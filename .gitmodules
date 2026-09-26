@@ -1,0 +1,3 @@
+[submodule "vendor/okam-ha-native"]
+	path = vendor/okam-ha-native
+	url = https://github.com/oleandor/okam-ha-native.git
