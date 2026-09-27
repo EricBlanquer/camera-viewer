@@ -94,6 +94,7 @@ LOG_FILE_NAME = "okam-linux.log"
 LOG_MAX_BYTES = 1024 * 1024
 LOG_BACKUPS = 2
 TRAY_ARGUMENT = "--tray"
+CAMERA_PASSWORD_ARGUMENT = "--camera-password"
 SIGNAL_POLL_MS = 500
 INSTANCE_SERVER_PREFIX = "okam-linux"
 INSTANCE_CONNECT_TIMEOUT_MS = 500
@@ -3406,6 +3407,8 @@ def main() -> int:
         settings.remove("account/username")
         settings.sync()
         return 0 if settings.status() == QSettings.Status.NoError else 1
+    if sys.argv[1:] == [CAMERA_PASSWORD_ARGUMENT]:
+        return print_camera_passwords()
     start_in_tray = sys.argv[1:] == [TRAY_ARGUMENT]
     if len(sys.argv) != 1 and not start_in_tray:
         return 2
@@ -3433,6 +3436,23 @@ def main() -> int:
     if not start_in_tray or window.tray is None:
         window.show()
     return app.exec()
+
+
+def print_camera_passwords() -> int:
+    username = QSettings(APPLICATION_NAME, APPLICATION_NAME).value("account/username", "", str)
+    password = stored_account_password(username) if username else None
+    if not username or not password:
+        print("No saved O-KAM account. Start O-KAM Linux and sign in first.", file=sys.stderr)
+        return 1
+    try:
+        devices = Eye4AccountClient(opener=account_request).enumerate(username, password)
+    except AccountError as ex:
+        print(str(ex), file=sys.stderr)
+        return 1
+    for device in devices:
+        credential = stored_camera_password(device.uid) or device.device_password
+        print(f"{device.name} ({device.uid}): {credential or 'not provided by O-KAM; the camera uses its initial password'}")
+    return 0
 
 
 def accept_instance_request(server: QLocalServer, window: MainWindow) -> None:

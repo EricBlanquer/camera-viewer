@@ -65,6 +65,26 @@ The application never sends siren or alarm commands.
 
 The application writes a log to `~/.cache/okam-linux/okam-linux.log`.
 
+## Camera password
+
+The camera has its own local password, separate from the O-KAM account password.
+O-KAM Linux does not need you to enter it: the O-KAM account service returns it with the camera list, and the application uses it to authenticate the P2P session.
+To display it, sign in once with the application, then run:
+
+```sh
+.venv/bin/python app.py --camera-password
+```
+
+The command signs in with the saved account, lists the cameras of the account, and prints each camera's name, UID, and password.
+When the account service returns no password, the camera still uses its initial password.
+A camera-specific password saved in the desktop keyring under `application=okam-linux`, `camera=<camera UID>` takes precedence.
+
+## Local credentials file
+
+`secrets.local.json` may keep a local copy of the account email, account password, and camera passwords.
+Git ignores this file, and it must keep owner-only permissions (`chmod 600 secrets.local.json`).
+The application itself reads the account password from the desktop keyring, not from this file.
+
 ## Source and limits
 
 The transport submodule is pinned to commit `eeb3e67d11a83a02ba1f408fde8df1ca73218037` of [O-KAM Native Bridge](https://github.com/oleandor/okam-ha-native), whose code is licensed under MIT.
