@@ -187,6 +187,8 @@ CARD_START_FRAME_TYPE = 0x63
 CARD_END_FRAME_TYPE = 0x64
 CARD_VIDEO_FRAME_TYPES = (0x00, 0x01)
 CARD_AUDIO_FRAME_TYPE = 0x0D
+DIRECT_CONNECT_SECONDS = 10
+RELAY_CONNECT_SECONDS = 55
 SEQUENCE_HALF_RANGE = 0x8000
 MAX_OUT_OF_ORDER_PACKETS = 4096
 KEY_FRAME_TYPE = 0x00
@@ -787,6 +789,20 @@ class ReliableCS2Session(CS2Session):
         self._incoming_sequence[channel] = expected
 
 
+def open_camera_session(client_id: str, service_parameter: object) -> ReliableCS2Session:
+    direct = ReliableCS2Session(client_id, service_parameter, prefer_relay=False)
+    try:
+        direct.connect(timeout=DIRECT_CONNECT_SECONDS)
+        LOG.info("Camera session is direct with %s", direct._peer[0] if direct._peer else "unknown")
+        return direct
+    except CS2Error as ex:
+        LOG.info("Direct camera session failed (%s); using the relay", ex)
+    relay = ReliableCS2Session(client_id, service_parameter)
+    relay.connect(timeout=RELAY_CONNECT_SECONDS)
+    LOG.info("Camera session uses the relay")
+    return relay
+
+
 def prepare_camera_connection(
     device: AccountDevice, report: Callable[[str], None], stop_requested: threading.Event
 ) -> tuple[str, object] | None:
@@ -1005,9 +1021,8 @@ class DetectionWorker(QThread):
             connection = prepare_camera_connection(self.device, lambda message: None, self.stop_requested)
             if connection is None:
                 return
-            session = ReliableCS2Session(*connection)
+            session = open_camera_session(*connection)
             try:
-                session.connect(timeout=55)
                 login = authenticate_camera(
                     session, select_camera_password(self.device.device_password, self.camera_password)
                 )
@@ -1131,10 +1146,9 @@ class StreamWorker(QThread):
             return
         client_id, service_parameter = connection
         password = select_camera_password(self.device.device_password, self.camera_password)
-        session = ReliableCS2Session(client_id, service_parameter)
+        session = open_camera_session(client_id, service_parameter)
         stream_started = False
         try:
-            session.connect(timeout=55)
             if self.stop_requested.is_set():
                 return
             login = authenticate_camera(session, password)
@@ -1776,9 +1790,8 @@ class ReplayWorker(QThread):
         connection = prepare_camera_connection(self.device, lambda message: None, self.stop_requested)
         if connection is None:
             raise CS2Error("Replay stopped.")
-        session = ReliableCS2Session(*connection)
+        session = open_camera_session(*connection)
         try:
-            session.connect(timeout=55)
             login = authenticate_camera(
                 session, select_camera_password(self.device.device_password, self.camera_password)
             )

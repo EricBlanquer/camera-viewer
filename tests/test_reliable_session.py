@@ -1,7 +1,9 @@
 import unittest
 from unittest import mock
 
-from app import ReliableCS2Session
+from okam_native.cs2 import CS2Error
+
+from app import ReliableCS2Session, open_camera_session
 
 
 def data_packet(sequence: int, payload: bytes, channel: int = 4) -> bytes:
@@ -48,6 +50,41 @@ class ReliableSessionTest(unittest.TestCase):
         session._handle_data(data_packet(0, b"A"))
         self.assertEqual(bytes(session._channel_buffers[4]), b"A")
         self.assertEqual(session.acknowledged, [0, 0])
+
+
+def remember_path(session: ReliableCS2Session, *args: object, prefer_relay: bool = True) -> None:
+    session.prefer_relay = prefer_relay
+
+
+class SessionPathTest(unittest.TestCase):
+    def fake_connect(self, direct_works: bool):
+        attempts: list[bool] = []
+
+        def connect(session: ReliableCS2Session, *, timeout: float) -> None:
+            attempts.append(session.prefer_relay)
+            if not session.prefer_relay and not direct_works:
+                raise CS2Error("camera did not establish a native P2P session")
+            session._peer = ("192.168.1.17", 25717)
+
+        return attempts, connect
+
+    def test_direct_session_is_tried_first(self) -> None:
+        attempts, connect = self.fake_connect(True)
+        with mock.patch.object(ReliableCS2Session, "__init__", remember_path), mock.patch.object(
+            ReliableCS2Session, "connect", connect
+        ):
+            session = open_camera_session("uid", "parameter")
+        self.assertFalse(session.prefer_relay)
+        self.assertEqual(attempts, [False])
+
+    def test_relay_is_used_when_direct_fails(self) -> None:
+        attempts, connect = self.fake_connect(False)
+        with mock.patch.object(ReliableCS2Session, "__init__", remember_path), mock.patch.object(
+            ReliableCS2Session, "connect", connect
+        ):
+            session = open_camera_session("uid", "parameter")
+        self.assertTrue(session.prefer_relay)
+        self.assertEqual(attempts, [False, True])
 
 
 if __name__ == "__main__":
