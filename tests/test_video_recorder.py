@@ -22,7 +22,7 @@ def encoded_frames() -> list[bytes]:
             "-f",
             "lavfi",
             "-i",
-            f"testsrc=size=320x180:rate=10:duration={FRAME_COUNT * FRAME_SECONDS}",
+            f"testsrc=size=320x180:rate=15:duration={FRAME_COUNT / 15}",
             "-c:v",
             "libx264",
             "-bf",

@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from dataclasses import dataclass
 from typing import BinaryIO, Callable
 from datetime import datetime, timedelta
 
@@ -148,11 +150,31 @@ RECORD_LIST_PATH = "get_record_file.cgi?GetType=file&dirname={day}&"
 RECORD_LIST_RESPONSE_COMMAND = 0x6007
 RECORD_LIST_SECONDS = 20
 RECORD_NAME_FIELD = "record_name["
+RECORD_DURATION_FIELD = "record_duration["
+RECORD_SIZE_FIELD = "record_size["
 RECORDING_NAME_PATTERN = re.compile(r"(\d{14})_(\d{3})\.mp4")
 CONTINUOUS_RECORDING_TYPE = "100"
 RECORDING_TIME_LENGTH = 14
 RECORDING_TIME_FORMAT = "%Y%m%d%H%M%S"
 RECORD_DAY_FORMAT = "%Y%m%d"
+CARD_PLAY_PATH = "livestream.cgi?streamid=4&filename={name}&offset=0&download=1&"
+CARD_STOP_PATH = "livestream.cgi?streamid=17&"
+CARD_CHANNEL = 4
+CARD_PLAY_RESPONSE_COMMAND = 0x6037
+CARD_RESPONSE_SECONDS = 10
+CARD_FRAME_SECONDS = 15
+CARD_START_FRAME_TYPE = 0x63
+CARD_END_FRAME_TYPE = 0x64
+CARD_VIDEO_FRAME_TYPES = (0x00, 0x01)
+CARD_AUDIO_FRAME_TYPE = 0x0D
+SEQUENCE_HALF_RANGE = 0x8000
+MAX_OUT_OF_ORDER_PACKETS = 4096
+FRAME_MAGIC = b"\x55\xaa\x15\xa8"
+AAC_SUFFIX = ".aac"
+ADTS_HEADER_BYTES = 7
+ADTS_AAC_LC_PROFILE = 1
+ADTS_16000_HZ_INDEX = 8
+ADTS_MONO_CHANNELS = 1
 DETECTION_POLL_MS = 15 * 60 * 1000
 DETECTION_SETTING = "detections/last_seen"
 DETECTION_MESSAGE_MS = 15000
@@ -404,10 +426,6 @@ def remux_to_matroska(
         "-loglevel",
         "error",
         "-y",
-        "-fflags",
-        "+genpts",
-        "-framerate",
-        f"{frame_rate:.3f}",
         "-f",
         "h264",
         "-i",
@@ -415,7 +433,15 @@ def remux_to_matroska(
     ]
     if audio_path is not None:
         command += ["-itsoffset", f"{audio_offset:.3f}", "-f", "aac", "-i", str(audio_path), "-map", "0:v", "-map", "1:a"]
-    command += ["-c", "copy", "-f", "matroska", str(output_path)]
+    command += [
+        "-c",
+        "copy",
+        "-bsf:v",
+        f"setts=ts=N/({frame_rate:.6f}*TB)",
+        "-f",
+        "matroska",
+        str(output_path),
+    ]
     try:
         result = subprocess.run(
             command,
@@ -514,6 +540,37 @@ class ControlsOverlay(QWidget):
         painter.end()
 
 
+class ReliableCS2Session(CS2Session):
+    def _handle_data(self, packet: bytes) -> None:
+        declared = int.from_bytes(packet[2:4], "big") if len(packet) >= 4 else -1
+        body = packet[4:]
+        if declared != len(body) or len(body) < 4 or body[0] != 0xD1 or body[1] >= 8:
+            self._count("data_packets_invalid")
+            return
+        channel = body[1]
+        sequence = int.from_bytes(body[2:4], "big")
+        expected = self._incoming_sequence[channel]
+        waiting = self._out_of_order[channel]
+        distance = (sequence - expected) & 0xFFFF
+        if 0 < distance < SEQUENCE_HALF_RANGE and sequence not in waiting:
+            if len(waiting) >= MAX_OUT_OF_ORDER_PACKETS:
+                self._count("data_packets_deferred")
+                return
+            waiting[sequence] = body[4:]
+        self._count(f"channel{channel}_packets")
+        self._count(f"channel{channel}_bytes", len(body) - 4)
+        assert self._peer is not None
+        self._send_clear(b"\xf1\xd1\x00\x06\xd1" + bytes([channel]) + b"\x00\x01" + body[2:4], self._peer)
+        if distance != 0:
+            return
+        self._channel_buffers[channel].extend(body[4:])
+        expected = (expected + 1) & 0xFFFF
+        while expected in waiting:
+            self._channel_buffers[channel].extend(waiting.pop(expected))
+            expected = (expected + 1) & 0xFFFF
+        self._incoming_sequence[channel] = expected
+
+
 def prepare_camera_connection(
     device: AccountDevice, report: Callable[[str], None], stop_requested: threading.Event
 ) -> tuple[str, object] | None:
@@ -536,10 +593,26 @@ def prepare_camera_connection(
     return client_id, service_parameter
 
 
-def list_detections(session: CS2Session, user: str, password: str, day: str) -> list[str]:
+@dataclass(frozen=True)
+class CardRecording:
+    name: str
+    start: datetime
+    duration: int
+    size: int
+
+    @property
+    def end(self) -> datetime:
+        return self.start + timedelta(seconds=self.duration)
+
+    @property
+    def detection(self) -> bool:
+        return is_detection_recording(self.name)
+
+
+def list_recordings(session: CS2Session, user: str, password: str, day: str) -> list[CardRecording]:
     write_command(session, make_cgi_request(RECORD_LIST_PATH.format(day=day), user, password))
     deadline = time.monotonic() + RECORD_LIST_SECONDS
-    names: list[str] = []
+    recordings: list[CardRecording] = []
     while (remaining := deadline - time.monotonic()) > 0:
         try:
             command, payload = read_command(session, timeout=remaining)
@@ -550,14 +623,131 @@ def list_detections(session: CS2Session, user: str, password: str, day: str) -> 
         if parse_result(payload) != 0:
             raise CS2Error("The camera rejected the recording list request.")
         fields = response_fields(payload)
-        names += [
-            value
-            for key, value in fields.items()
-            if key.startswith(RECORD_NAME_FIELD) and is_detection_recording(value)
-        ]
+        for key, name in fields.items():
+            if not key.startswith(RECORD_NAME_FIELD) or RECORDING_NAME_PATTERN.fullmatch(name) is None:
+                continue
+            index = key[len(RECORD_NAME_FIELD):]
+            try:
+                duration = int(fields.get(f"{RECORD_DURATION_FIELD}{index}", "0"))
+                size = int(fields.get(f"{RECORD_SIZE_FIELD}{index}", "0"))
+            except ValueError:
+                continue
+            recordings.append(CardRecording(name, recording_time(name), duration, size))
         if fields.get("current_page", "0") == fields.get("totol_page", "0"):
-            return sorted(names)
+            return sorted(recordings, key=lambda recording: recording.name)
     raise CS2Error("The camera did not finish listing its recordings.")
+
+
+def list_detections(session: CS2Session, user: str, password: str, day: str) -> list[str]:
+    return [recording.name for recording in list_recordings(session, user, password, day) if recording.detection]
+
+
+def adts_header(length: int) -> bytes:
+    size = length + ADTS_HEADER_BYTES
+    return bytes(
+        [
+            0xFF,
+            0xF1,
+            (ADTS_AAC_LC_PROFILE << 6) | (ADTS_16000_HZ_INDEX << 2),
+            (ADTS_MONO_CHANNELS << 6) | (size >> 11),
+            (size >> 3) & 0xFF,
+            ((size & 0x07) << 5) | 0x1F,
+            0xFC,
+        ]
+    )
+
+
+class CardClipWriter:
+    def __init__(self, path: Path, directory: Path) -> None:
+        self.path = path
+        self.video_path = directory / f"{path.stem}{RAW_RECORDING_SUFFIX}"
+        self.audio_path = directory / f"{path.stem}{AAC_SUFFIX}"
+        self.video_file = self.video_path.open("wb")
+        self.audio_file = self.audio_path.open("wb")
+        self.video_frames = 0
+        self.first_video_time: float | None = None
+        self.last_video_time = 0.0
+        self.first_audio_time: float | None = None
+
+    def add(self, frame_type: int, timestamp: float, body: bytes) -> None:
+        if frame_type in CARD_VIDEO_FRAME_TYPES:
+            if self.first_video_time is None:
+                self.first_video_time = timestamp
+            self.last_video_time = timestamp
+            self.video_frames += 1
+            self.video_file.write(body)
+        elif frame_type == CARD_AUDIO_FRAME_TYPE and body:
+            if self.first_audio_time is None:
+                self.first_audio_time = timestamp
+            self.audio_file.write(adts_header(len(body)) + body)
+
+    def finish(self) -> Path:
+        self.close()
+        try:
+            if (
+                self.first_video_time is None
+                or self.video_frames < MIN_RECORDING_FRAMES
+                or self.last_video_time <= self.first_video_time
+            ):
+                raise OSError("The camera sent no playable video.")
+            frame_rate = (self.video_frames - 1) / (self.last_video_time - self.first_video_time)
+            audio_path = self.audio_path if self.first_audio_time is not None else None
+            audio_offset = (self.first_audio_time or 0.0) - self.first_video_time
+            remux_to_matroska(self.video_path, frame_rate, self.path, audio_path, audio_offset)
+        finally:
+            self.discard()
+        return self.path
+
+    def close(self) -> None:
+        self.video_file.close()
+        self.audio_file.close()
+
+    def discard(self) -> None:
+        self.close()
+        self.video_path.unlink(missing_ok=True)
+        self.audio_path.unlink(missing_ok=True)
+
+
+def download_card_recording(
+    session: CS2Session,
+    user: str,
+    password: str,
+    recording: CardRecording,
+    writer: CardClipWriter,
+    progress: Callable[[float], None],
+    cancelled: Callable[[], bool],
+) -> bool:
+    write_command(session, make_cgi_request(CARD_PLAY_PATH.format(name=recording.name), user, password))
+    response = read_command_result(session, (CARD_PLAY_RESPONSE_COMMAND,), timeout=CARD_RESPONSE_SECONDS)
+    if response is None or response[1] != 0:
+        raise CS2Error("The camera rejected the playback request.")
+    started = False
+    received = 0
+    try:
+        while not cancelled():
+            header = session.read_exact(CARD_CHANNEL, 32, timeout=CARD_FRAME_SECONDS)
+            if header[:4] != FRAME_MAGIC:
+                raise CS2Error("camera playback framing is invalid")
+            frame_type = header[4]
+            milliseconds, seconds, _frame_number, length = struct.unpack_from("<HIII", header, 6)
+            if length > MAX_FRAME_BYTES:
+                raise CS2Error("camera playback frame is invalid")
+            body = session.read_exact(CARD_CHANNEL, length, timeout=CARD_FRAME_SECONDS) if length else b""
+            if frame_type == CARD_START_FRAME_TYPE:
+                started = True
+                continue
+            if not started:
+                continue
+            if frame_type == CARD_END_FRAME_TYPE:
+                return True
+            writer.add(frame_type, seconds + milliseconds / 1000, body)
+            received += len(header) + length
+            if recording.size > 0:
+                progress(min(1.0, received / recording.size))
+    except CS2Timeout:
+        raise CS2Error("The camera stopped sending the recording.") from None
+    write_command(session, make_cgi_request(CARD_STOP_PATH, user, password))
+    return False
 
 
 def is_detection_recording(name: str) -> bool:
@@ -585,7 +775,7 @@ class DetectionWorker(QThread):
             connection = prepare_camera_connection(self.device, lambda message: None, self.stop_requested)
             if connection is None:
                 return
-            session = CS2Session(*connection)
+            session = ReliableCS2Session(*connection)
             try:
                 session.connect(timeout=55)
                 login = authenticate_camera(
@@ -688,7 +878,7 @@ class StreamWorker(QThread):
             return
         client_id, service_parameter = connection
         password = select_camera_password(self.device.device_password, self.camera_password)
-        session = CS2Session(client_id, service_parameter)
+        session = ReliableCS2Session(client_id, service_parameter)
         stream_started = False
         try:
             session.connect(timeout=55)
