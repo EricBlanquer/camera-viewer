@@ -117,6 +117,7 @@ AUDIO_RESPONSE_COMMAND = 0x6031
 RECONNECT_MAX_SECONDS = 30
 OVERLAY_TIMEOUT_MS = 5000
 MAX_ZOOM_LEVEL = 4
+DOUBLE_CLICK_ZOOM_STEPS = 2
 X11_WHEEL_UP = 4
 X11_WHEEL_DOWN = 5
 MAX_MPV_RESPONSE_BYTES = 65536
@@ -1718,11 +1719,15 @@ class VideoWidget(QWidget):
     dragged = pyqtSignal(int, int)
     drag_moved = pyqtSignal(int, int)
     wheel_zoomed = pyqtSignal(int, int, int)
+    double_clicked = pyqtSignal(int, int)
 
     def __init__(self) -> None:
         super().__init__()
         self.drag_start: tuple[int, int] | None = None
         self.drag_last: tuple[int, int] | None = None
+        self.click_timer = QTimer(self)
+        self.click_timer.setSingleShot(True)
+        self.click_timer.timeout.connect(self.clicked.emit)
         self.controls_overlay: QWidget | None = None
         self.recording_badge: QWidget | None = None
         self.x_display = xdisplay.Display() if QApplication.platformName() == "xcb" else None
@@ -1819,7 +1824,11 @@ class VideoWidget(QWidget):
         dy = y - self.drag_start[1]
         self.drag_start = None
         if abs(dx) < DRAG_PIXELS_PER_STEP // 2 and abs(dy) < DRAG_PIXELS_PER_STEP // 2:
-            self.clicked.emit()
+            if self.click_timer.isActive():
+                self.click_timer.stop()
+                self.double_clicked.emit(x, y)
+            else:
+                self.click_timer.start(QApplication.doubleClickInterval())
         else:
             self.dragged.emit(dx, dy)
 
@@ -2365,6 +2374,7 @@ class MainWindow(QMainWindow):
         self.video.dragged.connect(self.move_by_drag)
         self.video.drag_moved.connect(self.pan_zoomed_video)
         self.video.wheel_zoomed.connect(self.change_zoom)
+        self.video.double_clicked.connect(self.toggle_zoom_at)
         layout.addWidget(self.video, 1)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
@@ -3095,6 +3105,12 @@ class MainWindow(QMainWindow):
         if self.recording_path is not None:
             self.reset_recording_state()
         self.set_status(message)
+
+    def toggle_zoom_at(self, x: int, y: int) -> None:
+        if self.zoom_level > 0:
+            self.change_zoom(-self.zoom_level)
+        else:
+            self.change_zoom(DOUBLE_CLICK_ZOOM_STEPS, x, y)
 
     def change_zoom(self, step: int, x: int | None = None, y: int | None = None) -> None:
         if not self.stream_live and self.replay is None:
