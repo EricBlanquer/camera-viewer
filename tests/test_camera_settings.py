@@ -1,14 +1,21 @@
 import struct
 import unittest
+from datetime import datetime
 
 from okam_native.cs2 import CS2Timeout
 
 from app import (
+    CARD_CHANNEL,
+    CARD_END_FRAME_TYPE,
+    CARD_PLAY_RESPONSE_COMMAND,
+    CARD_START_FRAME_TYPE,
     RECORD_LIST_RESPONSE_COMMAND,
     TRANSPARENT_RESPONSE_COMMAND,
     WHITE_LIGHT_COMMAND,
     WHITE_LIGHT_STATUS_COMMAND,
+    CardRecording,
     available_qualities,
+    download_card_recording,
     is_detection_recording,
     list_detections,
     read_response_fields,
@@ -117,6 +124,58 @@ class DetectionListTest(unittest.TestCase):
         )
         self.assertEqual(len(session.written), 1)
         self.assertIn(b"get_record_file.cgi?GetType=file&dirname=20260926&", session.written[0])
+
+
+class ChannelSession:
+    def __init__(self, channels: dict[int, list[bytes]]) -> None:
+        self.channels = channels
+
+    def write(self, channel: int, data: bytes, *, timeout: float = 0) -> None:
+        pass
+
+    def read_exact(self, channel: int, size: int, *, timeout: float) -> bytes:
+        packets = self.channels.get(channel, [])
+        if not packets:
+            raise CS2Timeout("no packet")
+        packet = packets.pop(0)
+        if len(packet) != size:
+            raise AssertionError(f"expected {size} bytes, got {len(packet)}")
+        return packet
+
+    def _count_kind(self, prefix: str, kind: str) -> None:
+        pass
+
+
+def card_frame(frame_type: int, body: bytes) -> list[bytes]:
+    header = bytearray(32)
+    header[:4] = b"\x55\xaa\x15\xa8"
+    header[4] = frame_type
+    header[16:20] = len(body).to_bytes(4, "little")
+    return [bytes(header), body] if body else [bytes(header)]
+
+
+class CardDownloadTest(unittest.TestCase):
+    def test_download_serves_other_requests_between_frames(self) -> None:
+        frames = card_frame(CARD_START_FRAME_TYPE, b"") + card_frame(0, b"I") + card_frame(1, b"P")
+        frames += card_frame(CARD_END_FRAME_TYPE, b"")
+        session = ChannelSession(
+            {0: command_packet(CARD_PLAY_RESPONSE_COMMAND, b"result= 0;\r\n"), CARD_CHANNEL: frames}
+        )
+        received: list[bytes] = []
+        idle_calls: list[int] = []
+        complete = download_card_recording(
+            session,
+            "admin",
+            "secret",
+            CardRecording("20260926231604_011.mp4", datetime(2026, 9, 26, 23, 16, 4), 180, 100),
+            lambda frame_type, timestamp, body: received.append(body),
+            lambda fraction: None,
+            lambda: False,
+            lambda: idle_calls.append(len(received)),
+        )
+        self.assertTrue(complete)
+        self.assertEqual(received, [b"I", b"P"])
+        self.assertEqual(idle_calls, [1, 2])
 
 
 class VideoQualityTest(unittest.TestCase):

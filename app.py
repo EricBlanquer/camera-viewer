@@ -812,6 +812,7 @@ def download_card_recording(
     on_frame: Callable[[int, float, bytes], None],
     progress: Callable[[float], None],
     cancelled: Callable[[], bool],
+    idle: Callable[[], None] = lambda: None,
 ) -> bool:
     write_command(session, make_cgi_request(CARD_PLAY_PATH.format(name=recording.name), user, password))
     response = read_command_result(session, (CARD_PLAY_RESPONSE_COMMAND,), timeout=CARD_RESPONSE_SECONDS)
@@ -837,6 +838,7 @@ def download_card_recording(
             if frame_type == CARD_END_FRAME_TYPE:
                 return True
             on_frame(frame_type, seconds + milliseconds / 1000, body)
+            idle()
             received += len(header) + length
             if recording.size > 0:
                 progress(min(1.0, received / recording.size))
@@ -1496,7 +1498,9 @@ class ReplayWorker(QThread):
         self.device = device
         self.camera_password = camera_password
         self.directory = directory
-        self.requests: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.listings: queue.Queue[str] = queue.Queue()
+        self.downloads: queue.Queue[ReplayBuffer] = queue.Queue()
+        self.wake = threading.Event()
         self.stop_requested = threading.Event()
         self.cancel_download = threading.Event()
         self.session: CS2Session | None = None
@@ -1504,15 +1508,18 @@ class ReplayWorker(QThread):
         self.login_password = ""
 
     def list_day(self, day: str) -> None:
-        self.requests.put((REPLAY_LIST_REQUEST, day))
+        self.listings.put(day)
+        self.wake.set()
 
     def download(self, buffer: ReplayBuffer) -> None:
         self.cancel_download.set()
-        self.requests.put((REPLAY_DOWNLOAD_REQUEST, buffer))
+        self.downloads.put(buffer)
+        self.wake.set()
 
     def stop(self) -> None:
         self.stop_requested.set()
         self.cancel_download.set()
+        self.wake.set()
 
     def run(self) -> None:
         try:
@@ -1547,25 +1554,35 @@ class ReplayWorker(QThread):
             self.camera_password = ""
 
     def _next_request(self) -> tuple[str, object] | None:
+        self.wake.wait(PACER_IDLE_SECONDS)
+        self.wake.clear()
         try:
-            requests = [self.requests.get(timeout=PACER_IDLE_SECONDS)]
+            return REPLAY_LIST_REQUEST, self.listings.get_nowait()
         except queue.Empty:
-            return None
+            pass
+        latest: ReplayBuffer | None = None
         while True:
             try:
-                requests.append(self.requests.get_nowait())
+                buffer = self.downloads.get_nowait()
             except queue.Empty:
                 break
-        downloads = [request for request in requests if request[0] == REPLAY_DOWNLOAD_REQUEST]
-        for request in downloads[:-1]:
-            request[1].end()
-        lists = [request for request in requests if request[0] == REPLAY_LIST_REQUEST]
-        pending = lists[1:] + downloads[-1:] if lists else lists[1:]
-        for request in pending:
-            self.requests.put(request)
-        if lists:
-            return lists[0]
-        return downloads[-1] if downloads else None
+            if latest is not None:
+                latest.end()
+            latest = buffer
+        if latest is None:
+            return None
+        if not self.listings.empty() or not self.downloads.empty():
+            self.wake.set()
+        return REPLAY_DOWNLOAD_REQUEST, latest
+
+    def _serve_listings(self, session: CS2Session) -> None:
+        while True:
+            try:
+                day = self.listings.get_nowait()
+            except queue.Empty:
+                return
+            LOG.info("Replay request list %s during a download", day)
+            self.day_listed.emit(day, list_recordings(session, self.login_user, self.login_password, day))
 
     def _open_session(self) -> CS2Session:
         if self.session is not None:
@@ -1598,6 +1615,8 @@ class ReplayWorker(QThread):
         if kind == REPLAY_LIST_REQUEST:
             day = str(value)
             self.day_listed.emit(day, list_recordings(session, self.login_user, self.login_password, day))
+            if not self.listings.empty() or not self.downloads.empty():
+                self.wake.set()
             return
         buffer = value
         assert isinstance(buffer, ReplayBuffer)
@@ -1618,6 +1637,7 @@ class ReplayWorker(QThread):
                 keep,
                 lambda fraction: self.progress.emit(recording.name, fraction),
                 lambda: self.cancel_download.is_set() or self.stop_requested.is_set(),
+                lambda: self._serve_listings(session),
             )
         except Exception:
             writer.discard()
@@ -1948,7 +1968,8 @@ class ReplayController(QObject):
         self.timeline.set_recordings(self.all_recordings())
         self.timeline.set_center(start or datetime.now())
         self.status_changed.emit("Loading recordings...")
-        self.load_visible_days(*self.timeline.visible_range())
+        visible_start, visible_end = self.timeline.visible_range()
+        self.load_visible_days(visible_start - timedelta(days=1), visible_end)
 
     def stop(self) -> None:
         self.timeline.seek_requested.disconnect(self.seek)
