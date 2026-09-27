@@ -191,7 +191,7 @@ REPLAY_SPEEDS = (1, 2, 4, 8)
 REPLAY_DEFAULT_REWIND_SECONDS = 60
 REPLAY_SPEED_LABEL = "{speed}x"
 LIVE_BUTTON_LABEL = "LIVE"
-LOADING_STATUS = "Loading recording {percent}%"
+LOADING_STATUS = "Loading {moment:%d/%m/%Y %H:%M:%S} {percent}%"
 DETECTION_JUMP_MARGIN_SECONDS = 5
 DETECTION_RECENT_SECONDS = 30
 DETECTION_MERGE_SECONDS = 10
@@ -217,6 +217,9 @@ TIMELINE_DETECTION_COLOR = QColor(244, 122, 111)
 TIMELINE_LABEL_COLOR = QColor(220, 220, 220)
 TIMELINE_TICK_COLOR = QColor(150, 150, 150)
 TIMELINE_CURSOR_COLOR = QColor(34, 184, 216)
+TIMELINE_CURSOR_TEXT_COLOR = QColor(255, 255, 255)
+TIMELINE_CURSOR_LABEL_WIDTH = 150
+TIMELINE_LABEL_WIDTH = 80
 REPLAY_ATTEMPTS = 2
 REPLAY_LIST_REQUEST = "list"
 REPLAY_DOWNLOAD_REQUEST = "download"
@@ -1918,19 +1921,28 @@ class TimelineWidget(QWidget):
         first = datetime.fromtimestamp((camera_timestamp(start) // step + 1) * step, timezone.utc).replace(tzinfo=None)
         painter.setPen(TIMELINE_LABEL_COLOR)
         moment = first
+        middle = width / 2
         while moment <= end:
             x = self.x_at(moment)
             label = f"{moment:%d/%m}" if moment.hour == 0 and moment.minute == 0 else f"{moment:%H:%M}"
-            painter.drawText(QRectF(x - 40, 0, 80, TIMELINE_HEADER_HEIGHT), Qt.AlignmentFlag.AlignCenter, label)
+            if abs(x - middle) > TIMELINE_CURSOR_LABEL_WIDTH / 2 + TIMELINE_LABEL_WIDTH / 2:
+                painter.drawText(
+                    QRectF(x - TIMELINE_LABEL_WIDTH / 2, 0, TIMELINE_LABEL_WIDTH, TIMELINE_HEADER_HEIGHT),
+                    Qt.AlignmentFlag.AlignCenter,
+                    label,
+                )
             painter.setPen(TIMELINE_TICK_COLOR)
             painter.drawLine(QPointF(x, TIMELINE_HEADER_HEIGHT), QPointF(x, TIMELINE_HEADER_HEIGHT + TIMELINE_TICK_HEIGHT))
             painter.setPen(TIMELINE_LABEL_COLOR)
             moment += timedelta(seconds=step)
-        painter.setPen(QPen(TIMELINE_CURSOR_COLOR, 2))
-        middle = width / 2
-        painter.drawLine(QPointF(middle, TIMELINE_HEADER_HEIGHT), QPointF(middle, self.height()))
+        cursor_label = QRectF(middle - TIMELINE_CURSOR_LABEL_WIDTH / 2, 3, TIMELINE_CURSOR_LABEL_WIDTH, TIMELINE_HEADER_HEIGHT - 6)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(TIMELINE_CURSOR_COLOR)
-        painter.drawEllipse(QPointF(middle, TIMELINE_HEADER_HEIGHT + 2), 4, 4)
+        painter.drawRoundedRect(cursor_label, cursor_label.height() / 2, cursor_label.height() / 2)
+        painter.setPen(TIMELINE_CURSOR_TEXT_COLOR)
+        painter.drawText(cursor_label, Qt.AlignmentFlag.AlignCenter, f"{self.center:%a %d/%m %H:%M:%S}")
+        painter.setPen(QPen(TIMELINE_CURSOR_COLOR, 2))
+        painter.drawLine(QPointF(middle, TIMELINE_HEADER_HEIGHT), QPointF(middle, self.height()))
         painter.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -1985,6 +1997,7 @@ class ReplayController(QObject):
         self.current: ReplayBuffer | None = None
         self.prefetched: ReplayBuffer | None = None
         self.target_fraction = 0.0
+        self.loading_target = datetime.now()
         self.waiting_for_target = False
         self.pending_jump = 0
         self.jump_origin = datetime.now()
@@ -2141,7 +2154,8 @@ class ReplayController(QObject):
                 self.pacer.seek(camera_timestamp(target))
             return
         self.clip_available.emit(self.saved_clips.get(recording.name) is not None)
-        self.status_changed.emit(LOADING_STATUS.format(percent=0))
+        self.loading_target = target
+        self.status_changed.emit(LOADING_STATUS.format(moment=target, percent=0))
         if self.prefetched is not None and self.prefetched.recording == recording:
             self.current = self.prefetched
             self.prefetched = None
@@ -2196,7 +2210,7 @@ class ReplayController(QObject):
         if self.current is None or self.current.recording.name != name or not self.waiting_for_target:
             return
         percent = min(99, round(100 * fraction / max(self.target_fraction, LOADING_MIN_FRACTION)))
-        self.status_changed.emit(LOADING_STATUS.format(percent=percent))
+        self.status_changed.emit(LOADING_STATUS.format(moment=self.loading_target, percent=percent))
 
     def on_downloaded(self, name: str, path: str) -> None:
         self.saved_clips[name] = Path(path) if path else None

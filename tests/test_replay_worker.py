@@ -70,7 +70,12 @@ class ReplayLoadingTest(unittest.TestCase):
             controller.on_position(camera_timestamp(datetime(2026, 9, 26, 19, 30, 28)))
             self.assertEqual(
                 loading,
-                ["Loading recording 0%", "Loading recording 50%", "Loading recording 99%", "Playback 26/09/2026 19:30:28"],
+                [
+                    "Loading 26/09/2026 19:30:28 0%",
+                    "Loading 26/09/2026 19:30:28 50%",
+                    "Loading 26/09/2026 19:30:28 99%",
+                    "Playback 26/09/2026 19:30:28",
+                ],
             )
         finally:
             controller.stop()
