@@ -43,7 +43,7 @@ Drag the video horizontally or vertically with the left mouse button to move it 
 When the desktop provides a notification area, O-KAM Linux shows an icon there instead of a taskbar entry.
 Click the icon to show or hide the window, or open its menu to use the same controls or quit.
 Opening O-KAM Linux again from the application menu shows the running instance instead of starting a second one.
-Closing the window hides it and stops the video; showing it again restarts live video.
+Closing the window hides it; live video keeps running in the background so continuous recording and detection checks continue.
 
 The playback button switches the window to the recordings stored on the camera's microSD card, and **LIVE** returns to live video.
 In playback, the control bar shows a timeline with continuous recording in blue and detections in red; drag it or click a time to play from there, and use the wheel or the magnifier buttons to show a shorter or longer period.
@@ -51,8 +51,13 @@ Playback starts while the recording is still loading, with sound, pause, and spe
 The picture button saves the current image, and the download button saves the loaded recording as a Matroska file.
 Clicking a detection notification opens the playback at that detection.
 
-Every 15 minutes, O-KAM Linux checks the camera's microSD card for new detection recordings and shows a desktop notification with the time of the latest one.
-The check uses the live connection while video is shown; otherwise it wakes the camera briefly, which uses some of its battery.
+Every minute, O-KAM Linux checks the camera's microSD card for new detection recordings and shows a desktop notification with the time of the latest one.
+The check uses the live connection.
+
+O-KAM Linux also records the live video continuously on this computer, in ten-minute Matroska files in `Videos/O-KAM Linux/Continuous`, and deletes files older than 24 hours.
+This keeps a copy of the last day even if the camera and its microSD card are taken, as long as the computer and the application are running.
+The tray menu switches continuous recording on or off and opens the recordings folder.
+A segment interrupted by a crash or power loss is recovered at the next start.
 The first check only records the latest existing detection, so older events are not announced.
 
 The video quality selector appears only when the camera can switch quality and return to its full resolution without restarting.

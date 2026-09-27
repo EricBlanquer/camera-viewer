@@ -26,9 +26,10 @@ from dataclasses import dataclass
 from typing import BinaryIO, Callable
 from datetime import datetime, timedelta, timezone
 
-from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
+    QDesktopServices,
     QActionGroup,
     QColor,
     QIcon,
@@ -236,7 +237,13 @@ ADTS_HEADER_BYTES = 7
 ADTS_AAC_LC_PROFILE = 1
 ADTS_16000_HZ_INDEX = 8
 ADTS_MONO_CHANNELS = 1
-DETECTION_POLL_MS = 15 * 60 * 1000
+DETECTION_POLL_MS = 60 * 1000
+CONTINUOUS_FOLDER = "Continuous"
+CONTINUOUS_TIME_FORMAT = "%Y%m%d_%H%M%S"
+CONTINUOUS_NAME_PATTERN = re.compile(r"[^/]+_(\d{8}_\d{6})\.mkv")
+CONTINUOUS_SEGMENT_SECONDS = 10 * 60
+CONTINUOUS_RETENTION = timedelta(hours=24)
+CONTINUOUS_SETTING = "recording/continuous"
 DETECTION_SETTING = "detections/last_seen"
 DETECTION_MESSAGE_MS = 15000
 RAW_RECORDING_SUFFIX = ".h264"
@@ -631,6 +638,89 @@ class VideoRecorder:
         return self.path
 
 
+def continuous_directory() -> Path:
+    videos = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.MoviesLocation)
+    directory = (Path(videos) if videos else Path.home() / "Videos") / APPLICATION_NAME / CONTINUOUS_FOLDER
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def segment_time(path: Path) -> datetime | None:
+    match = CONTINUOUS_NAME_PATTERN.fullmatch(path.name)
+    if match is None:
+        return None
+    return datetime.strptime(match.group(1), CONTINUOUS_TIME_FORMAT)
+
+
+def prune_continuous_recordings(directory: Path, now: datetime, retention: timedelta) -> None:
+    for path in directory.iterdir():
+        start = segment_time(path)
+        if start is not None and start < now - retention:
+            path.unlink(missing_ok=True)
+            LOG.info("Deleted continuous recording %s", path.name)
+
+
+def recover_continuous_recordings(directory: Path) -> None:
+    for raw_path in directory.glob(f"*{MATROSKA_SUFFIX}{RAW_RECORDING_SUFFIX}"):
+        output = raw_path.with_suffix("")
+        start = segment_time(output)
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-count_packets", "-show_entries", "stream=nb_read_packets",
+                 "-of", "csv=p=0", "-f", "h264", str(raw_path)],
+                capture_output=True,
+                text=True,
+                timeout=RECORDING_REMUX_TIMEOUT_SECONDS,
+                check=False,
+            )
+            frames = int(result.stdout.strip().split(",")[0])
+            duration = datetime.fromtimestamp(raw_path.stat().st_mtime) - start if start is not None else timedelta()
+            if frames < MIN_RECORDING_FRAMES or duration.total_seconds() <= 0:
+                raise OSError("The interrupted recording is empty.")
+            remux_to_matroska(raw_path, frames / duration.total_seconds(), output)
+            raw_path.unlink(missing_ok=True)
+            LOG.info("Recovered interrupted recording %s", output.name)
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired) as ex:
+            LOG.info("Could not recover %s: %s", raw_path.name, ex)
+
+
+class ContinuousRecorder:
+    def __init__(self, directory: Path, prefix: str) -> None:
+        self.directory = directory
+        self.prefix = prefix
+        self.recorder: VideoRecorder | None = None
+        self.segment_started = 0.0
+
+    def write(self, frame: bytes, keyframe: bool, now: float) -> None:
+        if self.recorder is not None and keyframe and now - self.segment_started >= CONTINUOUS_SEGMENT_SECONDS:
+            self.close()
+        if self.recorder is None:
+            if not keyframe:
+                return
+            path = self.directory / f"{self.prefix}_{datetime.now():{CONTINUOUS_TIME_FORMAT}}{MATROSKA_SUFFIX}"
+            self.recorder = VideoRecorder(path)
+            self.segment_started = now
+            prune_continuous_recordings(self.directory, datetime.now(), CONTINUOUS_RETENTION)
+        try:
+            self.recorder.write(frame, keyframe, now)
+        except OSError as ex:
+            LOG.info("Continuous recording stopped: %s", ex)
+            self.close()
+
+    def close(self) -> None:
+        recorder = self.recorder
+        self.recorder = None
+        if recorder is None or not recorder.started:
+            return
+        threading.Thread(target=self._save, args=(recorder,)).start()
+
+    def _save(self, recorder: VideoRecorder) -> None:
+        try:
+            LOG.info("Saved continuous recording %s", recorder.finish().name)
+        except OSError as ex:
+            LOG.info("Could not save continuous recording %s: %s", recorder.path.name, ex)
+
+
 class ControlsOverlay(QWidget):
     def __init__(self, parent: QWidget) -> None:
         super().__init__(
@@ -951,7 +1041,13 @@ class StreamWorker(QThread):
     setting_completed = pyqtSignal(str, object)
     setting_failed = pyqtSignal(str, str)
 
-    def __init__(self, device: AccountDevice, camera_password: str, player_input: BinaryIO) -> None:
+    def __init__(
+        self,
+        device: AccountDevice,
+        camera_password: str,
+        player_input: BinaryIO,
+        continuous: ContinuousRecorder | None = None,
+    ) -> None:
         super().__init__()
         self.device = device
         self.camera_password = camera_password
@@ -964,7 +1060,12 @@ class StreamWorker(QThread):
         self.audio_player: subprocess.Popen[bytes] | None = None
         self.recording_request: Path | None = None
         self.recorder: VideoRecorder | None = None
+        self.continuous = continuous
+        self.continuous_enabled = threading.Event()
         self.detection_days: list[str] | None = None
+        self.display_enabled = threading.Event()
+        self.display_enabled.set()
+        self.display_needs_keyframe = False
 
     def queue_setting(self, name: str, value: object) -> bool:
         try:
@@ -972,6 +1073,18 @@ class StreamWorker(QThread):
             return True
         except queue.Full:
             return False
+
+    def set_continuous(self, enabled: bool) -> None:
+        if enabled:
+            self.continuous_enabled.set()
+        else:
+            self.continuous_enabled.clear()
+
+    def set_display(self, enabled: bool) -> None:
+        if enabled:
+            self.display_enabled.set()
+        else:
+            self.display_enabled.clear()
 
     def request_detections(self, days: list[str]) -> None:
         self.detection_days = days
@@ -1061,9 +1174,20 @@ class StreamWorker(QThread):
                     continue
                 last_video = time.monotonic()
                 self._record_frame(frame, keyframe, last_video)
+                if self.continuous is not None:
+                    if self.continuous_enabled.is_set():
+                        self.continuous.write(frame, keyframe, last_video)
+                    else:
+                        self.continuous.close()
                 if not received_video:
                     received_video = True
                     self.status_changed.emit("Live video")
+                if not self.display_enabled.is_set():
+                    self.display_needs_keyframe = True
+                    continue
+                if self.display_needs_keyframe and not keyframe:
+                    continue
+                self.display_needs_keyframe = False
                 try:
                     self.player_input.write(frame)
                 except BrokenPipeError:
@@ -1077,6 +1201,8 @@ class StreamWorker(QThread):
             self._close_audio_player()
             self.recording_request = None
             self._finish_recording()
+            if self.continuous is not None:
+                self.continuous.close()
             if stream_started:
                 try:
                     write_command(
@@ -2642,6 +2768,13 @@ class MainWindow(QMainWindow):
         for button in self.camera_buttons:
             self.add_tray_action(movement, button)
         menu.addSeparator()
+        self.continuous_action = menu.addAction("Continuous recording (24 h)")
+        self.continuous_action.setCheckable(True)
+        self.continuous_action.setChecked(self.continuous_recording_enabled())
+        self.continuous_action.toggled.connect(self.set_continuous_recording)
+        open_recordings = menu.addAction("Open recordings folder")
+        open_recordings.triggered.connect(self.open_recordings_folder)
+        menu.addSeparator()
         quit_action = menu.addAction("Quit")
         quit_action.triggered.connect(self.quit_application)
         menu.aboutToShow.connect(self.update_tray_menu)
@@ -2668,8 +2801,11 @@ class MainWindow(QMainWindow):
         self.quality_menu.setEnabled(self.quality_button.isEnabled() and self.isVisible())
 
     def detection_days(self) -> list[str]:
-        today = datetime.now()
-        return [(today - timedelta(days=1)).strftime(RECORD_DAY_FORMAT), today.strftime(RECORD_DAY_FORMAT)]
+        now = datetime.now()
+        days = [now.strftime(RECORD_DAY_FORMAT)]
+        if now - timedelta(milliseconds=DETECTION_POLL_MS * 2) < now.replace(hour=0, minute=0, second=0, microsecond=0):
+            days.insert(0, (now - timedelta(days=1)).strftime(RECORD_DAY_FORMAT))
+        return days
 
     def check_detections(self) -> None:
         if not self.devices or self.detection_worker is not None or self.close_pending or self.replay is not None:
@@ -2731,16 +2867,37 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        if self.stream_worker is not None:
+            self.stream_worker.set_display(True)
         if self.stream_worker is None and self.account_worker is None:
             self.reconnect()
 
     def hide_to_tray(self) -> None:
-        self.exit_replay(False)
-        self.stop_stream()
+        self.exit_replay()
+        if self.stream_worker is not None:
+            self.stream_worker.set_display(False)
         self.overlay_timer.stop()
         self.hide_overlay()
         self.hide()
         self.update_recording_badge()
+
+    def continuous_recording_enabled(self) -> bool:
+        return self.settings.value(CONTINUOUS_SETTING, True, bool)
+
+    def set_continuous_recording(self, enabled: bool) -> None:
+        self.settings.setValue(CONTINUOUS_SETTING, enabled)
+        self.settings.sync()
+        if self.stream_worker is not None:
+            self.stream_worker.set_continuous(enabled)
+        self.show_notice("Continuous recording on." if enabled else "Continuous recording off.")
+
+    def open_recordings_folder(self) -> None:
+        try:
+            directory = continuous_directory()
+        except OSError:
+            self.show_notice("Unable to open the recordings folder.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
 
     def quit_application(self) -> None:
         self.quit_requested = True
@@ -2856,7 +3013,7 @@ class MainWindow(QMainWindow):
         self.timeline.hide()
         self.live_bar.show()
         self.show_overlay()
-        if resume and self.isVisible() and self.stream_worker is None and self.account_worker is None:
+        if resume and self.stream_worker is None and self.account_worker is None:
             self.reconnect()
 
     def show_window_without_stream(self) -> None:
@@ -2894,9 +3051,9 @@ class MainWindow(QMainWindow):
         self.account_worker = None
         if self.close_pending:
             self.close()
-        elif self.devices and self.isVisible():
+        elif self.devices:
             self.watch_live()
-        elif self.retry_pending and self.isVisible():
+        elif self.retry_pending:
             self.schedule_reconnect(self.status_text)
 
     def schedule_reconnect(self, reason: str) -> None:
@@ -2926,9 +3083,19 @@ class MainWindow(QMainWindow):
         self.reset_recording_state()
         self.zoom_level = 0
         set_button_icon(self.sound_button, "sound", "Listen to camera")
+        try:
+            continuous = ContinuousRecorder(continuous_directory(), self.selected_device.name)
+        except OSError:
+            continuous = None
+            self.show_notice("Unable to create the continuous recording folder.")
         self.stream_worker = StreamWorker(
-            self.selected_device, stored_camera_password(self.selected_device.uid) or "", self.player.stdin
+            self.selected_device,
+            stored_camera_password(self.selected_device.uid) or "",
+            self.player.stdin,
+            continuous,
         )
+        self.stream_worker.set_continuous(self.continuous_recording_enabled())
+        self.stream_worker.set_display(self.isVisible() and not self.isMinimized())
         self.stream_worker.status_changed.connect(self.on_stream_status)
         self.stream_worker.failed.connect(self.on_stream_error)
         self.stream_worker.control_completed.connect(self.on_control_completed)
@@ -3431,6 +3598,18 @@ def main() -> int:
         return 2
     app = QApplication(sys.argv)
     configure_logging()
+    try:
+        directory = continuous_directory()
+    except OSError:
+        directory = None
+    if directory is not None:
+        threading.Thread(
+            target=lambda: (
+                recover_continuous_recordings(directory),
+                prune_continuous_recordings(directory, datetime.now(), CONTINUOUS_RETENTION),
+            ),
+            daemon=True,
+        ).start()
     server_name = f"{INSTANCE_SERVER_PREFIX}-{os.getuid()}"
     running_instance = QLocalSocket()
     running_instance.connectToServer(server_name)
