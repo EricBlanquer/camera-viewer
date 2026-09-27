@@ -45,12 +45,11 @@ Click the icon to show or hide the window, or open its menu to use the same cont
 Opening O-KAM Linux again from the application menu shows the running instance instead of starting a second one.
 Closing the window hides it and stops the video; showing it again restarts live video.
 
-The playback button opens the recordings stored on the camera's microSD card.
-Its timeline shows continuous recording in blue and detections in red; drag it or click a time to play from there, and use the wheel or the magnifier buttons to show a shorter or longer period.
+The playback button switches the window to the recordings stored on the camera's microSD card, and **LIVE** returns to live video.
+In playback, the control bar shows a timeline with continuous recording in blue and detections in red; drag it or click a time to play from there, and use the wheel or the magnifier buttons to show a shorter or longer period.
 Playback starts while the recording is still loading, with sound, pause, and speeds up to 8x.
 The picture button saves the current image, and the download button saves the loaded recording as a Matroska file.
 Clicking a detection notification opens the playback at that detection.
-Live video pauses while the playback window is open.
 
 Every 15 minutes, O-KAM Linux checks the camera's microSD card for new detection recordings and shows a desktop notification with the time of the latest one.
 The check uses the live connection while video is shown; otherwise it wakes the camera briefly, which uses some of its battery.

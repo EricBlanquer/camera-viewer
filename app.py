@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import BinaryIO, Callable
 from datetime import datetime, timedelta, timezone
 
-from PyQt6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -177,14 +177,12 @@ MATROSKA_SUFFIX = ".mkv"
 PACER_IDLE_SECONDS = 0.1
 PACER_RESYNC_SECONDS = 1.0
 PACER_POSITION_SECONDS = 0.25
-REPLAY_WINDOW_WIDTH = 1100
-REPLAY_WINDOW_HEIGHT = 760
-REPLAY_VIDEO_MIN_WIDTH = 640
-REPLAY_VIDEO_MIN_HEIGHT = 360
 REPLAY_SPEEDS = (1, 2, 4, 8)
+REPLAY_DEFAULT_REWIND_SECONDS = 60
 REPLAY_SPEED_LABEL = "{speed}x"
+LIVE_BUTTON_LABEL = "LIVE"
 REPLAY_WORKER_WAIT_MS = 20000
-TIMELINE_HEIGHT = 96
+TIMELINE_HEIGHT = 84
 TIMELINE_HEADER_HEIGHT = 28
 TIMELINE_TICK_HEIGHT = 10
 TIMELINE_DRAG_PIXELS = 4
@@ -192,8 +190,9 @@ TIMELINE_MAX_LABELS = 8
 TIMELINE_DEFAULT_ZOOM = 4
 TIMELINE_SPANS = (600, 1800, 3600, 3 * 3600, 6 * 3600, 12 * 3600, 24 * 3600, 3 * 24 * 3600)
 TIMELINE_LABEL_STEPS = (60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400)
-TIMELINE_HEADER_COLOR = QColor(58, 58, 58)
-TIMELINE_EMPTY_COLOR = QColor(243, 243, 243)
+TIMELINE_PREFERRED_WIDTH = 4096
+TIMELINE_HEADER_COLOR = QColor(0, 0, 0, 0)
+TIMELINE_EMPTY_COLOR = QColor(255, 255, 255, 40)
 TIMELINE_RECORDING_COLOR = QColor(122, 168, 245)
 TIMELINE_DETECTION_COLOR = QColor(244, 122, 111)
 TIMELINE_LABEL_COLOR = QColor(220, 220, 220)
@@ -1749,6 +1748,9 @@ class TimelineWidget(QWidget):
         self.drag_center = self.center
         self.dragged = False
 
+    def sizeHint(self) -> QSize:
+        return QSize(TIMELINE_PREFERRED_WIDTH, TIMELINE_HEIGHT)
+
     @property
     def span(self) -> float:
         return TIMELINE_SPANS[self.zoom_index]
@@ -1861,125 +1863,62 @@ class TimelineWidget(QWidget):
         self.zoom(-1 if event.angleDelta().y() > 0 else 1)
 
 
-class ReplayWindow(QWidget):
-    closed = pyqtSignal()
+class ReplayController(QObject):
+    status_changed = pyqtSignal(str)
     position_changed = pyqtSignal(float)
     playback_finished = pyqtSignal(str)
+    playing_changed = pyqtSignal(bool)
+    clip_available = pyqtSignal(bool)
 
-    def __init__(self, device: AccountDevice, camera_password: str, start: datetime | None) -> None:
-        super().__init__(None, Qt.WindowType.Window)
+    def __init__(self, device: AccountDevice, camera_password: str, timeline: TimelineWidget) -> None:
+        super().__init__()
         self.device = device
-        self.setWindowTitle(f"{device.name} · Playback")
-        self.setWindowIcon(QIcon(str(ICON_DIRECTORY / "app.svg")))
-        self.resize(REPLAY_WINDOW_WIDTH, REPLAY_WINDOW_HEIGHT)
-        self.setStyleSheet(
-            "ReplayWindow { background-color: #171717; }"
-            "QLabel { color: white; }"
-            "QPushButton { color: white; background-color: transparent; border: none;"
-            " border-radius: 6px; padding: 4px; }"
-            "QPushButton:hover { background-color: rgba(255, 255, 255, 35); }"
-            "QPushButton:disabled { color: rgba(255, 255, 255, 90); }"
-            "#speedButton { border: 2px solid white; border-radius: 12px; font-weight: 600; }"
-        )
+        self.timeline = timeline
         self.directory = tempfile.TemporaryDirectory(prefix="intraswitch_okam_replay_")
         self.recordings: dict[str, list[CardRecording]] = {}
         self.requested_days: set[str] = set()
         self.saved_clips: dict[str, Path] = {}
-        self.start_request = start
+        self.start_request: datetime | None = None
         self.current: ReplayBuffer | None = None
         self.playing = False
         self.sound = True
         self.speed_index = 0
-        self.player: subprocess.Popen[bytes] | None = None
         self.pacer: ReplayPacer | None = None
-        self.mpv_socket = Path(self.directory.name) / "control.sock"
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        self.video = QWidget()
-        self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
-        self.video.setStyleSheet("background-color: #000000;")
-        self.video.setMinimumSize(REPLAY_VIDEO_MIN_WIDTH, REPLAY_VIDEO_MIN_HEIGHT)
-        layout.addWidget(self.video, 1)
-        controls = QHBoxLayout()
-        controls.setContentsMargins(12, 4, 12, 4)
-        self.play_button = QPushButton()
-        self.play_button.clicked.connect(self.toggle_playing)
-        self.sound_button = QPushButton()
-        self.sound_button.clicked.connect(self.toggle_sound)
-        self.speed_button = QPushButton(REPLAY_SPEED_LABEL.format(speed=REPLAY_SPEEDS[0]))
-        self.speed_button.setObjectName("speedButton")
-        self.speed_button.setFixedSize(44, 30)
-        self.speed_button.setToolTip("Playback speed")
-        self.speed_button.clicked.connect(self.change_speed)
-        self.time_label = QLabel()
-        self.status_label = QLabel("Loading recordings...")
-        self.snapshot_button = QPushButton()
-        self.snapshot_button.clicked.connect(self.take_snapshot)
-        self.save_button = QPushButton()
-        self.save_button.clicked.connect(self.save_clip)
-        self.zoom_out_button = QPushButton()
-        self.zoom_in_button = QPushButton()
-        for button, icon_name, label in (
-            (self.snapshot_button, "photo", "Save picture"),
-            (self.save_button, "download", "Save this recording"),
-            (self.zoom_out_button, "zoom_out", "Show a longer period"),
-            (self.zoom_in_button, "zoom_in", "Show a shorter period"),
-        ):
-            set_button_icon(button, icon_name, label)
-        for widget in (self.play_button, self.sound_button, self.speed_button, self.time_label):
-            controls.addWidget(widget)
-        controls.addSpacing(12)
-        controls.addWidget(self.status_label)
-        controls.addStretch(1)
-        for widget in (self.snapshot_button, self.save_button, self.zoom_out_button, self.zoom_in_button):
-            controls.addWidget(widget)
-        layout.addLayout(controls)
-        self.timeline = TimelineWidget()
-        self.timeline.seek_requested.connect(self.seek)
-        self.timeline.range_changed.connect(self.load_visible_days)
-        self.zoom_out_button.clicked.connect(lambda: self.timeline.zoom(1))
-        self.zoom_in_button.clicked.connect(lambda: self.timeline.zoom(-1))
-        layout.addWidget(self.timeline)
-        self.update_play_button()
-        self.update_sound_button()
-        self.save_button.setEnabled(False)
-        self.snapshot_button.setEnabled(False)
         self.worker = ReplayWorker(device, camera_password, Path(self.directory.name))
         self.worker.day_listed.connect(self.on_day_listed)
         self.worker.progress.connect(self.on_progress)
         self.worker.downloaded.connect(self.on_downloaded)
-        self.worker.failed.connect(self.status_label.setText)
+        self.worker.failed.connect(self.status_changed.emit)
         self.position_changed.connect(self.on_position)
         self.playback_finished.connect(self.on_finished)
+        self.timeline.seek_requested.connect(self.seek)
+        self.timeline.range_changed.connect(self.load_visible_days)
         self.worker.start()
-        if start is not None:
-            self.timeline.set_center(start)
-        self.load_visible_days(*self.timeline.visible_range())
 
-    def showEvent(self, event: QShowEvent) -> None:
-        super().showEvent(event)
-        if self.player is None:
-            QTimer.singleShot(0, self.start_player)
+    @property
+    def speed(self) -> int:
+        return REPLAY_SPEEDS[self.speed_index]
 
-    def start_player(self) -> None:
-        try:
-            self.player = subprocess.Popen(
-                mpv_stream_command(self.mpv_socket, int(self.video.winId()), False),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                bufsize=0,
-            )
-        except OSError:
-            self.status_label.setText("The mpv video player is unavailable.")
-            return
-        assert self.player.stdin is not None
-        self.pacer = ReplayPacer(self.player.stdin, self.position_changed.emit, self.playback_finished.emit)
+    def start(self, video_output: BinaryIO, start: datetime | None) -> None:
+        self.start_request = start
+        self.pacer = ReplayPacer(video_output, self.position_changed.emit, self.playback_finished.emit)
         self.pacer.set_sound(self.sound)
         self.pacer.start()
-        if self.current is not None:
-            self.pacer.load(self.current, camera_timestamp(self.timeline.center))
+        self.timeline.set_recordings(self.all_recordings())
+        self.timeline.set_center(start or datetime.now())
+        self.status_changed.emit("Loading recordings...")
+        self.load_visible_days(*self.timeline.visible_range())
+
+    def stop(self) -> None:
+        self.timeline.seek_requested.disconnect(self.seek)
+        self.timeline.range_changed.disconnect(self.load_visible_days)
+        self.worker.stop()
+        if self.pacer is not None:
+            self.pacer.stop()
+            self.pacer.join(timeout=3)
+            self.pacer = None
+        self.worker.wait(REPLAY_WORKER_WAIT_MS)
+        self.directory.cleanup()
 
     def load_visible_days(self, start: datetime, end: datetime) -> None:
         day = start.date()
@@ -2000,15 +1939,18 @@ class ReplayWindow(QWidget):
     def on_day_listed(self, day: str, recordings: list[CardRecording]) -> None:
         self.recordings[day] = recordings
         self.timeline.set_recordings(self.all_recordings())
-        if self.current is None and self.status_label.text() == "Loading recordings...":
-            self.status_label.setText("")
-        if self.current is None and self.start_request is not None:
+        if self.current is not None:
+            return
+        if self.start_request is not None:
             if any(recording.start <= self.start_request < recording.end for recording in recordings):
                 self.seek(self.start_request)
-        elif self.current is None and self.start_request is None and day == datetime.now().strftime(RECORD_DAY_FORMAT):
-            detections = [recording for recording in self.all_recordings() if recording.detection]
-            if detections:
-                self.seek(detections[-1].start)
+            return
+        if day == datetime.now().strftime(RECORD_DAY_FORMAT):
+            latest = self.all_recordings()
+            if latest:
+                self.seek(max(latest[-1].start, latest[-1].end - timedelta(seconds=REPLAY_DEFAULT_REWIND_SECONDS)))
+            else:
+                self.status_changed.emit("No recording today.")
 
     def recording_at(self, moment: datetime) -> CardRecording | None:
         recordings = self.all_recordings()
@@ -2020,123 +1962,76 @@ class ReplayWindow(QWidget):
     def seek(self, moment: datetime) -> None:
         recording = self.recording_at(moment)
         if recording is None:
-            self.status_label.setText("No recording at this time.")
+            self.status_changed.emit("No recording at this time.")
             return
         target = max(moment, recording.start)
         self.timeline.set_center(target)
-        self.playing = True
-        self.update_play_button()
-        if self.current is not None and self.current.recording == recording and not self.current_failed():
+        self.set_playing(True)
+        if self.current is not None and self.current.recording == recording and self.current.frames:
             if self.pacer is not None:
                 self.pacer.seek(camera_timestamp(target))
             return
         self.current = ReplayBuffer(recording)
-        self.save_button.setEnabled(recording.name in self.saved_clips)
-        self.snapshot_button.setEnabled(True)
-        self.status_label.setText("Loading...")
+        self.clip_available.emit(recording.name in self.saved_clips)
+        self.status_changed.emit("Loading recording...")
         self.worker.download(self.current)
         if self.pacer is not None:
             self.pacer.load(self.current, camera_timestamp(target))
 
-    def current_failed(self) -> bool:
-        return self.current is not None and self.current.ended and not self.current.frames
-
     def on_position(self, timestamp: float) -> None:
         moment = camera_time(timestamp)
         self.timeline.set_center(moment)
-        self.time_label.setText(f"{moment:%d/%m/%Y %H:%M:%S}")
+        self.status_changed.emit(f"Playback {moment:%d/%m/%Y %H:%M:%S}")
 
     def on_finished(self, name: str) -> None:
         if self.current is None or self.current.recording.name != name:
             return
         following = next((recording for recording in self.all_recordings() if recording.name > name), None)
         if following is None:
-            self.playing = False
-            self.update_play_button()
+            self.set_playing(False)
+            self.status_changed.emit("End of the recordings.")
             return
         self.seek(following.start)
 
     def on_progress(self, name: str, fraction: float) -> None:
-        if self.current is not None and self.current.recording.name == name:
-            self.status_label.setText(f"Loading {fraction:.0%}")
+        if self.current is not None and self.current.recording.name == name and not self.current.frames:
+            self.status_changed.emit(f"Loading recording {fraction:.0%}")
 
     def on_downloaded(self, name: str, path: str) -> None:
         self.saved_clips[name] = Path(path)
         if self.current is not None and self.current.recording.name == name:
-            self.status_label.setText("")
-            self.save_button.setEnabled(True)
+            self.clip_available.emit(True)
+
+    def set_playing(self, playing: bool) -> None:
+        self.playing = playing
+        if self.pacer is not None:
+            self.pacer.set_playing(playing)
+        self.playing_changed.emit(playing)
 
     def toggle_playing(self) -> None:
         if self.current is None:
             self.seek(self.timeline.center)
-            return
-        self.playing = not self.playing
-        self.update_play_button()
-        if self.pacer is not None:
-            self.pacer.set_playing(self.playing)
+        else:
+            self.set_playing(not self.playing)
 
-    def update_play_button(self) -> None:
-        set_button_icon(self.play_button, "pause" if self.playing else "play", "Pause" if self.playing else "Play")
-
-    def toggle_sound(self) -> None:
+    def toggle_sound(self) -> bool:
         self.sound = not self.sound
-        self.update_sound_button()
         if self.pacer is not None:
             self.pacer.set_sound(self.sound)
+        return self.sound
 
-    def update_sound_button(self) -> None:
-        set_button_icon(self.sound_button, "sound_on" if self.sound else "sound", "Mute" if self.sound else "Listen")
-
-    def change_speed(self) -> None:
+    def change_speed(self) -> int:
         self.speed_index = (self.speed_index + 1) % len(REPLAY_SPEEDS)
-        speed = REPLAY_SPEEDS[self.speed_index]
-        self.speed_button.setText(REPLAY_SPEED_LABEL.format(speed=speed))
         if self.pacer is not None:
-            self.pacer.set_speed(float(speed))
+            self.pacer.set_speed(float(self.speed))
+        return self.speed
 
-    def take_snapshot(self) -> None:
-        try:
-            path = media_directory() / f"{self.device.name}_{self.timeline.center:%Y%m%d_%H%M%S}.png"
-        except OSError:
-            self.status_label.setText("Unable to create the picture folder.")
-            return
-        saved = mpv_request(self.mpv_socket, ["screenshot-to-file", str(path), "video"])[0]
-        self.status_label.setText(f"Picture saved: {path.name}" if saved else "Unable to save a picture.")
-
-    def save_clip(self) -> None:
+    def save_clip(self) -> Path | None:
         if self.current is None or self.current.recording.name not in self.saved_clips:
-            return
-        source = self.saved_clips[self.current.recording.name]
-        try:
-            target = media_directory() / f"{self.device.name}_{Path(self.current.recording.name).stem}{MATROSKA_SUFFIX}"
-            shutil.copyfile(source, target)
-        except OSError:
-            self.status_label.setText("Unable to save the recording.")
-            return
-        self.status_label.setText(f"Recording saved: {target.name}")
-
-    def closeEvent(self, event: object) -> None:
-        self.worker.stop()
-        if self.pacer is not None:
-            self.pacer.stop()
-            self.pacer.join(timeout=3)
-        if self.player is not None:
-            if self.player.stdin is not None:
-                try:
-                    self.player.stdin.close()
-                except OSError:
-                    pass
-            self.player.terminate()
-            try:
-                self.player.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.player.kill()
-                self.player.wait(timeout=3)
-            self.player = None
-        self.worker.wait(REPLAY_WORKER_WAIT_MS)
-        self.directory.cleanup()
-        self.closed.emit()
-        super().closeEvent(event)
+            return None
+        target = media_directory() / f"{self.device.name}_{Path(self.current.recording.name).stem}{MATROSKA_SUFFIX}"
+        shutil.copyfile(self.saved_clips[self.current.recording.name], target)
+        return target
 
 
 class MainWindow(QMainWindow):
@@ -2172,7 +2067,9 @@ class MainWindow(QMainWindow):
         self.sound_enabled = False
         self.retry_pending = False
         self.detection_worker: DetectionWorker | None = None
-        self.replay_window: ReplayWindow | None = None
+        self.replay: ReplayController | None = None
+        self.pending_replay: tuple[datetime | None] | None = None
+        self.keep_player = False
         self.latest_detection: datetime | None = None
         self.detection_timer = QTimer(self)
         self.detection_timer.timeout.connect(self.check_detections)
@@ -2207,7 +2104,9 @@ class MainWindow(QMainWindow):
             "#cameraControls QPushButton:hover { background-color: rgba(255, 255, 255, 35); }"
             "#cameraControls #qualityButton { border: 2px solid white; border-radius: 8px;"
             " font-weight: 600; margin: 6px 2px; }"
-            "#ptzPanel { background: transparent; }"
+            "#ptzPanel, #liveBar, #replayBar { background: transparent; }"
+            "#cameraControls #pillButton { border: 2px solid white; border-radius: 8px;"
+            " font-weight: 600; margin: 6px 2px; }"
             "QToolTip { color: white; background-color: rgb(32, 32, 32);"
             " border: 1px solid rgba(255, 255, 255, 60); border-radius: 6px; padding: 4px 8px; }"
             "#cameraControls QPushButton:disabled { color: rgba(255, 255, 255, 90);"
@@ -2238,7 +2137,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.quality_button)
         self.replay_button = QPushButton("Playback")
         self.replay_button.setEnabled(False)
-        self.replay_button.clicked.connect(lambda: self.open_replay(None))
+        self.replay_button.clicked.connect(lambda: self.enter_replay(None))
         controls.addWidget(self.replay_button)
         self.snapshot_button = QPushButton("Photo")
         self.snapshot_button.setToolTip("Save a picture of the live video")
@@ -2275,6 +2174,8 @@ class MainWindow(QMainWindow):
         self.fullscreen_button = QPushButton("Full screen")
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         controls.addWidget(self.fullscreen_button)
+        self.fullscreen_replay_button = QPushButton()
+        self.fullscreen_replay_button.clicked.connect(self.toggle_fullscreen)
         controls.addStretch(1)
         for button, icon_name, label in (
             (self.replay_button, "replay", "Play back recordings"),
@@ -2286,9 +2187,71 @@ class MainWindow(QMainWindow):
             (self.zoom_in_button, "zoom_in", "Zoom in"),
             (self.ptz_button, "ptz", "Pan and tilt controls"),
             (self.fullscreen_button, "fullscreen", "Full screen"),
+            (self.fullscreen_replay_button, "fullscreen", "Full screen"),
         ):
             set_button_icon(button, icon_name, label)
-        overlay_layout.addLayout(controls)
+        self.live_bar = QWidget(self.overlay)
+        self.live_bar.setObjectName("liveBar")
+        self.live_bar.setLayout(controls)
+        overlay_layout.addWidget(self.live_bar)
+        self.replay_bar = QWidget(self.overlay)
+        self.replay_bar.setObjectName("replayBar")
+        replay_controls = QHBoxLayout(self.replay_bar)
+        replay_controls.setContentsMargins(0, 0, 0, 0)
+        replay_controls.setSpacing(12)
+        self.live_button = QPushButton(LIVE_BUTTON_LABEL)
+        self.live_button.setObjectName("pillButton")
+        self.live_button.setFixedSize(64, 44)
+        self.live_button.setToolTip("Back to live video")
+        self.live_button.setAccessibleName("Back to live video")
+        self.live_button.clicked.connect(self.exit_replay)
+        self.replay_play_button = QPushButton()
+        self.replay_sound_button = QPushButton()
+        self.replay_speed_button = QPushButton(REPLAY_SPEED_LABEL.format(speed=REPLAY_SPEEDS[0]))
+        self.replay_speed_button.setObjectName("pillButton")
+        self.replay_speed_button.setFixedSize(56, 44)
+        self.replay_speed_button.setToolTip("Playback speed")
+        self.replay_speed_button.setAccessibleName("Playback speed")
+        self.replay_snapshot_button = QPushButton()
+        self.replay_save_button = QPushButton()
+        self.timeline_zoom_out_button = QPushButton()
+        self.timeline_zoom_in_button = QPushButton()
+        for button, icon_name, label in (
+            (self.replay_play_button, "pause", "Pause"),
+            (self.replay_sound_button, "sound_on", "Mute playback"),
+            (self.replay_snapshot_button, "photo", "Save picture"),
+            (self.replay_save_button, "download", "Save this recording"),
+            (self.timeline_zoom_out_button, "zoom_out", "Show a longer period"),
+            (self.timeline_zoom_in_button, "zoom_in", "Show a shorter period"),
+        ):
+            set_button_icon(button, icon_name, label)
+        replay_controls.addStretch(1)
+        for button in (
+            self.live_button,
+            self.replay_play_button,
+            self.replay_sound_button,
+            self.replay_speed_button,
+            self.replay_snapshot_button,
+            self.replay_save_button,
+            self.timeline_zoom_out_button,
+            self.timeline_zoom_in_button,
+            self.fullscreen_replay_button,
+        ):
+            replay_controls.addWidget(button)
+        replay_controls.addStretch(1)
+        self.replay_save_button.setEnabled(False)
+        self.replay_play_button.clicked.connect(lambda: self.replay is not None and self.replay.toggle_playing())
+        self.replay_sound_button.clicked.connect(self.toggle_replay_sound)
+        self.replay_speed_button.clicked.connect(self.change_replay_speed)
+        self.replay_snapshot_button.clicked.connect(self.take_snapshot)
+        self.replay_save_button.clicked.connect(self.save_replay_clip)
+        self.timeline = TimelineWidget()
+        self.timeline_zoom_out_button.clicked.connect(lambda: self.timeline.zoom(1))
+        self.timeline_zoom_in_button.clicked.connect(lambda: self.timeline.zoom(-1))
+        overlay_layout.addWidget(self.replay_bar)
+        overlay_layout.addWidget(self.timeline)
+        self.replay_bar.hide()
+        self.timeline.hide()
         self.ptz_panel = QWidget(self.overlay)
         self.ptz_panel.setObjectName("ptzPanel")
         ptz_layout = QVBoxLayout(self.ptz_panel)
@@ -2351,7 +2314,9 @@ class MainWindow(QMainWindow):
         self.window_action.triggered.connect(self.toggle_window)
         menu.addSeparator()
         for button in (
+            self.live_button,
             self.replay_button,
+            self.replay_play_button,
             self.snapshot_button,
             self.record_button,
             self.sound_button,
@@ -2378,7 +2343,7 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip(f"{APPLICATION_NAME}\n{self.status_text}")
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self.on_tray_activated)
-        self.tray.messageClicked.connect(lambda: self.open_replay(self.latest_detection))
+        self.tray.messageClicked.connect(lambda: self.enter_replay(self.latest_detection))
         self.tray.show()
 
     def add_tray_action(self, menu: QMenu, button: QPushButton) -> None:
@@ -2393,7 +2358,7 @@ class MainWindow(QMainWindow):
             action.setIcon(menu_icon(button.property(ICON_NAME_PROPERTY), text_color))
             action.setText(button.toolTip())
             action.setEnabled(button.isEnabled() and self.isVisible())
-            action.setVisible(not button.isHidden())
+            action.setVisible(button.isVisibleTo(self.overlay))
         self.quality_menu.setEnabled(self.quality_button.isEnabled() and self.isVisible())
 
     def detection_days(self) -> list[str]:
@@ -2401,7 +2366,7 @@ class MainWindow(QMainWindow):
         return [(today - timedelta(days=1)).strftime(RECORD_DAY_FORMAT), today.strftime(RECORD_DAY_FORMAT)]
 
     def check_detections(self) -> None:
-        if not self.devices or self.detection_worker is not None or self.close_pending:
+        if not self.devices or self.detection_worker is not None or self.close_pending or self.replay is not None:
             return
         if self.stream_live and self.stream_worker is not None:
             self.stream_worker.request_detections(self.detection_days())
@@ -2464,6 +2429,7 @@ class MainWindow(QMainWindow):
             self.reconnect()
 
     def hide_to_tray(self) -> None:
+        self.exit_replay(False)
         self.stop_stream()
         self.overlay_timer.stop()
         self.hide_overlay()
@@ -2472,8 +2438,7 @@ class MainWindow(QMainWindow):
 
     def quit_application(self) -> None:
         self.quit_requested = True
-        if self.replay_window is not None:
-            self.replay_window.close()
+        self.exit_replay(False)
         self.close()
 
     def change_account(self) -> None:
@@ -2543,27 +2508,80 @@ class MainWindow(QMainWindow):
         self.retry_pending = message != ACCOUNT_REJECTED_MESSAGE
         self.set_status(message)
 
-    def open_replay(self, start: datetime | None) -> None:
-        if not self.devices:
+    def enter_replay(self, start: datetime | None) -> None:
+        if not self.devices or self.close_pending:
             return
-        if self.replay_window is not None:
-            self.replay_window.showNormal()
-            self.replay_window.raise_()
-            self.replay_window.activateWindow()
+        self.show_window_without_stream()
+        if self.replay is not None:
             if start is not None:
-                self.replay_window.seek(start)
+                self.replay.seek(start)
             return
-        self.stop_stream()
-        self.replay_window = ReplayWindow(
-            self.selected_device, stored_camera_password(self.selected_device.uid) or "", start
+        if self.stream_worker is not None:
+            self.pending_replay = (start,)
+            self.keep_player = True
+            self.stop_stream()
+            return
+        self.reconnect_timer.stop()
+        self.retry_pending = False
+        if not self.start_player():
+            return
+        assert self.player is not None and self.player.stdin is not None
+        self.replay = ReplayController(
+            self.selected_device, stored_camera_password(self.selected_device.uid) or "", self.timeline
         )
-        self.replay_window.closed.connect(self.on_replay_closed)
-        self.replay_window.show()
+        self.replay.status_changed.connect(self.set_status)
+        self.replay.playing_changed.connect(self.on_replay_playing_changed)
+        self.replay.clip_available.connect(self.replay_save_button.setEnabled)
+        self.live_bar.hide()
+        self.ptz_panel.hide()
+        self.replay_bar.show()
+        self.timeline.show()
+        self.replay_save_button.setEnabled(False)
+        self.replay.start(self.player.stdin, start)
+        self.show_overlay()
 
-    def on_replay_closed(self) -> None:
-        self.replay_window = None
-        if self.isVisible() and self.stream_worker is None and self.account_worker is None:
+    def exit_replay(self, resume: bool = True) -> None:
+        if self.replay is None:
+            return
+        replay = self.replay
+        self.replay = None
+        replay.stop()
+        self.replay_bar.hide()
+        self.timeline.hide()
+        self.live_bar.show()
+        self.show_overlay()
+        if resume and self.isVisible() and self.stream_worker is None and self.account_worker is None:
             self.reconnect()
+
+    def show_window_without_stream(self) -> None:
+        if not self.isVisible() or self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def on_replay_playing_changed(self, playing: bool) -> None:
+        set_button_icon(self.replay_play_button, "pause" if playing else "play", "Pause" if playing else "Play")
+
+    def toggle_replay_sound(self) -> None:
+        if self.replay is None:
+            return
+        sound = self.replay.toggle_sound()
+        set_button_icon(self.replay_sound_button, "sound_on" if sound else "sound", "Mute playback" if sound else "Listen")
+
+    def change_replay_speed(self) -> None:
+        if self.replay is not None:
+            self.replay_speed_button.setText(REPLAY_SPEED_LABEL.format(speed=self.replay.change_speed()))
+
+    def save_replay_clip(self) -> None:
+        if self.replay is None:
+            return
+        try:
+            path = self.replay.save_clip()
+        except OSError:
+            self.set_status("Unable to save the recording.")
+            return
+        if path is not None:
+            self.set_status(f"Recording saved: {path}")
 
     def on_account_finished(self) -> None:
         self.replay_button.setEnabled(bool(self.devices))
@@ -2703,7 +2721,10 @@ class MainWindow(QMainWindow):
         self.video.place_overlay()
         self.overlay.show()
         self.video.raise_interaction_layer()
-        self.overlay_timer.start(OVERLAY_TIMEOUT_MS)
+        if self.replay is None:
+            self.overlay_timer.start(OVERLAY_TIMEOUT_MS)
+        else:
+            self.overlay_timer.stop()
 
     def hide_overlay(self) -> None:
         self.overlay.hide()
@@ -2727,7 +2748,7 @@ class MainWindow(QMainWindow):
         return mpv_request(self.mpv_socket, command)[0]
 
     def take_snapshot(self) -> None:
-        if not self.stream_live:
+        if not self.stream_live and self.replay is None:
             return
         try:
             path = media_directory() / f"Jardin_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
@@ -3010,8 +3031,9 @@ class MainWindow(QMainWindow):
         self.stream_live = False
         self.control_pending = False
         self.sound_enabled = False
-        if not self.retry_pending or self.close_pending:
+        if not (self.retry_pending or self.keep_player) or self.close_pending:
             self.stop_player()
+        self.keep_player = False
         self.reset_recording_state()
         self.zoom_level = 0
         self.disable_live_controls()
@@ -3021,6 +3043,10 @@ class MainWindow(QMainWindow):
             self.set_status("Camera stopped.")
         if self.close_pending:
             self.close()
+        elif self.pending_replay is not None:
+            start = self.pending_replay[0]
+            self.pending_replay = None
+            self.enter_replay(start)
 
     def closeEvent(self, event: object) -> None:
         if self.tray is not None and not self.quit_requested:
