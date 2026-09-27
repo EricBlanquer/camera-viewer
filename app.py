@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import logging.handlers
 import os
 import queue
 import re
@@ -85,6 +87,11 @@ from Xlib.protocol import event as xevent
 
 
 APPLICATION_NAME = "O-KAM Linux"
+LOG = logging.getLogger("okam-linux")
+LOG_DIRECTORY = Path.home() / ".cache/okam-linux"
+LOG_FILE_NAME = "okam-linux.log"
+LOG_MAX_BYTES = 1024 * 1024
+LOG_BACKUPS = 2
 TRAY_ARGUMENT = "--tray"
 INSTANCE_SERVER_PREFIX = "okam-linux"
 INSTANCE_CONNECT_TIMEOUT_MS = 500
@@ -221,6 +228,16 @@ MIN_RECORDING_FRAMES = 2
 RECORDING_REMUX_TIMEOUT_SECONDS = 600
 RECORDING_TICK_MS = 1000
 RECORDING_DOT_COLOR = "#ff4d4d"
+
+
+def configure_logging() -> None:
+    LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_DIRECTORY / LOG_FILE_NAME, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOG.addHandler(handler)
+    LOG.setLevel(logging.INFO)
 
 
 def menu_icon(name: str, color: QColor) -> QIcon:
@@ -1577,6 +1594,7 @@ class ReplayWorker(QThread):
 
     def _handle(self, kind: str, value: object) -> None:
         session = self._open_session()
+        LOG.info("Replay request %s %s", kind, value.recording.name if isinstance(value, ReplayBuffer) else value)
         if kind == REPLAY_LIST_REQUEST:
             day = str(value)
             self.day_listed.emit(day, list_recordings(session, self.login_user, self.login_password, day))
@@ -1605,6 +1623,7 @@ class ReplayWorker(QThread):
             writer.discard()
             raise
         buffer.end()
+        LOG.info("Download of %s %s with %d frames", recording.name, "finished" if complete else "stopped", len(buffer.frames))
         if not complete:
             writer.discard()
             return
@@ -1986,10 +2005,12 @@ class ReplayController(QObject):
         direction = self.pending_jump
         detections = [recording for recording in self.all_recordings() if recording.detection]
         if direction < 0:
-            playing = next(
-                (recording for recording in detections if recording.start <= self.jump_origin < recording.end),
-                None,
-            )
+            playing = self.current.recording if self.current is not None else None
+            if playing is None or not playing.detection or not playing.start <= self.jump_origin < playing.end:
+                playing = next(
+                    (recording for recording in reversed(detections) if recording.start <= self.jump_origin < recording.end),
+                    None,
+                )
             limit = playing.start if playing is not None else self.jump_origin
             found = next(
                 (
@@ -2006,6 +2027,7 @@ class ReplayController(QObject):
             )
         if found is not None:
             self.pending_jump = 0
+            LOG.info("Jump %s from %s to detection %s", "back" if direction < 0 else "forward", self.jump_origin, found.name)
             self.seek(found.start, found)
             return
         loaded = sorted(self.recordings)
@@ -2036,6 +2058,7 @@ class ReplayController(QObject):
 
     def seek(self, moment: datetime, preferred: CardRecording | None = None) -> None:
         recording = preferred or self.recording_at(moment)
+        LOG.info("Seek to %s in %s", moment, recording.name if recording is not None else "no recording")
         if recording is None:
             self.status_changed.emit("No recording at this time.")
             return
@@ -3207,6 +3230,7 @@ def main() -> int:
     if len(sys.argv) != 1 and not start_in_tray:
         return 2
     app = QApplication(sys.argv)
+    configure_logging()
     server_name = f"{INSTANCE_SERVER_PREFIX}-{os.getuid()}"
     running_instance = QLocalSocket()
     running_instance.connectToServer(server_name)

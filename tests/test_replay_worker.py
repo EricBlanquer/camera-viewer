@@ -98,6 +98,20 @@ class ReplayLoadingTest(unittest.TestCase):
         finally:
             controller.stop()
 
+    def test_previous_detection_skips_the_overlapping_clip_being_played(self) -> None:
+        controller = ReplayController(SimpleNamespace(), "", TimelineWidget())
+        try:
+            controller.worker.download = lambda buffer: None
+            first = recording("20260926230955_011.mp4")
+            second = recording("20260926231004_011.mp4")
+            controller.recordings["20260926"] = [recording("20260926192809_011.mp4"), first, second]
+            controller.seek(second.start, second)
+            controller.timeline.center = datetime(2026, 9, 26, 23, 10, 20)
+            controller.jump_to_detection(-1)
+            self.assertEqual(controller.current.recording, first)
+        finally:
+            controller.stop()
+
 
     def test_next_recording_is_preloaded_and_reused(self) -> None:
         controller = ReplayController(SimpleNamespace(), "", TimelineWidget())

@@ -63,6 +63,8 @@ Battery cameras may need several seconds to wake before video appears.
 Two-way audio is not implemented because the official SDK does not fully document the talk stream.
 The application never sends siren or alarm commands.
 
+The application writes a log to `~/.cache/okam-linux/okam-linux.log`.
+
 ## Source and limits
 
 The transport submodule is pinned to commit `eeb3e67d11a83a02ba1f408fde8df1ca73218037` of [O-KAM Native Bridge](https://github.com/oleandor/okam-ha-native), whose code is licensed under MIT.
