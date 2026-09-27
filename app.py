@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from dataclasses import dataclass
 from typing import BinaryIO, Callable
@@ -45,6 +46,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -90,6 +92,8 @@ from Xlib.protocol import event as xevent
 
 APPLICATION_NAME = "Camera Viewer"
 STORAGE_NAME = "O-KAM Linux"
+RTSP_ACCOUNT = "rtsp"
+RTSP_CAMERAS_SETTING = "cameras/rtsp"
 LOG = logging.getLogger("okam-linux")
 LOG_DIRECTORY = Path.home() / ".cache/okam-linux"
 LOG_FILE_NAME = "okam-linux.log"
@@ -564,6 +568,15 @@ def mpv_stream_command(socket_path: Path, window_id: int, fill: bool) -> list[st
     return command + ["-"]
 
 
+def mpv_rtsp_command(socket_path: Path, window_id: int, fill: bool, camera: RtspCamera) -> list[str]:
+    command = mpv_stream_command(socket_path, window_id, fill)
+    command.remove("--demuxer-lavf-format=h264")
+    command.remove("--untimed")
+    command[-1] = camera.url
+    command.insert(-1, f"--rtsp-transport={camera.transport}")
+    return command
+
+
 def media_directory() -> Path:
     pictures = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)
     directory = (Path(pictures) if pictures else Path.home() / "Pictures") / STORAGE_NAME
@@ -573,6 +586,44 @@ def media_directory() -> Path:
 
 def safe_camera_name(name: str) -> str:
     return re.sub(r"[^\w.-]+", "_", name, flags=re.UNICODE).strip("._") or "Camera"
+
+
+@dataclass(frozen=True)
+class RtspCamera:
+    uid: str
+    name: str
+    url: str
+    transport: str = "udp"
+
+
+def valid_rtsp_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        return (parsed.scheme.lower() == "rtsp" and bool(parsed.hostname)
+                and not parsed.username and not parsed.password and parsed.port != 0)
+    except ValueError:
+        return False
+
+
+def load_rtsp_cameras(settings: QSettings) -> list[RtspCamera]:
+    try:
+        records = json.loads(settings.value(RTSP_CAMERAS_SETTING, "[]", str))
+        if not isinstance(records, list):
+            return []
+        return [
+            RtspCamera(record["uid"], record["name"], record["url"], record.get("transport", "udp"))
+            for record in records
+            if isinstance(record, dict)
+            and isinstance(record.get("uid"), str)
+            and record["uid"].startswith("rtsp:")
+            and isinstance(record.get("name"), str)
+            and record["name"].strip()
+            and isinstance(record.get("url"), str)
+            and valid_rtsp_url(record["url"])
+            and record.get("transport", "udp") in ("udp", "tcp")
+        ]
+    except (ValueError, TypeError):
+        return []
 
 
 def camera_time(timestamp: float) -> datetime:
@@ -2461,6 +2512,158 @@ class ReplayController(QObject):
         return target
 
 
+class RtspStreamWorker(QThread):
+    status_changed = pyqtSignal(str)
+    failed = pyqtSignal(str)
+    recording_started = pyqtSignal()
+    recording_saved = pyqtSignal(str)
+    recording_failed = pyqtSignal(str)
+    continuous_failed = pyqtSignal(str)
+
+    def __init__(self, camera: RtspCamera, player: subprocess.Popen[bytes], socket_path: Path) -> None:
+        super().__init__()
+        self.camera = camera
+        self.player = player
+        self.socket_path = socket_path
+        self.stop_requested = threading.Event()
+        self.continuous_enabled = threading.Event()
+        self.recording_request: Path | None = None
+        self.recording: subprocess.Popen[bytes] | None = None
+        self.recording_path: Path | None = None
+        self.recording_announced = False
+        self.continuous: subprocess.Popen[bytes] | None = None
+
+    def set_continuous(self, enabled: bool) -> None:
+        if enabled:
+            self.continuous_enabled.set()
+        else:
+            self.continuous_enabled.clear()
+
+    def set_recording(self, path: Path | None) -> None:
+        self.recording_request = path
+
+    def stop(self) -> None:
+        self.stop_requested.set()
+
+    def _ffmpeg(self, output: Path, segmented: bool) -> subprocess.Popen[bytes]:
+        command = [
+            "ffmpeg", "-nostats", "-loglevel", "error", "-rtsp_transport", self.camera.transport,
+            "-i", self.camera.url, "-map", "0:v:0", "-an", "-c:v", "copy",
+        ]
+        if segmented:
+            command += [
+                "-f", "segment", "-segment_format", "matroska",
+                "-segment_time", str(CONTINUOUS_SEGMENT_SECONDS),
+                "-reset_timestamps", "1", "-strftime", "1",
+            ]
+        else:
+            command += ["-f", "matroska"]
+        return subprocess.Popen(
+            command + [str(output)], stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    @staticmethod
+    def _finish(process: subprocess.Popen[bytes]) -> bool:
+        try:
+            if process.poll() is None:
+                process.communicate(input=b"q", timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait(timeout=5)
+        return process.returncode == 0
+
+    def _stop_recording(self) -> None:
+        process = self.recording
+        path = self.recording_path
+        self.recording = None
+        self.recording_path = None
+        self.recording_announced = False
+        if process is None or path is None:
+            return
+        if self._finish(process) and path.is_file() and path.stat().st_size > 0:
+            self.recording_saved.emit(str(path))
+        else:
+            path.unlink(missing_ok=True)
+            self.recording_failed.emit("Unable to save the recording.")
+
+    def run(self) -> None:
+        try:
+            deadline = time.monotonic() + 30
+            while not self.stop_requested.is_set():
+                if self.player.poll() is not None:
+                    raise OSError("The RTSP video player stopped.")
+                ready, configured = mpv_request(self.socket_path, ["get_property", "vo-configured"])
+                if ready and configured is True:
+                    break
+                if time.monotonic() >= deadline:
+                    raise OSError("The RTSP camera did not provide video.")
+                self.stop_requested.wait(0.25)
+            if self.stop_requested.is_set():
+                return
+            self.status_changed.emit("Live video")
+            last_prune = 0.0
+            last_frame = None
+            last_frame_at = time.monotonic()
+            while not self.stop_requested.is_set():
+                if self.player.poll() is not None:
+                    raise OSError("The RTSP video player stopped.")
+                frame_ready, frame_number = mpv_request(self.socket_path, ["get_property", "estimated-frame-number"])
+                if frame_ready and isinstance(frame_number, int) and frame_number != last_frame:
+                    last_frame = frame_number
+                    last_frame_at = time.monotonic()
+                elif time.monotonic() - last_frame_at > 45:
+                    raise OSError("The RTSP video stream stopped producing frames.")
+                if self.continuous_enabled.is_set() and self.continuous is None:
+                    try:
+                        directory = continuous_directory()
+                        pattern = directory / f"{safe_camera_name(self.camera.name)}_{self.camera.uid[5:13]}_%Y%m%d_%H%M%S.mkv"
+                        self.continuous = self._ffmpeg(pattern, True)
+                    except OSError as ex:
+                        self.continuous_enabled.clear()
+                        LOG.info("Continuous RTSP recording could not start: %s", ex)
+                        self.continuous_failed.emit("Unable to start continuous RTSP recording.")
+                elif not self.continuous_enabled.is_set() and self.continuous is not None:
+                    self._finish(self.continuous)
+                    self.continuous = None
+                if self.continuous is not None and self.continuous.poll() is not None:
+                    self.continuous = None
+                    self.continuous_enabled.clear()
+                    self.continuous_failed.emit("Continuous RTSP recording stopped.")
+                if self.recording_request != self.recording_path:
+                    self._stop_recording()
+                    if self.recording_request is not None:
+                        try:
+                            self.recording = self._ffmpeg(self.recording_request, False)
+                            self.recording_path = self.recording_request
+                        except OSError as ex:
+                            LOG.info("RTSP recording could not start: %s", ex)
+                            self.recording_request = None
+                            self.recording_failed.emit("Unable to start the recording.")
+                if self.recording is not None:
+                    if self.recording.poll() is not None:
+                        self._stop_recording()
+                        self.recording_request = None
+                    elif not self.recording_announced and self.recording_path is not None and self.recording_path.is_file() and self.recording_path.stat().st_size > 0:
+                        self.recording_announced = True
+                        self.recording_started.emit()
+                if time.monotonic() - last_prune >= 60:
+                    try:
+                        prune_continuous_recordings(continuous_directory(), datetime.now(), CONTINUOUS_RETENTION)
+                    except OSError as ex:
+                        LOG.info("Could not prune continuous RTSP recordings: %s", ex)
+                    last_prune = time.monotonic()
+                self.stop_requested.wait(0.25)
+        except OSError as ex:
+            if not self.stop_requested.is_set():
+                LOG.info("RTSP camera stream stopped: %s", ex)
+                self.failed.emit(str(ex))
+        finally:
+            self._stop_recording()
+            if self.continuous is not None:
+                self._finish(self.continuous)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2478,12 +2681,12 @@ class MainWindow(QMainWindow):
         self.tray_actions: list[tuple[QAction, QPushButton]] = []
         self.window_hints: X11WindowHints | None = None
         self.normal_geometry: QRect | None = None
-        self.devices: list[AccountDevice] = []
+        self.devices: list[AccountDevice | RtspCamera] = []
         self.device_accounts: dict[str, str] = {}
         self.pending_camera: tuple[str, str] | None = None
         self.account_queue: list[tuple[str, str]] = []
         self.account_worker: AccountWorker | None = None
-        self.stream_worker: StreamWorker | None = None
+        self.stream_worker: StreamWorker | RtspStreamWorker | None = None
         self.control_pending = False
         self.player: subprocess.Popen[bytes] | None = None
         self.mpv_directory: tempfile.TemporaryDirectory[str] | None = None
@@ -2517,6 +2720,9 @@ class MainWindow(QMainWindow):
         self.overlay_timer.setSingleShot(True)
         self.overlay_timer.timeout.connect(self.hide_overlay)
         self.settings = QSettings(STORAGE_NAME, STORAGE_NAME)
+        self.rtsp_cameras = load_rtsp_cameras(self.settings)
+        self.devices.extend(self.rtsp_cameras)
+        self.device_accounts.update({camera.uid: RTSP_ACCOUNT for camera in self.rtsp_cameras})
         self.account_username = self.settings.value("account/username", "", str)
         self.account_secret: str | None = None
         self.accounts = self.settings.value("accounts/okam", [], list)
@@ -2743,7 +2949,7 @@ class MainWindow(QMainWindow):
         if QApplication.platformName() == "xcb":
             self.window_hints = X11WindowHints(self, self.tray is not None)
         self.set_status("Connecting to camera...")
-        if self.accounts:
+        if self.accounts or self.rtsp_cameras:
             QTimer.singleShot(0, self.find_cameras)
         else:
             QTimer.singleShot(0, self.change_account)
@@ -2776,6 +2982,7 @@ class MainWindow(QMainWindow):
         add_camera_menu = menu.addMenu("Add camera")
         self.add_account_action = add_camera_menu.addAction("O-KAM account...")
         self.add_account_action.triggered.connect(self.change_account)
+        add_camera_menu.addAction("RTSP camera...").triggered.connect(self.add_rtsp_camera)
         menu.addSeparator()
         for button in (
             self.live_button,
@@ -2837,7 +3044,8 @@ class MainWindow(QMainWindow):
         self.cameras_menu.clear()
         for device in self.devices:
             username = self.device_accounts[device.uid]
-            action = self.cameras_menu.addAction(f"{device.name} · O-KAM ({username})")
+            label = f"{device.name} · RTSP (local)" if isinstance(device, RtspCamera) else f"{device.name} · O-KAM ({username})"
+            action = self.cameras_menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(device is getattr(self, "selected_device", None))
             action.triggered.connect(
@@ -2847,8 +3055,10 @@ class MainWindow(QMainWindow):
             self.cameras_menu.addAction("No cameras available").setEnabled(False)
         self.cameras_menu.addSeparator()
         refresh = self.cameras_menu.addAction("Refresh camera list")
-        refresh.setEnabled(self.account_worker is None)
+        refresh.setEnabled(self.account_worker is None and bool(self.accounts))
         refresh.triggered.connect(self.refresh_cameras)
+        if isinstance(getattr(self, "selected_device", None), RtspCamera):
+            self.cameras_menu.addAction("Remove selected RTSP camera").triggered.connect(self.remove_selected_rtsp_camera)
 
     def detection_days(self) -> list[str]:
         now = datetime.now()
@@ -2859,6 +3069,8 @@ class MainWindow(QMainWindow):
 
     def check_detections(self) -> None:
         if not self.devices or self.detection_worker is not None or self.close_pending or self.replay is not None:
+            return
+        if isinstance(getattr(self, "selected_device", None), RtspCamera):
             return
         if self.stream_live and self.stream_worker is not None:
             self.stream_worker.request_detections(self.detection_days())
@@ -2883,6 +3095,8 @@ class MainWindow(QMainWindow):
             self.apply_pending_camera()
 
     def on_detections_listed(self, names: list[str]) -> None:
+        if isinstance(getattr(self, "selected_device", None), RtspCamera):
+            return
         setting = f"{DETECTION_SETTING}/{self.selected_device.uid}"
         last_seen = self.settings.value(setting, "", str)
         if not last_seen and not self.settings.contains(setting) and len(self.devices) == 1:
@@ -2923,14 +3137,16 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         if self.stream_worker is not None:
-            self.stream_worker.set_display(True)
+            if isinstance(self.stream_worker, StreamWorker):
+                self.stream_worker.set_display(True)
         if self.stream_worker is None and self.account_worker is None:
             self.reconnect()
 
     def hide_to_tray(self) -> None:
         self.exit_replay()
         if self.stream_worker is not None:
-            self.stream_worker.set_display(False)
+            if isinstance(self.stream_worker, StreamWorker):
+                self.stream_worker.set_display(False)
         self.overlay_timer.stop()
         self.hide_overlay()
         self.hide()
@@ -2958,6 +3174,78 @@ class MainWindow(QMainWindow):
         self.quit_requested = True
         self.exit_replay(False)
         self.close()
+
+    def save_rtsp_cameras(self) -> None:
+        records = [
+            {"uid": camera.uid, "name": camera.name, "url": camera.url, "transport": camera.transport}
+            for camera in self.rtsp_cameras
+        ]
+        self.settings.setValue(RTSP_CAMERAS_SETTING, json.dumps(records))
+        self.settings.sync()
+
+    def add_rtsp_camera(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add RTSP camera")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        name = QLineEdit()
+        name.setPlaceholderText("Entrance")
+        url = QLineEdit()
+        url.setPlaceholderText("rtsp://camera-host:554/stream")
+        transport = QComboBox()
+        transport.addItems(["UDP", "TCP"])
+        form.addRow("Name", name)
+        form.addRow("RTSP URL", url)
+        form.addRow("Transport", transport)
+        layout.addLayout(form)
+        error = QLabel()
+        error.setStyleSheet("color: #bd4242;")
+        layout.addWidget(error)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def accept_camera() -> None:
+            if not name.text().strip():
+                error.setText("Enter a camera name.")
+                name.setFocus()
+            elif not valid_rtsp_url(url.text().strip()):
+                error.setText("Enter an RTSP URL without embedded credentials.")
+                url.setFocus()
+            else:
+                dialog.accept()
+
+        buttons.accepted.connect(accept_camera)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        camera = RtspCamera(
+            f"rtsp:{uuid.uuid4().hex}", name.text().strip(), url.text().strip(),
+            transport.currentText().lower(),
+        )
+        self.rtsp_cameras.append(camera)
+        self.devices.append(camera)
+        self.device_accounts[camera.uid] = RTSP_ACCOUNT
+        self.save_rtsp_cameras()
+        self.select_camera(RTSP_ACCOUNT, camera.uid)
+
+    def remove_selected_rtsp_camera(self) -> None:
+        camera = getattr(self, "selected_device", None)
+        if not isinstance(camera, RtspCamera):
+            return
+        self.rtsp_cameras.remove(camera)
+        self.devices.remove(camera)
+        self.device_accounts.pop(camera.uid, None)
+        self.save_rtsp_cameras()
+        self.settings.remove("camera/selected_uid")
+        self.settings.remove("camera/selected_account")
+        self.settings.sync()
+        if self.devices:
+            replacement = self.devices[0]
+            self.select_camera(self.device_accounts[replacement.uid], replacement.uid)
+        else:
+            self.stop_stream()
+            del self.selected_device
+            self.set_status("No cameras available.")
 
     def change_account(self) -> None:
         dialog = QDialog(self)
@@ -2990,8 +3278,8 @@ class MainWindow(QMainWindow):
     def find_cameras(self) -> None:
         if self.account_worker is not None:
             return
-        self.devices = []
-        self.device_accounts = {}
+        self.devices = list(self.rtsp_cameras)
+        self.device_accounts = {camera.uid: RTSP_ACCOUNT for camera in self.rtsp_cameras}
         self.refresh_cameras()
 
     def refresh_cameras(self) -> None:
@@ -3003,7 +3291,10 @@ class MainWindow(QMainWindow):
             if (password := stored_account_password(username))
         ]
         if not self.account_queue:
-            self.change_account()
+            if self.devices:
+                self.on_account_finished()
+            else:
+                self.change_account()
             return
         self.reconnect_timer.stop()
         self.retry_pending = False
@@ -3078,6 +3369,9 @@ class MainWindow(QMainWindow):
         self.latest_detection = None
         self.sync_quality_actions()
         self.on_capabilities_found([], None)
+        self.replay_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
+        self.ptz_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
+        self.ptz_panel.hide()
         self.stop_player()
         self.show_window_without_stream()
         self.watch_live()
@@ -3087,7 +3381,7 @@ class MainWindow(QMainWindow):
         self.set_status(message)
 
     def enter_replay(self, start: datetime | None) -> None:
-        if not self.devices or self.close_pending:
+        if not self.devices or self.close_pending or isinstance(getattr(self, "selected_device", None), RtspCamera):
             return
         self.show_window_without_stream()
         if self.replay is not None:
@@ -3162,7 +3456,6 @@ class MainWindow(QMainWindow):
             self.show_notice(f"Recording saved: {path}")
 
     def on_account_finished(self) -> None:
-        self.replay_button.setEnabled(bool(self.devices))
         self.account_worker = None
         self.account_secret = None
         if self.close_pending:
@@ -3175,15 +3468,20 @@ class MainWindow(QMainWindow):
                 (device for device in self.devices if device.uid == saved_uid),
                 next((device for device in self.devices if device.name == "Jardin"), self.devices[0]),
             )
-            if not saved_uid:
+            self.replay_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
+            self.ptz_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
+            if isinstance(self.selected_device, RtspCamera):
+                self.ptz_panel.hide()
+            if saved_uid != self.selected_device.uid:
                 self.settings.setValue("camera/selected_uid", self.selected_device.uid)
                 self.settings.setValue("camera/selected_account", self.device_accounts[self.selected_device.uid])
-                legacy_detection = self.settings.value(DETECTION_SETTING, "", str)
-                if legacy_detection:
-                    self.settings.setValue(f"{DETECTION_SETTING}/{self.selected_device.uid}", legacy_detection)
-                legacy_quality = self.settings.value(QUALITY_SETTING, "", str)
-                if legacy_quality:
-                    self.settings.setValue(f"{QUALITY_SETTING}/{self.selected_device.uid}", legacy_quality)
+                if not saved_uid:
+                    legacy_detection = self.settings.value(DETECTION_SETTING, "", str)
+                    if legacy_detection:
+                        self.settings.setValue(f"{DETECTION_SETTING}/{self.selected_device.uid}", legacy_detection)
+                    legacy_quality = self.settings.value(QUALITY_SETTING, "", str)
+                    if legacy_quality:
+                        self.settings.setValue(f"{QUALITY_SETTING}/{self.selected_device.uid}", legacy_quality)
                 self.settings.sync()
             self.sync_quality_actions()
             if self.stream_worker is None:
@@ -3208,9 +3506,11 @@ class MainWindow(QMainWindow):
             return
         self.reconnect_timer.stop()
         self.retry_pending = False
-        if not self.start_player():
+        rtsp_camera = self.selected_device if isinstance(self.selected_device, RtspCamera) else None
+        if not (self.start_player(rtsp_camera) if rtsp_camera else self.start_player()):
             return
-        assert self.player.stdin is not None
+        if rtsp_camera is None:
+            assert self.player.stdin is not None
         self.stream_error = False
         self.stream_live = False
         self.control_pending = False
@@ -3218,40 +3518,49 @@ class MainWindow(QMainWindow):
         self.reset_recording_state()
         self.zoom_level = 0
         set_button_icon(self.sound_button, "sound", "Listen to camera")
-        try:
-            continuous = ContinuousRecorder(continuous_directory(), safe_camera_name(self.selected_device.name))
-        except OSError:
-            continuous = None
-            self.show_notice("Unable to create the continuous recording folder.")
-        self.stream_worker = StreamWorker(
-            self.selected_device,
-            stored_camera_password(self.selected_device.uid) or "",
-            self.player.stdin,
-            continuous,
-        )
+        if rtsp_camera is not None:
+            assert self.mpv_socket is not None
+            self.stream_worker = RtspStreamWorker(rtsp_camera, self.player, self.mpv_socket)
+        else:
+            try:
+                continuous = ContinuousRecorder(continuous_directory(), safe_camera_name(self.selected_device.name))
+            except OSError:
+                continuous = None
+                self.show_notice("Unable to create the continuous recording folder.")
+            self.stream_worker = StreamWorker(
+                self.selected_device,
+                stored_camera_password(self.selected_device.uid) or "",
+                self.player.stdin,
+                continuous,
+            )
         self.stream_worker.set_continuous(self.continuous_recording_enabled())
-        self.stream_worker.set_display(self.isVisible() and not self.isMinimized())
+        if isinstance(self.stream_worker, StreamWorker):
+            self.stream_worker.set_display(self.isVisible() and not self.isMinimized())
         self.stream_worker.status_changed.connect(self.on_stream_status)
         self.stream_worker.failed.connect(self.on_stream_error)
-        self.stream_worker.control_completed.connect(self.on_control_completed)
-        self.stream_worker.control_failed.connect(self.on_control_failed)
-        self.stream_worker.sound_changed.connect(self.on_sound_changed)
-        self.stream_worker.sound_failed.connect(self.on_sound_failed)
+        if isinstance(self.stream_worker, StreamWorker):
+            self.stream_worker.control_completed.connect(self.on_control_completed)
+            self.stream_worker.control_failed.connect(self.on_control_failed)
+            self.stream_worker.sound_changed.connect(self.on_sound_changed)
+            self.stream_worker.sound_failed.connect(self.on_sound_failed)
         self.stream_worker.recording_started.connect(self.on_recording_started)
         self.stream_worker.recording_saved.connect(self.on_recording_saved)
         self.stream_worker.recording_failed.connect(self.on_recording_failed)
-        self.stream_worker.capabilities_found.connect(self.on_capabilities_found)
-        self.stream_worker.detections_listed.connect(self.on_detections_listed)
-        self.stream_worker.detections_failed.connect(self.on_detections_failed)
-        self.stream_worker.setting_completed.connect(self.on_setting_completed)
-        self.stream_worker.setting_failed.connect(self.on_setting_failed)
+        if isinstance(self.stream_worker, RtspStreamWorker):
+            self.stream_worker.continuous_failed.connect(self.on_continuous_failed)
+        if isinstance(self.stream_worker, StreamWorker):
+            self.stream_worker.capabilities_found.connect(self.on_capabilities_found)
+            self.stream_worker.detections_listed.connect(self.on_detections_listed)
+            self.stream_worker.detections_failed.connect(self.on_detections_failed)
+            self.stream_worker.setting_completed.connect(self.on_setting_completed)
+            self.stream_worker.setting_failed.connect(self.on_setting_failed)
         self.stream_worker.finished.connect(self.on_stream_finished)
         self.stream_worker.start()
         QTimer.singleShot(200, self.show_overlay)
         QTimer.singleShot(500, self.video.raise_interaction_layer)
 
-    def start_player(self) -> bool:
-        if self.player is not None and self.player.poll() is None:
+    def start_player(self, rtsp_camera: RtspCamera | None = None) -> bool:
+        if rtsp_camera is None and self.player is not None and self.player.poll() is None:
             self._mpv_command(["set_property", "video-zoom", 0])
             self.zoom_level = 0
             self.video_pan = (0.0, 0.0)
@@ -3262,8 +3571,9 @@ class MainWindow(QMainWindow):
         self.mpv_socket = Path(self.mpv_directory.name) / "control.sock"
         try:
             self.player = subprocess.Popen(
-                mpv_stream_command(self.mpv_socket, int(self.video.winId()), True),
-                stdin=subprocess.PIPE,
+                mpv_rtsp_command(self.mpv_socket, int(self.video.winId()), True, rtsp_camera)
+                if rtsp_camera else mpv_stream_command(self.mpv_socket, int(self.video.winId()), True),
+                stdin=subprocess.DEVNULL if rtsp_camera else subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 bufsize=0,
@@ -3301,14 +3611,15 @@ class MainWindow(QMainWindow):
         if message == "Live video":
             self.stream_live = True
             self.reconnect_attempts = 0
-            self.set_controls_enabled(not self.control_pending)
-            self.sound_button.setEnabled(True)
+            rtsp = isinstance(self.selected_device, RtspCamera)
+            self.set_controls_enabled(not self.control_pending and not rtsp)
+            self.sound_button.setEnabled(not rtsp)
             self.snapshot_button.setEnabled(True)
             self.record_button.setEnabled(True)
             self.zoom_out_button.setEnabled(False)
             self.zoom_in_button.setEnabled(True)
-            self.light_button.setEnabled(True)
-            self.quality_button.setEnabled(True)
+            self.light_button.setEnabled(not rtsp)
+            self.quality_button.setEnabled(not rtsp)
 
     def disable_live_controls(self) -> None:
         self.set_controls_enabled(False)
@@ -3324,7 +3635,7 @@ class MainWindow(QMainWindow):
 
     def set_controls_enabled(self, enabled: bool) -> None:
         for button in self.camera_buttons:
-            button.setEnabled(enabled)
+            button.setEnabled(enabled and not isinstance(getattr(self, "selected_device", None), RtspCamera))
 
     def show_overlay(self) -> None:
         if not self.isVisible() or self.isMinimized():
@@ -3424,6 +3735,13 @@ class MainWindow(QMainWindow):
     def on_recording_failed(self, message: str) -> None:
         if self.recording_path is not None:
             self.reset_recording_state()
+        self.show_notice(message)
+
+    def on_continuous_failed(self, message: str) -> None:
+        if hasattr(self, "continuous_action"):
+            self.continuous_action.setChecked(False)
+        else:
+            self.set_continuous_recording(False)
         self.show_notice(message)
 
     def change_zoom(self, step: int, x: int | None = None, y: int | None = None) -> None:
@@ -3572,7 +3890,7 @@ class MainWindow(QMainWindow):
         self.show_notice(message)
 
     def toggle_sound(self) -> None:
-        if self.stream_worker is None:
+        if not isinstance(self.stream_worker, StreamWorker):
             return
         self.sound_button.setEnabled(False)
         self.show_notice("Changing camera sound...")
@@ -3609,7 +3927,7 @@ class MainWindow(QMainWindow):
         self._mpv_command(["set_property", "video-pan-y", self.video_pan[1]])
 
     def move_by_drag(self, dx: int, dy: int) -> None:
-        if self.zoom_level > 0 or self.replay is not None:
+        if self.zoom_level > 0 or self.replay is not None or isinstance(getattr(self, "selected_device", None), RtspCamera):
             return
         if abs(dx) < DRAG_PIXELS_PER_STEP // 2 and abs(dy) < DRAG_PIXELS_PER_STEP // 2:
             return
@@ -3621,7 +3939,7 @@ class MainWindow(QMainWindow):
         self.control_camera((direction,) * count)
 
     def control_camera(self, commands: tuple[str, ...]) -> None:
-        if not self.stream_live or self.stream_worker is None or self.control_pending:
+        if not self.stream_live or not isinstance(self.stream_worker, StreamWorker) or self.control_pending:
             return
         if not self.stream_worker.queue_control(commands):
             return

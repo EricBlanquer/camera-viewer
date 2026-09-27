@@ -11,7 +11,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
-from app import MainWindow
+from app import MainWindow, RTSP_ACCOUNT, RtspCamera, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
 
 
 class TrayTest(unittest.TestCase):
@@ -110,6 +110,58 @@ class TrayTest(unittest.TestCase):
             self.window.on_account_finished()
             self.assertIs(self.window.selected_device, entrance)
             self.assertEqual(self.window.settings.value("accounts/okam"), ["first@example.com"])
+
+    def test_rtsp_camera_persists_and_appears_beside_account_camera(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:
+            self.window.settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.Format.IniFormat)
+            camera = RtspCamera("rtsp:test", "Entrée", "rtsp://192.0.2.10:8001/0")
+            garden = SimpleNamespace(name="Jardin", uid="garden")
+            self.window.rtsp_cameras = [camera]
+            self.window.save_rtsp_cameras()
+            self.assertEqual(load_rtsp_cameras(self.window.settings), [camera])
+            self.window.devices = [garden, camera]
+            self.window.device_accounts = {"garden": "first@example.com", camera.uid: RTSP_ACCOUNT}
+            self.window.selected_device = garden
+            self.window.update_cameras_menu()
+            actions = self.window.cameras_menu.actions()
+            self.assertEqual(actions[0].text(), "Jardin · O-KAM (first@example.com)")
+            self.assertEqual(actions[1].text(), "Entrée · RTSP (local)")
+            chosen: list[tuple[str, str]] = []
+            self.window.select_camera = lambda account, uid: chosen.append((account, uid))
+            actions[1].trigger()
+            self.assertEqual(chosen, [(RTSP_ACCOUNT, camera.uid)])
+            self.window.accounts = []
+            with patch.object(self.window, "watch_live"):
+                self.window.find_cameras()
+            self.assertEqual(self.window.devices, [camera])
+
+    def test_rtsp_url_rejects_embedded_credentials_and_invalid_ports(self) -> None:
+        self.assertTrue(valid_rtsp_url("rtsp://192.0.2.10:8001/0"))
+        self.assertFalse(valid_rtsp_url("rtsp://user:password@192.0.2.10:8001/0"))
+        self.assertFalse(valid_rtsp_url("rtsp://192.0.2.10:bad/0"))
+        camera = RtspCamera("rtsp:test", "Other", "rtsp://192.0.2.10:554/stream", "tcp")
+        self.assertIn("--rtsp-transport=tcp", mpv_rtsp_command(Path("/tmp/control.sock"), 1, True, camera))
+        with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:
+            self.window.settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.Format.IniFormat)
+            self.window.rtsp_cameras = [camera]
+            self.window.save_rtsp_cameras()
+            self.assertEqual(load_rtsp_cameras(self.window.settings), [camera])
+
+    def test_removing_selected_rtsp_camera_switches_to_remaining_camera(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:
+            self.window.settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.Format.IniFormat)
+            camera = RtspCamera("rtsp:test", "Entrée", "rtsp://192.0.2.10:8001/0")
+            garden = SimpleNamespace(name="Jardin", uid="garden")
+            self.window.rtsp_cameras = [camera]
+            self.window.devices = [garden, camera]
+            self.window.device_accounts = {"garden": "first@example.com", camera.uid: RTSP_ACCOUNT}
+            self.window.selected_device = camera
+            selected: list[tuple[str, str]] = []
+            self.window.select_camera = lambda account, uid: selected.append((account, uid))
+            self.window.remove_selected_rtsp_camera()
+            self.assertEqual(selected, [("first@example.com", "garden")])
+            self.assertEqual(self.window.devices, [garden])
+            self.assertEqual(load_rtsp_cameras(self.window.settings), [])
 
     def test_switching_camera_stops_previous_stream_before_starting_new_one(self) -> None:
         with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:

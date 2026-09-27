@@ -1,13 +1,14 @@
 # Camera Viewer
 
 Camera Viewer is a native Linux desktop viewer for security cameras.
-O-KAM Pro cameras are currently supported.
-It uses Qt for the interface, mpv for H.264 playback, and the MIT-licensed [O-KAM Native Bridge](https://github.com/oleandor/okam-ha-native) for camera discovery, wake-up, and encrypted P2P transport.
+O-KAM Pro account cameras and local RTSP cameras are supported.
+It uses Qt for the interface, mpv for H.264 and H.265 playback, and the MIT-licensed [O-KAM Native Bridge](https://github.com/oleandor/okam-ha-native) for O-KAM camera discovery, wake-up, and encrypted P2P transport.
 It does not require Home Assistant, Wine, Waydroid, or the phone while viewing.
 
 ## Install
 
-Requirements: Python 3.11 or newer, PyQt6, python3-xlib, mpv, ffmpeg with ffplay, Git, `secret-tool` with an unlocked desktop keyring, and network access to O-KAM's services.
+Requirements: Python 3.11 or newer, PyQt6, python3-xlib, mpv, ffmpeg with ffplay, and Git.
+O-KAM accounts also require `secret-tool` with an unlocked desktop keyring and network access to O-KAM's services.
 On this computer these programs are already installed.
 
 ```sh
@@ -23,13 +24,21 @@ It keeps the vendor wake configuration in `~/.local/share/okam-linux/vendor` wit
 ## Use
 
 Open **Camera Viewer** from the application menu or run `.venv/bin/python app.py` from this directory.
-On first launch, enter an O-KAM account email and password in the sign-in dialog.
-The application saves the password in the desktop keyring, remembers the account in Qt settings, finds its cameras, and starts the last selected camera or Jardin automatically.
+On first launch, enter an O-KAM account email and password in the sign-in dialog, or close that dialog and add an RTSP camera from the tray menu.
+For O-KAM, the application saves the password in the desktop keyring and remembers the account in Qt settings.
+Later launches start the last selected camera or Jardin automatically.
 Use **Add camera > O-KAM account...** in the tray menu to add another account.
-The **Cameras** submenu lists the discovered cameras by name and account and switches the displayed camera.
+Use **Add camera > RTSP camera...** to add a camera by name, RTSP URL without embedded credentials, and UDP or TCP transport.
+The **Cameras** submenu lists O-KAM cameras by account and local RTSP cameras by name, switches the displayed camera, and can remove the selected RTSP camera.
 Use **Refresh camera list** there after adding a camera to an existing O-KAM account.
 Later launches show only the video and its controls.
-Run `.venv/bin/python app.py --forget-account` to remove all saved O-KAM accounts and show the sign-in dialog on the next launch.
+Run `.venv/bin/python app.py --forget-account` to remove all saved O-KAM accounts.
+
+The TERUHAL QW55 used with iCam365 provides an RTSP stream at `rtsp://<camera-LAN-address>:8001/0`.
+Select UDP transport for this model.
+Give the camera a stable LAN address so the saved URL remains valid.
+For RTSP cameras, live view, photo, local video recording, and continuous recording are available; iCam365 playback, sound, detection notifications, and camera movement controls are not available through this RTSP connection.
+An RTSP URL is reachable outside the home only when the computer has a secure route to the camera's LAN, such as a VPN; the iCam365 account relay is not integrated.
 
 The window keeps the camera's 16:9 ratio while it is resized, and the video fills it without black bars.
 The current state appears in the window title.
@@ -39,24 +48,24 @@ Use **Full screen** to expand the viewer.
 **Photo** saves a picture and **Record** saves the live video as a Matroska file in `Pictures/O-KAM Linux`.
 The existing media and settings paths retain their O-KAM Linux names so earlier recordings and account settings remain available.
 A counter at the top of the video shows the recording duration.
-Use **Sound** to listen to or silence the camera microphone, and the bulb button to switch the camera's white light.
+For O-KAM cameras, use **Sound** to listen to or silence the camera microphone, and the bulb button to switch the camera's white light.
 The magnifier buttons zoom the picture locally.
-The arrow buttons send short pan and tilt pulses to the camera.
-Drag the video horizontally or vertically with the left mouse button to move it by up to four short pulses.
-**Preset 1** through **Preset 5** recall its saved positions.
+For O-KAM cameras, the arrow buttons send short pan and tilt pulses to the camera.
+For O-KAM cameras, drag the video horizontally or vertically with the left mouse button to move it by up to four short pulses.
+For O-KAM cameras, **Preset 1** through **Preset 5** recall its saved positions.
 
 When the desktop provides a notification area, Camera Viewer shows an icon there instead of a taskbar entry.
 Click the icon to show or hide the window, or open its menu to use the same controls or quit.
 Opening Camera Viewer again from the application menu shows the running instance instead of starting a second one.
 Closing the window hides it; live video keeps running in the background so continuous recording and detection checks continue.
 
-The playback button switches the window to the recordings stored on the camera's microSD card, and **LIVE** returns to live video.
+For O-KAM cameras, the playback button switches the window to the recordings stored on the camera's microSD card, and **LIVE** returns to live video.
 In playback, the control bar shows a timeline with continuous recording in blue and detections in red; drag it or click a time to play from there, and use the wheel or the magnifier buttons to show a shorter or longer period.
 Playback starts while the recording is still loading, with sound, pause, and speeds up to 8x.
 The picture button saves the current image, and the download button saves the loaded recording as a Matroska file.
 Clicking a detection notification opens the playback at that detection.
 
-Every minute, Camera Viewer checks the selected camera's microSD card for new detection recordings and shows a desktop notification with the time of the latest one.
+Every minute, Camera Viewer checks the selected O-KAM camera's microSD card for new detection recordings and shows a desktop notification with the time of the latest one.
 The check uses the live connection.
 
 Camera Viewer also records the selected live video continuously on this computer, in ten-minute Matroska files in `Videos/O-KAM Linux/Continuous`, and deletes files older than 24 hours.
