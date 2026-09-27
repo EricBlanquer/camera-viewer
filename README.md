@@ -32,8 +32,10 @@ Use **Add camera > RTSP camera...** to add a camera by name, RTSP URL without em
 The **Cameras** submenu lists O-KAM cameras by account and local RTSP cameras by name, switches the displayed camera, and can remove the selected RTSP camera.
 With **Show all cameras** enabled in the tray menu, the selected camera and the other cameras appear together in a grid; this is on by default.
 Use **Camera layout > Side by side** or **Stacked** to place the feeds horizontally or vertically; the layout choice is remembered.
+When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 Drag one camera title onto another to exchange their positions; the order is remembered without restarting either stream.
 The selected camera keeps the live controls, sound, photo, recording, and replay features available for its type; the other camera views display live video and reconnect independently.
+In multi-camera view, the selected camera's controls remain visible and its **Controls** button can show or hide them.
 Turn off **Show all cameras** to return to one video.
 Use **Refresh camera list** there after adding a camera to an existing O-KAM account.
 Later launches show only the video and its controls.

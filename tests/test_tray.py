@@ -112,7 +112,8 @@ class TrayTest(unittest.TestCase):
             with patch("app.save_account_password", return_value=True):
                 self.window.on_devices_found([garden, entrance])
             self.window.watch_live = lambda: None
-            self.window.on_account_finished()
+            with patch.object(CameraPreview, "start"):
+                self.window.on_account_finished()
             self.assertIs(self.window.selected_device, entrance)
             self.assertEqual(self.window.settings.value("accounts/okam"), ["first@example.com"])
 
@@ -157,7 +158,7 @@ class TrayTest(unittest.TestCase):
         entrance = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
         self.window.devices = [garden, entrance]
         self.window.selected_device = garden
-        with patch.object(CameraPreview, "start"):
+        with patch.object(CameraPreview, "start") as start_preview:
             self.window.sync_previews()
             self.assertEqual(list(self.window.previews), [entrance.uid])
             self.assertIs(self.window.video_grid.itemAtPosition(0, 1).widget(), self.window.previews[entrance.uid])
@@ -168,6 +169,7 @@ class TrayTest(unittest.TestCase):
             self.assertIs(self.window.video_grid.itemAtPosition(0, 0).widget(), self.window.previews[entrance.uid])
             self.assertIs(self.window.video_grid.itemAtPosition(1, 0).widget(), self.window.primary_pane)
             self.assertEqual(self.window.settings.value("view/camera_layout"), "vertical")
+            self.assertEqual(start_preview.call_count, 1)
             self.window.selected_device = entrance
             self.window.sync_previews()
             self.assertEqual(list(self.window.previews), [garden.uid])
@@ -185,6 +187,28 @@ class TrayTest(unittest.TestCase):
         frame.resize(500, 500)
         self.assertEqual((video.width(), video.height()), (500, 281))
         frame.close()
+
+    def test_wide_docked_window_uses_horizontal_layout(self) -> None:
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.window.devices = [
+            SimpleNamespace(name="Jardin", uid="garden"),
+            RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0"),
+        ]
+        self.window.selected_device = self.window.devices[0]
+        self.window.settings.setValue("view/camera_layout", "vertical")
+        with patch.object(CameraPreview, "start"):
+            self.window.show()
+            self.window.resize(screen.width(), screen.height() // 2)
+            self.window.sync_previews()
+            self.assertEqual(self.window.effective_camera_layout(), "horizontal")
+            self.assertIs(self.window.video_grid.itemAtPosition(0, 1).widget(), self.window.previews["rtsp:entrance"])
+            self.window.show_overlay()
+            self.assertTrue(self.window.overlay.isVisible())
+            self.assertFalse(self.window.overlay_timer.isActive())
+            self.window.resize(screen.width() // 2, screen.height())
+            self.window.sync_previews()
+            self.assertEqual(self.window.effective_camera_layout(), "vertical")
+            self.assertIs(self.window.video_grid.itemAtPosition(1, 0).widget(), self.window.previews["rtsp:entrance"])
 
     def test_removing_selected_rtsp_camera_switches_to_remaining_camera(self) -> None:
         with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:
@@ -219,7 +243,8 @@ class TrayTest(unittest.TestCase):
             self.window.select_camera("second@example.com", "entrance")
             self.assertEqual(stopped, [True])
             self.assertIs(self.window.selected_device, garden)
-            self.window.on_stream_finished()
+            with patch.object(CameraPreview, "start"):
+                self.window.on_stream_finished()
             self.assertEqual(started, ["entrance"])
             self.assertEqual(self.window.settings.value("camera/selected_uid"), "entrance")
             self.assertEqual(self.window.quality_button.text(), "Auto")

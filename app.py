@@ -2891,6 +2891,9 @@ class MainWindow(QMainWindow):
         self.previews: dict[str, CameraPreview] = {}
         self.retired_previews: list[CameraPreview] = []
         self.preview_layout: str | None = None
+        self.layout_refresh_timer = QTimer(self)
+        self.layout_refresh_timer.setSingleShot(True)
+        self.layout_refresh_timer.timeout.connect(self.sync_previews)
         self.pending_camera: tuple[str, str] | None = None
         self.account_queue: list[tuple[str, str]] = []
         self.account_worker: AccountWorker | None = None
@@ -2956,9 +2959,20 @@ class MainWindow(QMainWindow):
         primary_layout = QVBoxLayout(self.primary_pane)
         primary_layout.setContentsMargins(0, 0, 0, 0)
         primary_layout.setSpacing(0)
+        primary_header = QWidget()
+        primary_header.setStyleSheet("background-color: #242424;")
+        primary_header_layout = QHBoxLayout(primary_header)
+        primary_header_layout.setContentsMargins(0, 0, 4, 0)
+        primary_header_layout.setSpacing(0)
         self.primary_label = CameraTitle("", "")
         self.primary_label.moved.connect(self.swap_cameras)
-        primary_layout.addWidget(self.primary_label)
+        primary_header_layout.addWidget(self.primary_label, 1)
+        self.controls_button = QPushButton("Controls")
+        self.controls_button.setAccessibleName("Show camera controls")
+        self.controls_button.setStyleSheet("color: white; background-color: #242424; border: none; padding: 4px 8px;")
+        self.controls_button.clicked.connect(self.toggle_overlay)
+        primary_header_layout.addWidget(self.controls_button)
+        primary_layout.addWidget(primary_header)
         self.primary_frame = AspectVideoFrame(self.video)
         primary_layout.addWidget(self.primary_frame, 1)
         self.video_grid.addWidget(self.primary_pane, 0, 0)
@@ -3431,6 +3445,18 @@ class MainWindow(QMainWindow):
         value = self.settings.value(MULTIVIEW_LAYOUT_SETTING, "horizontal", str)
         return value if value in ("horizontal", "vertical") else "horizontal"
 
+    def effective_camera_layout(self) -> str:
+        preferred = self.camera_layout()
+        if not self.isVisible() or len(self.devices) < 2:
+            return preferred
+        screen = self.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry()
+        if self.width() >= available.width() * 0.85 and self.width() > self.height() * 1.5:
+            return "horizontal"
+        if self.height() >= available.height() * 0.85 and self.height() > self.width() * 0.8:
+            return "vertical"
+        return preferred
+
     def set_camera_layout(self, value: str) -> None:
         if value not in ("horizontal", "vertical"):
             return
@@ -3477,7 +3503,7 @@ class MainWindow(QMainWindow):
             [camera for camera in ordered if camera.uid != selected.uid]
             if selected is not None and self.settings.value(MULTIVIEW_SETTING, True, bool) else []
         )
-        layout = self.camera_layout()
+        layout = self.effective_camera_layout()
         changed = len(cameras) != len(self.previews) or layout != self.preview_layout
         desired = {camera.uid for camera in cameras}
         for uid, preview in list(self.previews.items()):
@@ -3507,6 +3533,8 @@ class MainWindow(QMainWindow):
             self.aspect_fitted = False
             if self.isVisible():
                 QTimer.singleShot(0, self.fit_video_aspect)
+        if cameras and self.isVisible():
+            QTimer.singleShot(0, self.show_overlay)
 
     def add_rtsp_camera(self) -> None:
         dialog = QDialog(self)
@@ -3963,7 +3991,7 @@ class MainWindow(QMainWindow):
         self.video.place_overlay()
         self.overlay.show()
         self.video.raise_interaction_layer()
-        if self.replay is None:
+        if self.replay is None and not self.previews:
             self.overlay_timer.start(OVERLAY_TIMEOUT_MS)
         else:
             self.overlay_timer.stop()
@@ -4103,7 +4131,7 @@ class MainWindow(QMainWindow):
         if self.isFullScreen():
             return
         count = 1 + len(self.previews)
-        columns = 1 if self.camera_layout() == "vertical" or count == 1 else 2
+        columns = 1 if self.effective_camera_layout() == "vertical" or count == 1 else 2
         rows = (count + columns - 1) // columns
         label_height = self.primary_label.sizeHint().height()
         available_height = QApplication.primaryScreen().availableGeometry().height() - 80
@@ -4116,6 +4144,11 @@ class MainWindow(QMainWindow):
         if self.window_hints is not None:
             self.window_hints.set_aspect_ratio(width, height)
         self.resize(width, height)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if getattr(self, "previews", None) and self.effective_camera_layout() != self.preview_layout:
+            self.layout_refresh_timer.start(0)
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
@@ -4348,6 +4381,7 @@ class MainWindow(QMainWindow):
             self.hide_to_tray()
             return
         self.reconnect_timer.stop()
+        self.layout_refresh_timer.stop()
         self.retry_pending = False
         for uid, preview in list(self.previews.items()):
             del self.previews[uid]
