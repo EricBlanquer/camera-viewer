@@ -1,5 +1,6 @@
 import os
 import unittest
+from types import SimpleNamespace
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
@@ -51,6 +52,17 @@ class ReconnectTest(unittest.TestCase):
         self.window.stop_stream()
         self.assertIsNone(self.window.player)
         self.assertTrue(player.terminated)
+
+    def test_live_button_returns_to_live_video(self) -> None:
+        stopped: list[bool] = []
+        reconnected: list[bool] = []
+        self.window.show()
+        self.window.replay = SimpleNamespace(stop=lambda: stopped.append(True))
+        self.window.reconnect = lambda: reconnected.append(True)
+        self.window.live_button.click()
+        self.assertEqual(stopped, [True])
+        self.assertEqual(reconnected, [True])
+        self.assertIsNone(self.window.replay)
 
     def test_rejected_camera_credentials_do_not_retry(self) -> None:
         self.window.on_stream_error("The camera rejected the available credentials.")

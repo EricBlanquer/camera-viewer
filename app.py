@@ -191,6 +191,7 @@ LIVE_BUTTON_LABEL = "LIVE"
 LOADING_STATUS = "Loading recording {percent}%"
 DETECTION_JUMP_MARGIN_SECONDS = 5
 DETECTION_RECENT_SECONDS = 30
+DETECTION_MERGE_SECONDS = 10
 RECORDING_CHAIN_TOLERANCE_SECONDS = 5
 MAX_RECORDING_RELOADS = 2
 MAX_REPLAY_DAYS = 31
@@ -200,6 +201,7 @@ TIMELINE_HEIGHT = 84
 TIMELINE_HEADER_HEIGHT = 28
 TIMELINE_TICK_HEIGHT = 10
 TIMELINE_DRAG_PIXELS = 4
+TIMELINE_MERGE_SECONDS = 2
 TIMELINE_MAX_LABELS = 8
 TIMELINE_DEFAULT_ZOOM = 4
 TIMELINE_SPANS = (600, 1800, 3600, 3 * 3600, 6 * 3600, 12 * 3600, 24 * 3600, 3 * 24 * 3600)
@@ -1273,6 +1275,24 @@ class StreamWorker(QThread):
 
 
 @dataclass(frozen=True)
+class RecordingSpan:
+    start: datetime
+    end: datetime
+    first: CardRecording
+
+
+def merge_recordings(recordings: list[CardRecording], gap: timedelta) -> list[RecordingSpan]:
+    spans: list[RecordingSpan] = []
+    for recording in sorted(recordings, key=lambda item: item.start):
+        if spans and recording.start <= spans[-1].end + gap:
+            last = spans[-1]
+            spans[-1] = RecordingSpan(last.start, max(last.end, recording.end), last.first)
+        else:
+            spans.append(RecordingSpan(recording.start, recording.end, recording))
+    return spans
+
+
+@dataclass(frozen=True)
 class CardFrame:
     timestamp: float
     frame_type: int
@@ -1857,18 +1877,16 @@ class TimelineWidget(QWidget):
         start, end = self.visible_range()
         bar_top = TIMELINE_HEADER_HEIGHT + TIMELINE_TICK_HEIGHT + 4
         bar_height = self.height() - bar_top - 6
-        for recording in self.recordings:
-            if recording.end < start or recording.start > end:
-                continue
-            left = max(0.0, self.x_at(recording.start))
-            right = min(float(width), self.x_at(recording.end))
-            color = TIMELINE_DETECTION_COLOR if recording.detection else TIMELINE_RECORDING_COLOR
-            painter.fillRect(QRectF(left, bar_top, max(1.0, right - left), bar_height), color)
-        for recording in self.recordings:
-            if recording.detection and start <= recording.end and recording.start <= end:
-                left = max(0.0, self.x_at(recording.start))
-                right = min(float(width), self.x_at(recording.end))
-                painter.fillRect(QRectF(left, bar_top, max(2.0, right - left), bar_height), TIMELINE_DETECTION_COLOR)
+        gap = timedelta(seconds=TIMELINE_MERGE_SECONDS)
+        continuous = merge_recordings([recording for recording in self.recordings if not recording.detection], gap)
+        detections = merge_recordings([recording for recording in self.recordings if recording.detection], gap)
+        for spans, color in ((continuous, TIMELINE_RECORDING_COLOR), (detections, TIMELINE_DETECTION_COLOR)):
+            for span in spans:
+                if span.end < start or span.start > end:
+                    continue
+                left = max(0.0, self.x_at(span.start))
+                right = min(float(width), self.x_at(span.end))
+                painter.fillRect(QRectF(left, bar_top, max(2.0, right - left), bar_height), color)
         step = self.label_step()
         first = datetime.fromtimestamp((camera_timestamp(start) // step + 1) * step, timezone.utc).replace(tzinfo=None)
         painter.setPen(TIMELINE_LABEL_COLOR)
@@ -1944,7 +1962,6 @@ class ReplayController(QObject):
         self.pending_jump = 0
         self.jump_origin = datetime.now()
         self.last_position: datetime | None = None
-        self.last_detection: CardRecording | None = None
         self.reloads = 0
         self.playing = False
         self.sound = True
@@ -2028,41 +2045,29 @@ class ReplayController(QObject):
         self.pending_jump = direction
         self.continue_jump()
 
+    def detection_events(self) -> list[RecordingSpan]:
+        detections = [recording for recording in self.all_recordings() if recording.detection]
+        return merge_recordings(detections, timedelta(seconds=DETECTION_MERGE_SECONDS))
+
     def continue_jump(self) -> None:
         direction = self.pending_jump
-        detections = [recording for recording in self.all_recordings() if recording.detection]
+        events = self.detection_events()
+        recent = timedelta(seconds=DETECTION_RECENT_SECONDS)
+        containing = next(
+            (event for event in events if event.start <= self.jump_origin <= event.end + recent),
+            None,
+        )
+        margin = timedelta(seconds=DETECTION_JUMP_MARGIN_SECONDS)
         if direction < 0:
-            playing = self.current.recording if self.current is not None else None
-            if playing is None or not playing.detection or not playing.start <= self.jump_origin < playing.end:
-                playing = next(
-                    (recording for recording in reversed(detections) if recording.start <= self.jump_origin < recording.end),
-                    None,
-                )
-            recent = self.last_detection
-            if (
-                playing is None
-                and recent is not None
-                and recent.start <= self.jump_origin <= recent.end + timedelta(seconds=DETECTION_RECENT_SECONDS)
-            ):
-                playing = recent
-            limit = playing.start if playing is not None else self.jump_origin
-            found = next(
-                (
-                    recording
-                    for recording in reversed(detections)
-                    if recording.start < limit - timedelta(seconds=DETECTION_JUMP_MARGIN_SECONDS)
-                ),
-                None,
-            )
+            limit = containing.start if containing is not None else self.jump_origin
+            found = next((event for event in reversed(events) if event.start < limit - margin), None)
         else:
-            found = next(
-                (recording for recording in detections if recording.start > self.jump_origin + timedelta(seconds=DETECTION_JUMP_MARGIN_SECONDS)),
-                None,
-            )
+            limit = containing.end if containing is not None else self.jump_origin + margin
+            found = next((event for event in events if event.start > limit), None)
         if found is not None:
             self.pending_jump = 0
-            LOG.info("Jump %s from %s to detection %s", "back" if direction < 0 else "forward", self.jump_origin, found.name)
-            self.seek(found.start, found)
+            LOG.info("Jump %s from %s to detection %s", "back" if direction < 0 else "forward", self.jump_origin, found.first.name)
+            self.seek(found.start, found.first)
             return
         loaded = sorted(self.recordings)
         today = datetime.now().strftime(RECORD_DAY_FORMAT)
@@ -2095,8 +2100,6 @@ class ReplayController(QObject):
 
     def seek(self, moment: datetime, preferred: CardRecording | None = None) -> None:
         recording = preferred or self.recording_at(moment)
-        if recording is not None and recording.detection:
-            self.last_detection = recording
         LOG.info("Seek to %s in %s", moment, recording.name if recording is not None else "no recording")
         if recording is None:
             self.status_changed.emit("No recording at this time.")
@@ -2133,11 +2136,17 @@ class ReplayController(QObject):
         self.status_changed.emit(f"Playback {moment:%d/%m/%Y %H:%M:%S}")
 
     def next_recording(self, recording: CardRecording) -> CardRecording | None:
-        threshold = recording.end - timedelta(seconds=RECORDING_CHAIN_TOLERANCE_SECONDS)
-        candidates = [candidate for candidate in self.all_recordings() if candidate.start >= threshold and candidate != recording]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda candidate: (candidate.start, candidate.detection != recording.detection))
+        moment = recording.end
+        others = [candidate for candidate in self.all_recordings() if candidate != recording]
+        covering = [
+            candidate
+            for candidate in others
+            if candidate.start <= moment < candidate.end - timedelta(seconds=RECORDING_CHAIN_TOLERANCE_SECONDS)
+        ]
+        if covering:
+            return max(covering, key=lambda candidate: (candidate.detection, candidate.end))
+        later = [candidate for candidate in others if candidate.start >= moment - timedelta(seconds=RECORDING_CHAIN_TOLERANCE_SECONDS)]
+        return min(later, key=lambda candidate: candidate.start) if later else None
 
     def on_finished(self, name: str) -> None:
         if self.current is None or self.current.recording.name != name:
@@ -2154,7 +2163,7 @@ class ReplayController(QObject):
             self.set_playing(False)
             self.status_changed.emit("End of the recordings.")
             return
-        self.seek(following.start, following)
+        self.seek(max(following.start, recording.end), following)
 
     def on_progress(self, name: str, fraction: float) -> None:
         if self.current is None or self.current.recording.name != name or not self.waiting_for_target:
@@ -2380,7 +2389,7 @@ class MainWindow(QMainWindow):
         self.live_button.setFixedSize(64, 44)
         self.live_button.setToolTip("Back to live video")
         self.live_button.setAccessibleName("Back to live video")
-        self.live_button.clicked.connect(self.exit_replay)
+        self.live_button.clicked.connect(lambda: self.exit_replay())
         self.replay_play_button = QPushButton()
         self.replay_sound_button = QPushButton()
         self.replay_speed_button = QPushButton(REPLAY_SPEED_LABEL.format(speed=REPLAY_SPEEDS[0]))

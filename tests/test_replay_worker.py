@@ -98,16 +98,20 @@ class ReplayLoadingTest(unittest.TestCase):
         finally:
             controller.stop()
 
-    def test_previous_detection_skips_the_overlapping_clip_being_played(self) -> None:
+    def test_overlapping_detections_form_one_event(self) -> None:
         controller = ReplayController(SimpleNamespace(), "", TimelineWidget())
         try:
             controller.worker.download = lambda buffer: None
             first = recording("20260926230955_011.mp4")
             second = recording("20260926231004_011.mp4")
-            controller.recordings["20260926"] = [recording("20260926192809_011.mp4"), first, second]
+            earlier = recording("20260926192809_011.mp4")
+            controller.recordings["20260926"] = [earlier, first, second]
             controller.seek(second.start, second)
             controller.timeline.center = datetime(2026, 9, 26, 23, 10, 20)
             controller.jump_to_detection(-1)
+            self.assertEqual(controller.current.recording, earlier)
+            controller.timeline.center = datetime(2026, 9, 26, 19, 28, 20)
+            controller.jump_to_detection(1)
             self.assertEqual(controller.current.recording, first)
         finally:
             controller.stop()
@@ -124,10 +128,11 @@ class ReplayLoadingTest(unittest.TestCase):
             controller.recordings["20260926"] = [first, detection, second]
             controller.seek(first.start)
             controller.on_downloaded(first.name, "/nonexistent/first.mkv")
-            self.assertEqual(downloads, [first.name, second.name])
+            self.assertEqual(downloads, [first.name, detection.name])
             controller.on_finished(first.name)
-            self.assertEqual(controller.current.recording, second)
-            self.assertEqual(downloads, [first.name, second.name])
+            self.assertEqual(controller.current.recording, detection)
+            self.assertEqual(controller.timeline.center, first.end)
+            self.assertEqual(downloads, [first.name, detection.name])
         finally:
             controller.stop()
 
@@ -143,7 +148,8 @@ class ReplayLoadingTest(unittest.TestCase):
             controller.saved_clips[continuous.name] = Path("/nonexistent/continuous.mkv")
             controller.seek(continuous.start, continuous)
             controller.on_finished(continuous.name)
-            self.assertEqual(controller.current.recording, following)
+            self.assertEqual(controller.current.recording, detection)
+            self.assertEqual(controller.timeline.center, continuous.end)
         finally:
             controller.stop()
 
