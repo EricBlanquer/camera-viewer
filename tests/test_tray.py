@@ -11,7 +11,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
-from app import MainWindow, RTSP_ACCOUNT, RtspCamera, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
+from app import CameraPreview, MainWindow, RTSP_ACCOUNT, RtspCamera, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
 
 
 class TrayTest(unittest.TestCase):
@@ -20,13 +20,17 @@ class TrayTest(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
-        self.window = MainWindow()
+        self.settings_directory = tempfile.TemporaryDirectory(prefix="intraswitch_okam_")
+        settings = QSettings(str(Path(self.settings_directory.name) / "settings.ini"), QSettings.Format.IniFormat)
+        with patch("app.QSettings", return_value=settings), patch("app.QTimer.singleShot"):
+            self.window = MainWindow()
         if self.window.tray is None:
             self.window.create_tray()
 
     def tearDown(self) -> None:
         self.window.quit_requested = True
         self.window.close()
+        self.settings_directory.cleanup()
         QApplication.setQuitOnLastWindowClosed(True)
 
     def tray_action(self, label: str):
@@ -56,6 +60,7 @@ class TrayTest(unittest.TestCase):
         self.window.show()
         self.window.close()
         self.assertFalse(self.window.isVisible())
+        self.window.reconnect = lambda: None
         self.window.toggle_window()
         self.assertTrue(self.window.isVisible())
 
@@ -146,6 +151,22 @@ class TrayTest(unittest.TestCase):
             self.window.rtsp_cameras = [camera]
             self.window.save_rtsp_cameras()
             self.assertEqual(load_rtsp_cameras(self.window.settings), [camera])
+
+    def test_show_all_cameras_keeps_a_preview_for_each_other_camera(self) -> None:
+        garden = SimpleNamespace(name="Jardin", uid="garden")
+        entrance = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
+        self.window.devices = [garden, entrance]
+        self.window.selected_device = garden
+        with patch.object(CameraPreview, "start"):
+            self.window.sync_previews()
+            self.assertEqual(list(self.window.previews), [entrance.uid])
+            self.assertIs(self.window.video_grid.itemAtPosition(0, 1).widget(), self.window.previews[entrance.uid])
+            self.window.selected_device = entrance
+            self.window.sync_previews()
+            self.assertEqual(list(self.window.previews), [garden.uid])
+            self.window.set_show_all_cameras(False)
+            self.assertEqual(self.window.previews, {})
+            self.assertFalse(self.window.settings.value("view/show_all_cameras", True, bool))
 
     def test_removing_selected_rtsp_camera_switches_to_remaining_camera(self) -> None:
         with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:

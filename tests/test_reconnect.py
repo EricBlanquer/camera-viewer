@@ -1,9 +1,13 @@
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
+from pathlib import Path
+from unittest.mock import patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
+from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
 from app import ACCOUNT_REJECTED_MESSAGE, MainWindow
@@ -30,10 +34,15 @@ class ReconnectTest(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
-        self.window = MainWindow()
+        self.settings_directory = tempfile.TemporaryDirectory(prefix="intraswitch_okam_")
+        settings = QSettings(str(Path(self.settings_directory.name) / "settings.ini"), QSettings.Format.IniFormat)
+        with patch("app.QSettings", return_value=settings), patch("app.QTimer.singleShot"):
+            self.window = MainWindow()
 
     def tearDown(self) -> None:
+        self.window.quit_requested = True
         self.window.close()
+        self.settings_directory.cleanup()
 
     def test_transport_failure_schedules_retry_and_stop_cancels_it(self) -> None:
         self.window.on_stream_error("camera closed the native P2P session")
@@ -41,6 +50,13 @@ class ReconnectTest(unittest.TestCase):
         self.assertTrue(self.window.reconnect_timer.isActive())
         self.window.stop_stream()
         self.assertFalse(self.window.reconnect_timer.isActive())
+
+    def test_reconnect_discovers_cameras_before_a_selection_exists(self) -> None:
+        self.window.devices = [SimpleNamespace(name="Entrance", uid="entrance")]
+        discoveries: list[bool] = []
+        self.window.find_cameras = lambda: discoveries.append(True)
+        self.window.reconnect()
+        self.assertEqual(discoveries, [True])
 
     def test_player_keeps_last_image_while_reconnecting(self) -> None:
         player = FakePlayer()

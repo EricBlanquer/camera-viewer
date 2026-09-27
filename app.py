@@ -50,6 +50,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -94,6 +95,7 @@ APPLICATION_NAME = "Camera Viewer"
 STORAGE_NAME = "O-KAM Linux"
 RTSP_ACCOUNT = "rtsp"
 RTSP_CAMERAS_SETTING = "cameras/rtsp"
+MULTIVIEW_SETTING = "view/show_all_cameras"
 LOG = logging.getLogger("okam-linux")
 LOG_DIRECTORY = Path.home() / ".cache/okam-linux"
 LOG_FILE_NAME = "okam-linux.log"
@@ -575,6 +577,23 @@ def mpv_rtsp_command(socket_path: Path, window_id: int, fill: bool, camera: Rtsp
     command[-1] = camera.url
     command.insert(-1, f"--rtsp-transport={camera.transport}")
     return command
+
+
+def stop_mpv_player(player: subprocess.Popen[bytes] | None) -> None:
+    if player is None:
+        return
+    if player.stdin is not None:
+        try:
+            player.stdin.close()
+        except OSError:
+            pass
+    if player.poll() is None:
+        player.terminate()
+        try:
+            player.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            player.kill()
+            player.wait(timeout=3)
 
 
 def media_directory() -> Path:
@@ -2603,16 +2622,16 @@ class RtspStreamWorker(QThread):
                 return
             self.status_changed.emit("Live video")
             last_prune = 0.0
-            last_frame = None
-            last_frame_at = time.monotonic()
+            last_position = None
+            last_progress_at = time.monotonic()
             while not self.stop_requested.is_set():
                 if self.player.poll() is not None:
                     raise OSError("The RTSP video player stopped.")
-                frame_ready, frame_number = mpv_request(self.socket_path, ["get_property", "estimated-frame-number"])
-                if frame_ready and isinstance(frame_number, int) and frame_number != last_frame:
-                    last_frame = frame_number
-                    last_frame_at = time.monotonic()
-                elif time.monotonic() - last_frame_at > 45:
+                position_ready, position = mpv_request(self.socket_path, ["get_property", "time-pos"])
+                if position_ready and isinstance(position, (int, float)) and position != last_position:
+                    last_position = position
+                    last_progress_at = time.monotonic()
+                elif time.monotonic() - last_progress_at > 45:
                     raise OSError("The RTSP video stream stopped producing frames.")
                 if self.continuous_enabled.is_set() and self.continuous is None:
                     try:
@@ -2664,6 +2683,116 @@ class RtspStreamWorker(QThread):
                 self._finish(self.continuous)
 
 
+class CameraPreview(QWidget):
+    stopped = pyqtSignal()
+
+    def __init__(self, camera: AccountDevice | RtspCamera) -> None:
+        super().__init__()
+        self.camera = camera
+        self.player: subprocess.Popen[bytes] | None = None
+        self.mpv_directory: tempfile.TemporaryDirectory[str] | None = None
+        self.worker: StreamWorker | RtspStreamWorker | None = None
+        self.closing = False
+        self.retry_enabled = True
+        self.retry_seconds = 2
+        self.retry_timer = QTimer(self)
+        self.retry_timer.setSingleShot(True)
+        self.retry_timer.timeout.connect(self.start)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.label = QLabel(camera.name)
+        self.label.setStyleSheet("color: white; background-color: #242424; padding: 5px 10px;")
+        layout.addWidget(self.label)
+        self.video = QWidget()
+        self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+        self.video.setMinimumSize(320, 180)
+        self.video.setStyleSheet("background-color: #171717;")
+        layout.addWidget(self.video, 1)
+
+    def start(self) -> None:
+        if self.closing or self.worker is not None:
+            return
+        self.label.setText(f"{self.camera.name} · Connecting...")
+        try:
+            self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-mpv-")
+        except OSError:
+            self.label.setText(f"{self.camera.name} · Player unavailable")
+            self._retry()
+            return
+        socket_path = Path(self.mpv_directory.name) / "control.sock"
+        rtsp_camera = self.camera if isinstance(self.camera, RtspCamera) else None
+        command = (
+            mpv_rtsp_command(socket_path, int(self.video.winId()), True, rtsp_camera)
+            if rtsp_camera else mpv_stream_command(socket_path, int(self.video.winId()), True)
+        )
+        try:
+            self.player = subprocess.Popen(
+                command, stdin=subprocess.DEVNULL if rtsp_camera else subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0,
+            )
+        except OSError:
+            self.label.setText(f"{self.camera.name} · Player unavailable")
+            self._cleanup_player()
+            self._retry()
+            return
+        if rtsp_camera:
+            self.worker = RtspStreamWorker(rtsp_camera, self.player, socket_path)
+        else:
+            assert self.player.stdin is not None
+            self.worker = StreamWorker(
+                self.camera, stored_camera_password(self.camera.uid) or "", self.player.stdin,
+            )
+            self.worker.set_display(self.isVisible())
+        self.worker.status_changed.connect(self._on_status)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.finished.connect(self._on_finished)
+        self.worker.start()
+
+    def _on_status(self, message: str) -> None:
+        if message == "Live video":
+            self.retry_seconds = 2
+        self.label.setText(f"{self.camera.name} · {message}")
+
+    def _on_failed(self, message: str) -> None:
+        self.label.setText(f"{self.camera.name} · {message}")
+        self.retry_enabled = message != "The camera rejected the available credentials."
+
+    def _on_finished(self) -> None:
+        self.worker = None
+        self._cleanup_player()
+        if self.closing:
+            self.stopped.emit()
+        elif self.retry_enabled:
+            self._retry()
+
+    def _retry(self) -> None:
+        if self.closing:
+            return
+        self.retry_timer.start(self.retry_seconds * 1000)
+        self.retry_seconds = min(60, self.retry_seconds * 2)
+
+    def _cleanup_player(self) -> None:
+        stop_mpv_player(self.player)
+        self.player = None
+        if self.mpv_directory is not None:
+            self.mpv_directory.cleanup()
+            self.mpv_directory = None
+
+    def set_display(self, enabled: bool) -> None:
+        if isinstance(self.worker, StreamWorker):
+            self.worker.set_display(enabled)
+
+    def stop(self) -> None:
+        self.closing = True
+        self.retry_timer.stop()
+        if self.worker is not None:
+            self.worker.stop()
+        else:
+            self._cleanup_player()
+            self.stopped.emit()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2683,6 +2812,8 @@ class MainWindow(QMainWindow):
         self.normal_geometry: QRect | None = None
         self.devices: list[AccountDevice | RtspCamera] = []
         self.device_accounts: dict[str, str] = {}
+        self.previews: dict[str, CameraPreview] = {}
+        self.retired_previews: list[CameraPreview] = []
         self.pending_camera: tuple[str, str] | None = None
         self.account_queue: list[tuple[str, str]] = []
         self.account_worker: AccountWorker | None = None
@@ -2740,7 +2871,11 @@ class MainWindow(QMainWindow):
         self.video.drag_moved.connect(self.pan_zoomed_video)
         self.video.wheel_zoomed.connect(self.change_zoom)
         self.video.double_clicked.connect(lambda x, y: self.toggle_fullscreen())
-        layout.addWidget(self.video, 1)
+        self.video_grid = QGridLayout()
+        self.video_grid.setContentsMargins(0, 0, 0, 0)
+        self.video_grid.setSpacing(2)
+        self.video_grid.addWidget(self.video, 0, 0)
+        layout.addLayout(self.video_grid, 1)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
         self.overlay.setStyleSheet(
@@ -2979,6 +3114,10 @@ class MainWindow(QMainWindow):
         self.window_action.triggered.connect(self.toggle_window)
         self.cameras_menu = menu.addMenu("Cameras")
         self.cameras_menu.aboutToShow.connect(self.update_cameras_menu)
+        self.show_all_action = menu.addAction("Show all cameras")
+        self.show_all_action.setCheckable(True)
+        self.show_all_action.setChecked(self.settings.value(MULTIVIEW_SETTING, True, bool))
+        self.show_all_action.toggled.connect(self.set_show_all_cameras)
         add_camera_menu = menu.addMenu("Add camera")
         self.add_account_action = add_camera_menu.addAction("O-KAM account...")
         self.add_account_action.triggered.connect(self.change_account)
@@ -3139,6 +3278,8 @@ class MainWindow(QMainWindow):
         if self.stream_worker is not None:
             if isinstance(self.stream_worker, StreamWorker):
                 self.stream_worker.set_display(True)
+        for preview in self.previews.values():
+            preview.set_display(True)
         if self.stream_worker is None and self.account_worker is None:
             self.reconnect()
 
@@ -3147,6 +3288,8 @@ class MainWindow(QMainWindow):
         if self.stream_worker is not None:
             if isinstance(self.stream_worker, StreamWorker):
                 self.stream_worker.set_display(False)
+        for preview in self.previews.values():
+            preview.set_display(False)
         self.overlay_timer.stop()
         self.hide_overlay()
         self.hide()
@@ -3182,6 +3325,48 @@ class MainWindow(QMainWindow):
         ]
         self.settings.setValue(RTSP_CAMERAS_SETTING, json.dumps(records))
         self.settings.sync()
+
+    def set_show_all_cameras(self, enabled: bool) -> None:
+        self.settings.setValue(MULTIVIEW_SETTING, enabled)
+        self.settings.sync()
+        self.sync_previews()
+
+    def _retire_preview(self, preview: CameraPreview) -> None:
+        self.video_grid.removeWidget(preview)
+        preview.hide()
+        self.retired_previews.append(preview)
+        preview.stopped.connect(lambda current=preview: self._preview_stopped(current))
+        preview.stop()
+
+    def _preview_stopped(self, preview: CameraPreview) -> None:
+        self.retired_previews.remove(preview)
+        preview.deleteLater()
+        if self.close_pending and self.stream_worker is None and self.account_worker is None:
+            QTimer.singleShot(0, self.close)
+
+    def sync_previews(self) -> None:
+        selected = getattr(self, "selected_device", None)
+        cameras = (
+            [camera for camera in self.devices if camera.uid != selected.uid]
+            if selected is not None and self.settings.value(MULTIVIEW_SETTING, True, bool) else []
+        )
+        desired = {camera.uid for camera in cameras}
+        for uid, preview in list(self.previews.items()):
+            if uid not in desired:
+                del self.previews[uid]
+                self._retire_preview(preview)
+        for index, camera in enumerate(cameras, 1):
+            preview = self.previews.get(camera.uid)
+            if preview is None:
+                preview = CameraPreview(camera)
+                self.previews[camera.uid] = preview
+                self.video_grid.addWidget(preview, index // 2, index % 2)
+                preview.show()
+                preview.start()
+            else:
+                self.video_grid.addWidget(preview, index // 2, index % 2)
+        if len(cameras) == 1 and self.width() < 1120:
+            self.resize(1120, self.height())
 
     def add_rtsp_camera(self) -> None:
         dialog = QDialog(self)
@@ -3245,6 +3430,7 @@ class MainWindow(QMainWindow):
         else:
             self.stop_stream()
             del self.selected_device
+            self.sync_previews()
             self.set_status("No cameras available.")
 
     def change_account(self) -> None:
@@ -3373,6 +3559,7 @@ class MainWindow(QMainWindow):
         self.ptz_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
         self.ptz_panel.hide()
         self.stop_player()
+        self.sync_previews()
         self.show_window_without_stream()
         self.watch_live()
 
@@ -3484,6 +3671,7 @@ class MainWindow(QMainWindow):
                         self.settings.setValue(f"{QUALITY_SETTING}/{self.selected_device.uid}", legacy_quality)
                 self.settings.sync()
             self.sync_quality_actions()
+            self.sync_previews()
             if self.stream_worker is None:
                 self.watch_live()
         elif self.retry_pending:
@@ -3496,7 +3684,7 @@ class MainWindow(QMainWindow):
         self.set_status(f"{reason} Reconnecting in {delay}s.")
 
     def reconnect(self) -> None:
-        if self.devices:
+        if self.devices and hasattr(self, "selected_device"):
             self.watch_live()
         else:
             self.find_cameras()
@@ -3587,20 +3775,8 @@ class MainWindow(QMainWindow):
         return True
 
     def stop_player(self) -> None:
-        if self.player is not None:
-            if self.player.stdin is not None:
-                try:
-                    self.player.stdin.close()
-                except OSError:
-                    pass
-            if self.player.poll() is None:
-                self.player.terminate()
-                try:
-                    self.player.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self.player.kill()
-                    self.player.wait(timeout=3)
-            self.player = None
+        stop_mpv_player(self.player)
+        self.player = None
         if self.mpv_directory is not None:
             self.mpv_directory.cleanup()
             self.mpv_directory = None
@@ -3780,7 +3956,7 @@ class MainWindow(QMainWindow):
             set_button_icon(self.fullscreen_button, "exit_fullscreen", "Exit full screen")
 
     def fit_video_aspect(self) -> None:
-        if self.isFullScreen() or self.video.width() <= 0 or self.video.height() <= 0:
+        if self.isFullScreen() or self.previews or self.video.width() <= 0 or self.video.height() <= 0:
             return
         video_height = round(self.video.width() * VIDEO_ASPECT_HEIGHT / VIDEO_ASPECT_WIDTH)
         self.resize(self.width(), self.height() - self.video.height() + video_height)
@@ -4017,10 +4193,14 @@ class MainWindow(QMainWindow):
             return
         self.reconnect_timer.stop()
         self.retry_pending = False
+        for uid, preview in list(self.previews.items()):
+            del self.previews[uid]
+            self._retire_preview(preview)
         if (
             self.account_worker is not None
             or self.stream_worker is not None
             or self.detection_worker is not None
+            or self.retired_previews
         ):
             self.close_pending = True
             self.stop_stream()

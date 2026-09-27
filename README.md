@@ -30,6 +30,9 @@ Later launches start the last selected camera or Jardin automatically.
 Use **Add camera > O-KAM account...** in the tray menu to add another account.
 Use **Add camera > RTSP camera...** to add a camera by name, RTSP URL without embedded credentials, and UDP or TCP transport.
 The **Cameras** submenu lists O-KAM cameras by account and local RTSP cameras by name, switches the displayed camera, and can remove the selected RTSP camera.
+With **Show all cameras** enabled in the tray menu, the selected camera and the other cameras appear together in a grid; this is on by default.
+The selected camera keeps the live controls, sound, photo, recording, and replay features available for its type; the other camera views display live video and reconnect independently.
+Turn off **Show all cameras** to return to one video.
 Use **Refresh camera list** there after adding a camera to an existing O-KAM account.
 Later launches show only the video and its controls.
 Run `.venv/bin/python app.py --forget-account` to remove all saved O-KAM accounts.
@@ -40,7 +43,7 @@ Give the camera a stable LAN address so the saved URL remains valid.
 For RTSP cameras, live view, photo, local video recording, and continuous recording are available; iCam365 playback, sound, detection notifications, and camera movement controls are not available through this RTSP connection.
 An RTSP URL is reachable outside the home only when the computer has a secure route to the camera's LAN, such as a VPN; the iCam365 account relay is not integrated.
 
-The window keeps the camera's 16:9 ratio while it is resized, and the video fills it without black bars.
+The window keeps the camera's 16:9 ratio in single-camera view, and the video fills it without black bars.
 The current state appears in the window title.
 Click the video to show or hide the translucent control bar.
 Live video starts automatically, and the viewer reconnects by itself after a network or transport interruption.
