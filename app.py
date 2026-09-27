@@ -17,8 +17,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import BinaryIO
-from datetime import datetime
+from typing import BinaryIO, Callable
+from datetime import datetime, timedelta
 
 from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import (
@@ -143,7 +143,19 @@ QUALITY_SETTING = "camera/quality"
 SETTING_LIGHT = "light"
 SETTING_QUALITY = "quality"
 SETTING_RESPONSE_SECONDS = 5
-RESPONSE_FIELD_PATTERN = re.compile(r'(?:var\s+)?(\w+)\s*=\s*"?([^";\r\n]*)"?\s*;')
+RESPONSE_FIELD_PATTERN = re.compile(r'(?:var\s+)?([\w\[\]]+)\s*=\s*"?([^";\r\n]*)"?\s*;')
+RECORD_LIST_PATH = "get_record_file.cgi?GetType=file&dirname={day}&"
+RECORD_LIST_RESPONSE_COMMAND = 0x6007
+RECORD_LIST_SECONDS = 20
+RECORD_NAME_FIELD = "record_name["
+RECORDING_NAME_PATTERN = re.compile(r"(\d{14})_(\d{3})\.mp4")
+CONTINUOUS_RECORDING_TYPE = "100"
+RECORDING_TIME_LENGTH = 14
+RECORDING_TIME_FORMAT = "%Y%m%d%H%M%S"
+RECORD_DAY_FORMAT = "%Y%m%d"
+DETECTION_POLL_MS = 15 * 60 * 1000
+DETECTION_SETTING = "detections/last_seen"
+DETECTION_MESSAGE_MS = 15000
 RAW_RECORDING_SUFFIX = ".h264"
 MIN_RECORDING_FRAMES = 2
 RECORDING_REMUX_TIMEOUT_SECONDS = 600
@@ -471,6 +483,96 @@ class ControlsOverlay(QWidget):
         painter.end()
 
 
+def prepare_camera_connection(
+    device: AccountDevice, report: Callable[[str], None], stop_requested: threading.Event
+) -> tuple[str, object] | None:
+    credentials = load_wake_credentials(WAKE_SOURCE)
+    if credentials is None:
+        raise WakeError("Verified O-KAM wake configuration is unavailable. Run install.sh.")
+    report("Resolving camera connection...")
+    client_id = resolve_client_id(device.uid)
+    service_parameter = get_service_parameter(client_id)
+    if stop_requested.is_set():
+        return None
+    report("Waking camera...")
+    try:
+        asyncio.run(wake_camera(device.uid, credentials))
+    except WakeError:
+        report("Wake service did not respond; trying the camera connection...")
+    if stop_requested.is_set():
+        return None
+    report("Connecting to camera...")
+    return client_id, service_parameter
+
+
+def list_detections(session: CS2Session, user: str, password: str, day: str) -> list[str]:
+    write_command(session, make_cgi_request(RECORD_LIST_PATH.format(day=day), user, password))
+    deadline = time.monotonic() + RECORD_LIST_SECONDS
+    names: list[str] = []
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            command, payload = read_command(session, timeout=remaining)
+        except CS2Timeout:
+            raise CS2Error("The camera did not list its recordings.") from None
+        if command != RECORD_LIST_RESPONSE_COMMAND:
+            continue
+        if parse_result(payload) != 0:
+            raise CS2Error("The camera rejected the recording list request.")
+        fields = response_fields(payload)
+        names += [
+            value
+            for key, value in fields.items()
+            if key.startswith(RECORD_NAME_FIELD) and is_detection_recording(value)
+        ]
+        if fields.get("current_page", "0") == fields.get("totol_page", "0"):
+            return sorted(names)
+    raise CS2Error("The camera did not finish listing its recordings.")
+
+
+def is_detection_recording(name: str) -> bool:
+    match = RECORDING_NAME_PATTERN.fullmatch(name)
+    return match is not None and match.group(2) != CONTINUOUS_RECORDING_TYPE
+
+
+def recording_time(name: str) -> datetime:
+    return datetime.strptime(name[:RECORDING_TIME_LENGTH], RECORDING_TIME_FORMAT)
+
+
+class DetectionWorker(QThread):
+    detections_listed = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, device: AccountDevice, camera_password: str, days: list[str]) -> None:
+        super().__init__()
+        self.device = device
+        self.camera_password = camera_password
+        self.days = days
+        self.stop_requested = threading.Event()
+
+    def run(self) -> None:
+        try:
+            connection = prepare_camera_connection(self.device, lambda message: None, self.stop_requested)
+            if connection is None:
+                return
+            session = CS2Session(*connection)
+            try:
+                session.connect(timeout=55)
+                login = authenticate_camera(
+                    session, select_camera_password(self.device.device_password, self.camera_password)
+                )
+                names: list[str] = []
+                for day in self.days:
+                    names += list_detections(session, login.user, login.password, day)
+                self.detections_listed.emit(names)
+            finally:
+                session.close()
+        except Exception as ex:
+            print(f"Detection check error: {type(ex).__name__}: {ex}", file=sys.stderr, flush=True)
+            self.failed.emit("Unable to check camera detections.")
+        finally:
+            self.camera_password = ""
+
+
 class StreamWorker(QThread):
     status_changed = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -482,6 +584,8 @@ class StreamWorker(QThread):
     recording_saved = pyqtSignal(str)
     recording_failed = pyqtSignal(str)
     capabilities_found = pyqtSignal(list, object)
+    detections_listed = pyqtSignal(list)
+    detections_failed = pyqtSignal(str)
     setting_completed = pyqtSignal(str, object)
     setting_failed = pyqtSignal(str, str)
 
@@ -498,6 +602,7 @@ class StreamWorker(QThread):
         self.audio_player: subprocess.Popen[bytes] | None = None
         self.recording_request: Path | None = None
         self.recorder: VideoRecorder | None = None
+        self.detection_days: list[str] | None = None
 
     def queue_setting(self, name: str, value: object) -> bool:
         try:
@@ -505,6 +610,9 @@ class StreamWorker(QThread):
             return True
         except queue.Full:
             return False
+
+    def request_detections(self, days: list[str]) -> None:
+        self.detection_days = days
 
     def set_recording(self, path: Path | None) -> None:
         self.recording_request = path
@@ -544,22 +652,10 @@ class StreamWorker(QThread):
             self.camera_password = ""
 
     def _stream(self) -> None:
-        credentials = load_wake_credentials(WAKE_SOURCE)
-        if credentials is None:
-            raise WakeError("Verified O-KAM wake configuration is unavailable. Run install.sh.")
-        self.status_changed.emit("Resolving camera connection...")
-        client_id = resolve_client_id(self.device.uid)
-        service_parameter = get_service_parameter(client_id)
-        if self.stop_requested.is_set():
+        connection = prepare_camera_connection(self.device, self.status_changed.emit, self.stop_requested)
+        if connection is None:
             return
-        self.status_changed.emit("Waking camera...")
-        try:
-            asyncio.run(wake_camera(self.device.uid, credentials))
-        except WakeError:
-            self.status_changed.emit("Wake service did not respond; trying the camera connection...")
-        if self.stop_requested.is_set():
-            return
-        self.status_changed.emit("Connecting to camera...")
+        client_id, service_parameter = connection
         password = select_camera_password(self.device.device_password, self.camera_password)
         session = CS2Session(client_id, service_parameter)
         stream_started = False
@@ -585,6 +681,7 @@ class StreamWorker(QThread):
             while not self.stop_requested.is_set():
                 self._process_control(session, login.user, login.password)
                 self._process_setting(session, login.user, login.password)
+                self._process_detections(session, login.user, login.password)
                 self._update_sound(session, login.user, login.password)
                 try:
                     frame, frame_type = frame_reader.read(session)
@@ -629,6 +726,21 @@ class StreamWorker(QThread):
                 except CS2Error:
                     pass
             session.close()
+
+    def _process_detections(self, session: CS2Session, user: str, password: str) -> None:
+        days = self.detection_days
+        if days is None:
+            return
+        self.detection_days = None
+        try:
+            names: list[str] = []
+            for day in days:
+                names += list_detections(session, user, password, day)
+        except CS2Error as ex:
+            print(f"Detection check error: {ex}", file=sys.stderr, flush=True)
+            self.detections_failed.emit("Unable to check camera detections.")
+            return
+        self.detections_listed.emit(names)
 
     def _read_capabilities(self, session: CS2Session, user: str, password: str) -> None:
         write_command(session, make_cgi_request(CAMERA_STATUS_PATH, user, password))
@@ -1000,6 +1112,10 @@ class MainWindow(QMainWindow):
         self.stream_live = False
         self.sound_enabled = False
         self.retry_pending = False
+        self.detection_worker: DetectionWorker | None = None
+        self.detection_timer = QTimer(self)
+        self.detection_timer.timeout.connect(self.check_detections)
+        self.detection_timer.start(DETECTION_POLL_MS)
         self.reconnect_attempts = 0
         self.reconnect_timer = QTimer(self)
         self.reconnect_timer.setSingleShot(True)
@@ -1195,6 +1311,7 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip(f"{APPLICATION_NAME}\n{self.status_text}")
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self.on_tray_activated)
+        self.tray.messageClicked.connect(self.show_window)
         self.tray.show()
 
     def add_tray_action(self, menu: QMenu, button: QPushButton) -> None:
@@ -1211,6 +1328,55 @@ class MainWindow(QMainWindow):
             action.setEnabled(button.isEnabled() and self.isVisible())
             action.setVisible(not button.isHidden())
         self.quality_menu.setEnabled(self.quality_button.isEnabled() and self.isVisible())
+
+    def detection_days(self) -> list[str]:
+        today = datetime.now()
+        return [(today - timedelta(days=1)).strftime(RECORD_DAY_FORMAT), today.strftime(RECORD_DAY_FORMAT)]
+
+    def check_detections(self) -> None:
+        if not self.devices or self.detection_worker is not None or self.close_pending:
+            return
+        if self.stream_live and self.stream_worker is not None:
+            self.stream_worker.request_detections(self.detection_days())
+            return
+        if self.stream_worker is not None or self.account_worker is not None:
+            return
+        self.detection_worker = DetectionWorker(
+            self.selected_device,
+            stored_camera_password(self.selected_device.uid) or "",
+            self.detection_days(),
+        )
+        self.detection_worker.detections_listed.connect(self.on_detections_listed)
+        self.detection_worker.failed.connect(self.on_detections_failed)
+        self.detection_worker.finished.connect(self.on_detection_worker_finished)
+        self.detection_worker.start()
+
+    def on_detection_worker_finished(self) -> None:
+        self.detection_worker = None
+        if self.close_pending:
+            self.close()
+
+    def on_detections_listed(self, names: list[str]) -> None:
+        last_seen = self.settings.value(DETECTION_SETTING, "", str)
+        new_names = sorted(name for name in names if name > last_seen)
+        if not new_names:
+            return
+        self.settings.setValue(DETECTION_SETTING, new_names[-1])
+        self.settings.sync()
+        if not last_seen:
+            return
+        latest = recording_time(new_names[-1])
+        message = f"{self.selected_device.name} \u00b7 {latest:%d/%m %H:%M:%S}"
+        if len(new_names) > 1:
+            message += f" ({len(new_names)} new detections)"
+        if self.tray is not None:
+            self.tray.showMessage(
+                "Camera detection", message, self.windowIcon(), DETECTION_MESSAGE_MS
+            )
+        self.set_status(f"Detection at {latest:%d/%m %H:%M:%S}.")
+
+    def on_detections_failed(self, message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
 
     def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -1391,6 +1557,8 @@ class MainWindow(QMainWindow):
         self.stream_worker.recording_saved.connect(self.on_recording_saved)
         self.stream_worker.recording_failed.connect(self.on_recording_failed)
         self.stream_worker.capabilities_found.connect(self.on_capabilities_found)
+        self.stream_worker.detections_listed.connect(self.on_detections_listed)
+        self.stream_worker.detections_failed.connect(self.on_detections_failed)
         self.stream_worker.setting_completed.connect(self.on_setting_completed)
         self.stream_worker.setting_failed.connect(self.on_setting_failed)
         self.stream_worker.finished.connect(self.on_stream_finished)
@@ -1797,6 +1965,7 @@ class MainWindow(QMainWindow):
         if (
             self.account_worker is not None
             or self.stream_worker is not None
+            or self.detection_worker is not None
         ):
             self.close_pending = True
             self.stop_stream()

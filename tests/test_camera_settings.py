@@ -4,10 +4,13 @@ import unittest
 from okam_native.cs2 import CS2Timeout
 
 from app import (
+    RECORD_LIST_RESPONSE_COMMAND,
     TRANSPARENT_RESPONSE_COMMAND,
     WHITE_LIGHT_COMMAND,
     WHITE_LIGHT_STATUS_COMMAND,
     available_qualities,
+    is_detection_recording,
+    list_detections,
     read_response_fields,
     video_quality_path,
     white_light_path,
@@ -38,6 +41,15 @@ class CommandSession:
 
     def _count_kind(self, prefix: str, kind: str) -> None:
         pass
+
+
+class RecordingCommandSession(CommandSession):
+    def __init__(self, packets: list[bytes]) -> None:
+        super().__init__(packets)
+        self.written: list[bytes] = []
+
+    def write(self, channel: int, data: bytes, *, timeout: float = 0) -> None:
+        self.written.append(data)
 
 
 class WhiteLightTest(unittest.TestCase):
@@ -75,6 +87,36 @@ class WhiteLightTest(unittest.TestCase):
                 1,
             )
         )
+
+
+class DetectionListTest(unittest.TestCase):
+    def test_only_alarm_recordings_are_detections(self) -> None:
+        self.assertTrue(is_detection_recording("20260926143210_011.mp4"))
+        self.assertTrue(is_detection_recording("20260926143210_010.mp4"))
+        self.assertFalse(is_detection_recording("20260926143210_100.mp4"))
+        self.assertFalse(is_detection_recording("../20260926143210_011.mp4"))
+
+    def test_paged_listing_returns_sorted_detections(self) -> None:
+        first = (
+            b'result= 0;\r\nvar result="ok";\r\nvar record_filenum=3;\r\n'
+            b'record_name[0]="20260926235404_100.mp4";\r\nrecord_size[0]=12;\r\n'
+            b'record_name[1]="20260926143210_011.mp4";\r\nrecord_size[1]=12;\r\n'
+            b"var totol_page=2;\r\nvar current_page=1;\r\n"
+        )
+        second = (
+            b'result= 0;\r\nrecord_name[0]="20260926091500_011.mp4";\r\n'
+            b"var totol_page=2;\r\nvar current_page=2;\r\n"
+        )
+        session = RecordingCommandSession(
+            command_packet(RECORD_LIST_RESPONSE_COMMAND, first)
+            + command_packet(RECORD_LIST_RESPONSE_COMMAND, second)
+        )
+        self.assertEqual(
+            list_detections(session, "admin", "secret", "20260926"),
+            ["20260926091500_011.mp4", "20260926143210_011.mp4"],
+        )
+        self.assertEqual(len(session.written), 1)
+        self.assertIn(b"get_record_file.cgi?GetType=file&dirname=20260926&", session.written[0])
 
 
 class VideoQualityTest(unittest.TestCase):

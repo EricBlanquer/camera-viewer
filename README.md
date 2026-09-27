@@ -45,6 +45,10 @@ Click the icon to show or hide the window, or open its menu to use the same cont
 Opening O-KAM Linux again from the application menu shows the running instance instead of starting a second one.
 Closing the window hides it and stops the video; showing it again restarts live video.
 
+Every 15 minutes, O-KAM Linux checks the camera's microSD card for new detection recordings and shows a desktop notification with the time of the latest one.
+The check uses the live connection while video is shown; otherwise it wakes the camera briefly, which uses some of its battery.
+The first check only records the latest existing detection, so older events are not announced.
+
 The video quality selector appears only when the camera can switch quality and return to its full resolution without restarting.
 If the O-KAM account service omits the camera credential, the application reads a camera-specific secret from the desktop keyring under the attributes `application=okam-linux`, `camera=<camera UID>`.
 The account password and camera credential are never embedded in the source code.
