@@ -2848,7 +2848,7 @@ class MainWindow(QMainWindow):
             self.tray.showMessage(
                 "Camera detection", message, self.windowIcon(), DETECTION_MESSAGE_MS
             )
-        self.set_status(f"Detection at {latest:%d/%m %H:%M:%S}.")
+        self.show_notice(f"Detection at {latest:%d/%m %H:%M:%S}.")
 
     def on_detections_failed(self, message: str) -> None:
         print(message, file=sys.stderr, flush=True)
@@ -3041,7 +3041,7 @@ class MainWindow(QMainWindow):
         try:
             path = self.replay.save_clip()
         except OSError:
-            self.set_status("Unable to save the recording.")
+            self.show_notice("Unable to save the recording.")
             return
         if path is not None:
             self.show_notice(f"Recording saved: {path}")
@@ -3229,12 +3229,12 @@ class MainWindow(QMainWindow):
         try:
             path = media_directory() / f"Jardin_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
         except OSError:
-            self.set_status("Unable to create the picture folder.")
+            self.show_notice("Unable to create the picture folder.")
             return
         if self._mpv_command(["screenshot-to-file", str(path), "video"]):
             self.show_notice(f"Picture saved: {path}")
         else:
-            self.set_status("Unable to save a picture.")
+            self.show_notice("Unable to save a picture.")
 
     def toggle_recording(self) -> None:
         if not self.stream_live or self.stream_worker is None:
@@ -3243,16 +3243,16 @@ class MainWindow(QMainWindow):
             try:
                 path = media_directory() / f"Jardin_{datetime.now():%Y%m%d_%H%M%S_%f}.mkv"
             except OSError:
-                self.set_status("Unable to create the recording folder.")
+                self.show_notice("Unable to create the recording folder.")
                 return
             self.stream_worker.set_recording(path)
             self.recording_path = path
             set_button_icon(self.record_button, "recording", "Stop recording")
-            self.set_status("Waiting for a key frame to start recording...")
+            self.show_notice("Waiting for a key frame to start recording...")
         else:
             self.stream_worker.set_recording(None)
             self.reset_recording_state()
-            self.set_status("Saving recording...")
+            self.show_notice("Saving recording...")
 
     def reset_recording_state(self) -> None:
         self.recording_path = None
@@ -3289,7 +3289,7 @@ class MainWindow(QMainWindow):
     def on_recording_failed(self, message: str) -> None:
         if self.recording_path is not None:
             self.reset_recording_state()
-        self.set_status(message)
+        self.show_notice(message)
 
     def toggle_zoom_at(self, x: int, y: int) -> None:
         if self.zoom_level > 0:
@@ -3304,7 +3304,7 @@ class MainWindow(QMainWindow):
         if level == self.zoom_level:
             return
         if not self._mpv_command(["set_property", "video-zoom", level / 2]):
-            self.set_status("Unable to change zoom.")
+            self.show_notice("Unable to change zoom.")
             return
         old_scale = 2 ** (self.zoom_level / 2)
         new_scale = 2 ** (level / 2)
@@ -3392,7 +3392,7 @@ class MainWindow(QMainWindow):
         self.setting_pending = True
         self.light_button.setEnabled(False)
         self.quality_button.setEnabled(False)
-        self.set_status(message)
+        self.show_notice(message)
         return True
 
     def toggle_light(self) -> None:
@@ -3407,7 +3407,7 @@ class MainWindow(QMainWindow):
     def choose_quality(self, quality: str) -> None:
         if self.recording_path is not None:
             self.sync_quality_actions()
-            self.set_status("Stop recording before changing video quality.")
+            self.show_notice("Stop recording before changing video quality.")
             return
         if not self.queue_setting(SETTING_QUALITY, quality, f"Changing video quality to {quality}..."):
             self.sync_quality_actions()
@@ -3438,13 +3438,13 @@ class MainWindow(QMainWindow):
         self.quality_button.setEnabled(self.stream_live)
         if name == SETTING_QUALITY:
             self.sync_quality_actions()
-        self.set_status(message)
+        self.show_notice(message)
 
     def toggle_sound(self) -> None:
         if self.stream_worker is None:
             return
         self.sound_button.setEnabled(False)
-        self.set_status("Changing camera sound...")
+        self.show_notice("Changing camera sound...")
         self.stream_worker.set_sound(not self.sound_enabled)
 
     def on_sound_changed(self, enabled: bool) -> None:
@@ -3459,7 +3459,7 @@ class MainWindow(QMainWindow):
 
     def on_sound_failed(self, message: str) -> None:
         self.sound_button.setEnabled(self.stream_live)
-        self.set_status(message)
+        self.show_notice(message)
 
     def pan_zoomed_video(self, dx: int, dy: int) -> None:
         if self.zoom_level == 0 or (not self.stream_live and self.replay is None):
@@ -3498,9 +3498,9 @@ class MainWindow(QMainWindow):
         self.set_controls_enabled(False)
         command = commands[0]
         if command.startswith("Preset "):
-            self.set_status(f"Moving camera to {command.lower()}...")
+            self.show_notice(f"Moving camera to {command.lower()}...")
         else:
-            self.set_status(f"Moving camera {command.lower()}...")
+            self.show_notice(f"Moving camera {command.lower()}...")
 
     def on_control_completed(self, command: str) -> None:
         self.control_pending = False
@@ -3515,7 +3515,7 @@ class MainWindow(QMainWindow):
     def on_control_failed(self, message: str) -> None:
         self.control_pending = False
         self.set_controls_enabled(self.stream_live)
-        self.set_status(message)
+        self.show_notice(message)
 
     def on_stream_error(self, message: str) -> None:
         self.stream_error = True
