@@ -1,4 +1,5 @@
 import io
+import itertools
 import os
 import tempfile
 import time
@@ -12,7 +13,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from PyQt6.QtCore import QObject, QSettings, Qt, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QPushButton, QWidget
 
-from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
+from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
 
 
 class TrayTest(unittest.TestCase):
@@ -166,6 +167,46 @@ class TrayTest(unittest.TestCase):
             self.window.rtsp_cameras = [camera]
             self.window.save_rtsp_cameras()
             self.assertEqual(load_rtsp_cameras(self.window.settings), [camera])
+
+    def test_rtsp_sound_choice_survives_player_restart(self) -> None:
+        camera = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0/av0")
+        preview = CameraPreview(camera, settings=self.window.settings)
+        preview.live = True
+        preview._on_sound_changed(True)
+        preview.close()
+        restarted = CameraPreview(camera, settings=self.window.settings)
+        self.assertTrue(restarted.sound_enabled)
+        command = mpv_rtsp_command(Path("/tmp/control.sock"), 1, True, camera, restarted.sound_enabled)
+        self.assertIn("--mute=no", command)
+        self.assertIn("--af=lavfi=[volume=25dB,alimiter=limit=0.95]", command)
+        restarted.close()
+        self.window.selected_device = camera
+        with patch.object(self.window, "show_notice"):
+            self.window.on_sound_changed(False)
+        disabled = CameraPreview(camera, settings=self.window.settings)
+        self.assertFalse(disabled.sound_enabled)
+        disabled.close()
+
+    def test_rtsp_player_reconnects_when_frames_stop(self) -> None:
+        camera = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0/av0")
+        player = Mock()
+        player.poll.return_value = None
+        worker = RtspStreamWorker(camera, player, Path(self.settings_directory.name) / "player.sock")
+        worker.stop_requested.wait = Mock(return_value=False)
+        failures: list[str] = []
+        worker.failed.connect(failures.append)
+        positions: list[bool] = []
+
+        def request(_socket: Path, command: list[object]) -> tuple[bool, object]:
+            if command[1] == "time-pos":
+                positions.append(True)
+            return True, {"vo-configured": True, "track-list": [], "time-pos": 0}[command[1]]
+        with patch("app.mpv_request", side_effect=request), patch("app.icam365_light_request", return_value=False), patch(
+            "app.prune_continuous_recordings"
+        ), patch("app.time.monotonic", side_effect=itertools.count(100, 5).__next__):
+            worker.run()
+        self.assertEqual(failures, ["The RTSP video stream stopped producing frames."])
+        self.assertLessEqual(len(positions), 3)
 
     def test_show_all_cameras_keeps_a_preview_for_each_other_camera(self) -> None:
         garden = SimpleNamespace(name="Jardin", uid="garden")
@@ -331,6 +372,65 @@ class TrayTest(unittest.TestCase):
         preview.fullscreen_button.click()
         self.assertEqual(fullscreen, [True])
         preview.close()
+
+    def test_icam365_tilt_stops_even_if_command_fails(self) -> None:
+        camera = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
+        with patch("app.http.client.HTTPConnection") as connection, patch("app.time.sleep"):
+            response = connection.return_value.getresponse.return_value
+            response.status = 400
+            response.getheader.return_value = ICAM365_SERVER
+            self.assertTrue(icam365_ptz_request(camera))
+            connection.return_value.request.assert_called_with("HEAD", "/ptzctrl")
+            connection.return_value.request.reset_mock()
+            response.status = 200
+            response.read.return_value = b"OK"
+            self.assertTrue(icam365_ptz_request(camera, "Up"))
+            self.assertEqual(
+                [call.args for call in connection.return_value.request.call_args_list],
+                [("GET", "/ptzctrl?act=1"), ("GET", "/ptzctrl?act=0")],
+            )
+            connection.return_value.request.reset_mock()
+            response.read.side_effect = [b"Rejected", b"OK"]
+            self.assertFalse(icam365_ptz_request(camera, "Down"))
+            self.assertEqual(
+                [call.args for call in connection.return_value.request.call_args_list],
+                [("GET", "/ptzctrl?act=3"), ("GET", "/ptzctrl?act=0")],
+            )
+            self.assertFalse(icam365_ptz_request(camera, "Left"))
+
+    def test_icam365_tilt_controls_appear_only_after_probe(self) -> None:
+        camera = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
+        preview = CameraPreview(camera)
+        preview.worker = RtspStreamWorker(camera, Mock(), Path(self.settings_directory.name) / "player.sock")
+        preview.live = True
+        self.assertTrue(preview.ptz_button.isHidden())
+        preview._on_rtsp_ptz_available()
+        self.assertFalse(preview.ptz_button.isHidden())
+        self.assertEqual([action.text() for action in preview.ptz_button.menu().actions()], ["Up", "Down"])
+        preview.ptz_button.menu().actions()[0].trigger()
+        self.assertEqual(preview.worker.ptz_request, "Up")
+        preview._on_control_finished("Up")
+        preview.close()
+
+    def test_selected_icam365_tilt_uses_same_ptz_panel(self) -> None:
+        camera = RtspCamera("rtsp:entrance", "Entrance", "rtsp://192.0.2.10:8001/0")
+        self.window.selected_device = camera
+        self.window.stream_worker = RtspStreamWorker(camera, Mock(), Path(self.settings_directory.name) / "player.sock")
+        self.window.stream_live = True
+        self.window.set_controls_enabled(True)
+        self.assertFalse(self.window.ptz_button.isEnabled())
+        self.window.on_rtsp_ptz_available()
+        self.assertTrue(self.window.ptz_button.isEnabled())
+        self.assertEqual([button.isHidden() for button in self.window.camera_buttons],
+                         [True, True, False, False, True, True, True, True, True])
+        self.window.control_camera(("Up",))
+        self.assertEqual(self.window.stream_worker.ptz_request, "Up")
+        self.assertFalse(self.window.camera_buttons[2].isEnabled())
+        self.window.on_control_completed("Up")
+        self.assertTrue(self.window.camera_buttons[2].isEnabled())
+        self.window.stream_worker.ptz_request = None
+        self.window.move_by_drag(0, -80)
+        self.assertEqual(self.window.stream_worker.ptz_request, "Down")
 
     def test_okam_preview_offers_camera_and_local_playback(self) -> None:
         camera = SimpleNamespace(name="Jardin", uid="garden")

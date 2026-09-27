@@ -1,7 +1,7 @@
 # Camera Viewer
 
 Camera Viewer is a native Linux desktop viewer for security cameras.
-O-KAM Pro account cameras and local RTSP cameras are supported.
+O-KAM Pro account cameras, local RTSP cameras, and Imou Life cameras with local RTSP access are supported.
 It uses Qt for the interface, mpv for H.264 and H.265 playback, and the MIT-licensed [O-KAM Native Bridge](https://github.com/oleandor/okam-ha-native) for O-KAM camera discovery, wake-up, and encrypted P2P transport.
 It does not require Home Assistant, Wine, Waydroid, or the phone while viewing.
 
@@ -29,13 +29,15 @@ For O-KAM, the application saves the password in the desktop keyring and remembe
 Later launches start the last selected camera or Jardin automatically.
 Use **Add camera > O-KAM account...** in the tray menu to add another account.
 Use **Add camera > RTSP camera...** to add a camera by name, RTSP URL without embedded credentials, and UDP or TCP transport.
-The **Cameras** submenu lists O-KAM cameras by account and local RTSP cameras by name, switches the displayed camera, and can remove the selected RTSP camera.
+Use **Add camera > Imou Life camera (local)...** to add an Imou camera by local IP address, RTSP port, channel, camera username, and device password or safety code.
+The device password is kept in the desktop keyring; saved camera settings and media-player command lines omit it.
+The **Cameras** submenu lists O-KAM cameras by account and local RTSP or Imou cameras by name, switches the displayed camera, and can remove the selected local camera.
 With **Show all cameras** enabled in the tray menu, the selected camera and the other cameras appear together in a grid; this is on by default.
 Use **Camera layout > Side by side** or **Stacked** to place the feeds horizontally or vertically; the layout choice is remembered.
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 Drag one camera title onto another to exchange their positions; the order is remembered without restarting either stream.
 The camera panes share the available space equally in a side-by-side layout.
-Each camera has its own local playback, photo, recording, zoom, and full-screen controls; compatible RTSP panes also have sound, while O-KAM panes also have pan-and-tilt, saved positions, light, and video quality controls when the camera supports them.
+Each camera has its own local playback, photo, recording, zoom, and full-screen controls; compatible RTSP panes also have sound and vertical tilt when the camera supports them, while O-KAM panes also have pan-and-tilt, saved positions, light, and video quality controls when the camera supports them.
 Compatible iCam365 camera panes have a bulb button that switches white light between On and Automatic.
 Local playback stays in that camera's video pane and uses the same controls and timeline as camera microSD playback, with recordings from the last 24 hours, pause, seeking, speeds up to 8x, sound, photo, saved clips, and full-screen controls; **LIVE** returns to the camera stream.
 For an O-KAM pane, the playback button offers the camera's microSD recordings and its local 24-hour recordings.
@@ -52,10 +54,21 @@ The TERUHAL QW55 used with iCam365 provides video and sound at `rtsp://<camera-L
 Select TCP transport for this model.
 Give the camera a stable LAN address so the saved URL remains valid.
 For RTSP cameras, live view, photo, local video and audio recording, continuous recording, and playback of local recordings are available when the configured stream carries audio.
+The live sound choice is saved per RTSP camera and restored after a stream reconnect or application restart.
+RTSP live sound is amplified in the player to make low-level camera microphones audible; the saved recording keeps the original audio.
 RTSP live view and local playback apply noise reduction in the player; saved recordings retain the original camera stream.
 When the camera exposes the TAS-Tech local white light endpoint, the bulb button switches between On and Automatic.
-iCam365 microSD playback, talkback microphone, detection notifications, and camera movement or saved positions are not available through this RTSP connection.
+When the camera exposes the TAS-Tech local tilt endpoint, the PTZ control appears after the live stream starts and offers short Up and Down movements; a vertical mouse drag also moves the camera.
+The tested TERUHAL QW55 accepts these movements on its local HTTP service at port 8001.
+On the tested camera, the local endpoint acknowledged horizontal commands without moving the image and exposed no verified saved-position command; the iCam365 mobile app uses its proprietary P2P protocol for these controls.
+iCam365 microSD playback, talkback microphone, and detection notifications are not available through this RTSP connection.
 An RTSP URL is reachable outside the home only when the computer has a secure route to the camera's LAN, such as a VPN; the iCam365 account relay is not integrated.
+
+The Imou form uses the [Dahua main-stream RTSP path](https://www.dahuasecurity.com/asset/upload/download/DS-PSD8802-A180_Operation_Manual__201709251.pdf) `/cam/realmonitor?channel=<channel>&subtype=0` and TCP port 554 by default.
+The camera must expose that RTSP stream on the local network; model support depends on the camera and its settings.
+Use the camera's device password or safety code, which may differ from the Imou Life account password.
+Imou cameras have the RTSP live-view and local recording controls described above; Imou Life account discovery, cloud relay, microSD playback, talkback, and remote movement are not integrated.
+For access away from the camera's network, the computer needs a route to its local IP address, such as a VPN.
 
 Each camera keeps its 16:9 ratio in single-camera and multi-camera views, including when the window is resized.
 The selected camera's live state appears next to its name; playback loading and errors appear over the affected video.
@@ -70,6 +83,7 @@ The magnifier buttons zoom the picture locally.
 For O-KAM cameras, the arrow buttons send short pan and tilt pulses to the camera.
 For O-KAM cameras, drag the video horizontally or vertically with the left mouse button to move it by up to four short pulses.
 For O-KAM cameras, **Preset 1** through **Preset 5** recall its saved positions.
+For compatible iCam365 cameras, **PTZ** offers Up and Down after the local control endpoint is detected.
 
 When the desktop provides a notification area, Camera Viewer shows an icon there instead of a taskbar entry.
 Click the icon to show or hide the window, or open its menu for camera selection, playback, and the **Camera controls** submenu.
