@@ -117,6 +117,8 @@ AUDIO_RESPONSE_COMMAND = 0x6031
 RECONNECT_MAX_SECONDS = 30
 OVERLAY_TIMEOUT_MS = 5000
 MAX_ZOOM_LEVEL = 4
+X11_WHEEL_UP = 4
+X11_WHEEL_DOWN = 5
 MAX_MPV_RESPONSE_BYTES = 65536
 OVERLAY_COLOR = QColor(24, 24, 24, 170)
 OVERLAY_MAX_RADIUS = 32
@@ -1715,6 +1717,7 @@ class VideoWidget(QWidget):
     clicked = pyqtSignal()
     dragged = pyqtSignal(int, int)
     drag_moved = pyqtSignal(int, int)
+    wheel_zoomed = pyqtSignal(int, int, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1830,6 +1833,12 @@ class VideoWidget(QWidget):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         self._move_drag(round(event.position().x()), round(event.position().y()))
 
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if event.angleDelta().y():
+            self.wheel_zoomed.emit(
+                1 if event.angleDelta().y() > 0 else -1, round(event.position().x()), round(event.position().y())
+            )
+
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self._finish_drag(round(event.position().x()), round(event.position().y()))
@@ -1856,7 +1865,9 @@ class VideoWidget(QWidget):
             if motion is not None:
                 self._move_drag(*motion)
                 motion = None
-            if event.type == X11.ButtonPress and event.detail == 1:
+            if event.type == X11.ButtonPress and event.detail in (X11_WHEEL_UP, X11_WHEEL_DOWN):
+                self.wheel_zoomed.emit(1 if event.detail == X11_WHEEL_UP else -1, event.event_x, event.event_y)
+            elif event.type == X11.ButtonPress and event.detail == 1:
                 self._start_drag(event.event_x, event.event_y)
             elif event.type == X11.ButtonRelease and event.detail == 1 and self.drag_start is not None:
                 self._finish_drag(event.event_x, event.event_y)
@@ -2353,6 +2364,7 @@ class MainWindow(QMainWindow):
         self.video.clicked.connect(self.toggle_overlay)
         self.video.dragged.connect(self.move_by_drag)
         self.video.drag_moved.connect(self.pan_zoomed_video)
+        self.video.wheel_zoomed.connect(self.change_zoom)
         layout.addWidget(self.video, 1)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
@@ -2911,6 +2923,7 @@ class MainWindow(QMainWindow):
     def start_player(self) -> bool:
         if self.player is not None and self.player.poll() is None:
             self._mpv_command(["set_property", "video-zoom", 0])
+            self.zoom_level = 0
             self.video_pan = (0.0, 0.0)
             self.apply_video_pan()
             return True
@@ -3083,8 +3096,8 @@ class MainWindow(QMainWindow):
             self.reset_recording_state()
         self.set_status(message)
 
-    def change_zoom(self, step: int) -> None:
-        if not self.stream_live:
+    def change_zoom(self, step: int, x: int | None = None, y: int | None = None) -> None:
+        if not self.stream_live and self.replay is None:
             return
         level = min(MAX_ZOOM_LEVEL, max(0, self.zoom_level + step))
         if level == self.zoom_level:
@@ -3092,6 +3105,15 @@ class MainWindow(QMainWindow):
         if not self._mpv_command(["set_property", "video-zoom", level / 2]):
             self.set_status("Unable to change zoom.")
             return
+        old_scale = 2 ** (self.zoom_level / 2)
+        new_scale = 2 ** (level / 2)
+        if x is not None and y is not None:
+            offset_x = (x - self.video.width() / 2) / max(1, self.video.width())
+            offset_y = (y - self.video.height() / 2) / max(1, self.video.height())
+            self.video_pan = (
+                offset_x / new_scale - (offset_x / old_scale - self.video_pan[0]),
+                offset_y / new_scale - (offset_y / old_scale - self.video_pan[1]),
+            )
         self.zoom_level = level
         self.apply_video_pan()
         self.zoom_out_button.setEnabled(level > 0)
@@ -3239,7 +3261,7 @@ class MainWindow(QMainWindow):
         self.set_status(message)
 
     def pan_zoomed_video(self, dx: int, dy: int) -> None:
-        if self.zoom_level == 0 or not self.stream_live:
+        if self.zoom_level == 0 or (not self.stream_live and self.replay is None):
             return
         scale = 2 ** (self.zoom_level / 2)
         self.video_pan = (
@@ -3255,7 +3277,7 @@ class MainWindow(QMainWindow):
         self._mpv_command(["set_property", "video-pan-y", self.video_pan[1]])
 
     def move_by_drag(self, dx: int, dy: int) -> None:
-        if self.zoom_level > 0:
+        if self.zoom_level > 0 or self.replay is not None:
             return
         if abs(dx) < DRAG_PIXELS_PER_STEP // 2 and abs(dy) < DRAG_PIXELS_PER_STEP // 2:
             return
