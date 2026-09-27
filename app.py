@@ -88,7 +88,8 @@ from Xlib import X as X11, Xutil, display as xdisplay
 from Xlib.protocol import event as xevent
 
 
-APPLICATION_NAME = "O-KAM Linux"
+APPLICATION_NAME = "Camera Viewer"
+STORAGE_NAME = "O-KAM Linux"
 LOG = logging.getLogger("okam-linux")
 LOG_DIRECTORY = Path.home() / ".cache/okam-linux"
 LOG_FILE_NAME = "okam-linux.log"
@@ -565,9 +566,13 @@ def mpv_stream_command(socket_path: Path, window_id: int, fill: bool) -> list[st
 
 def media_directory() -> Path:
     pictures = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)
-    directory = (Path(pictures) if pictures else Path.home() / "Pictures") / APPLICATION_NAME
+    directory = (Path(pictures) if pictures else Path.home() / "Pictures") / STORAGE_NAME
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def safe_camera_name(name: str) -> str:
+    return re.sub(r"[^\w.-]+", "_", name, flags=re.UNICODE).strip("._") or "Camera"
 
 
 def camera_time(timestamp: float) -> datetime:
@@ -641,7 +646,7 @@ class VideoRecorder:
 
 def continuous_directory() -> Path:
     videos = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.MoviesLocation)
-    directory = (Path(videos) if videos else Path.home() / "Videos") / APPLICATION_NAME / CONTINUOUS_FOLDER
+    directory = (Path(videos) if videos else Path.home() / "Videos") / STORAGE_NAME / CONTINUOUS_FOLDER
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
@@ -661,8 +666,8 @@ def prune_continuous_recordings(directory: Path, now: datetime, retention: timed
             LOG.info("Deleted continuous recording %s", path.name)
 
 
-def recover_continuous_recordings(directory: Path) -> None:
-    for raw_path in directory.glob(f"*{MATROSKA_SUFFIX}{RAW_RECORDING_SUFFIX}"):
+def recover_continuous_recordings(directory: Path, raw_paths: tuple[Path, ...] | None = None) -> None:
+    for raw_path in raw_paths if raw_paths is not None else directory.glob(f"*{MATROSKA_SUFFIX}{RAW_RECORDING_SUFFIX}"):
         output = raw_path.with_suffix("")
         start = segment_time(output)
         try:
@@ -757,6 +762,11 @@ class ReliableCS2Session(CS2Session):
                 break
             self._pump()
         self._channel_buffers[channel].clear()
+        waiting = self._out_of_order[channel]
+        if waiting:
+            expected = self._incoming_sequence[channel]
+            furthest = max(waiting, key=lambda sequence: (sequence - expected) & 0xFFFF)
+            self._incoming_sequence[channel] = (furthest + 1) & 0xFFFF
         self._out_of_order[channel].clear()
 
     def _handle_data(self, packet: bytes) -> None:
@@ -2328,7 +2338,9 @@ class ReplayController(QObject):
                 return recording
         return next((recording for recording in recordings if recording.start > moment), None)
 
-    def seek(self, moment: datetime, preferred: CardRecording | None = None) -> None:
+    def seek(self, moment: datetime, preferred: CardRecording | None = None, retry: bool = False) -> None:
+        if not retry:
+            self.reloads = 0
         recording = preferred or self.recording_at(moment)
         LOG.info("Seek to %s in %s", moment, recording.name if recording is not None else "no recording")
         if recording is None:
@@ -2360,7 +2372,6 @@ class ReplayController(QObject):
 
     def on_position(self, timestamp: float) -> None:
         self.last_position = camera_time(timestamp)
-        self.reloads = 0
         self.waiting_for_target = False
         moment = camera_time(timestamp)
         self.timeline.set_center(moment)
@@ -2387,7 +2398,7 @@ class ReplayController(QObject):
         if name not in self.saved_clips and resume is not None and resume < recording.end and self.reloads < MAX_RECORDING_RELOADS:
             self.reloads += 1
             self.current = None
-            self.seek(resume, recording)
+            self.seek(resume, recording, retry=True)
             return
         following = self.next_recording(recording)
         if following is None:
@@ -2445,7 +2456,7 @@ class ReplayController(QObject):
         source = self.saved_clips.get(self.current.recording.name) if self.current is not None else None
         if source is None:
             return None
-        target = media_directory() / f"{self.device.name}_{Path(self.current.recording.name).stem}{MATROSKA_SUFFIX}"
+        target = media_directory() / f"{safe_camera_name(self.device.name)}_{Path(self.current.recording.name).stem}{MATROSKA_SUFFIX}"
         shutil.copyfile(source, target)
         return target
 
@@ -2468,6 +2479,9 @@ class MainWindow(QMainWindow):
         self.window_hints: X11WindowHints | None = None
         self.normal_geometry: QRect | None = None
         self.devices: list[AccountDevice] = []
+        self.device_accounts: dict[str, str] = {}
+        self.pending_camera: tuple[str, str] | None = None
+        self.account_queue: list[tuple[str, str]] = []
         self.account_worker: AccountWorker | None = None
         self.stream_worker: StreamWorker | None = None
         self.control_pending = False
@@ -2502,11 +2516,12 @@ class MainWindow(QMainWindow):
         self.overlay_timer = QTimer(self)
         self.overlay_timer.setSingleShot(True)
         self.overlay_timer.timeout.connect(self.hide_overlay)
-        self.settings = QSettings(APPLICATION_NAME, APPLICATION_NAME)
+        self.settings = QSettings(STORAGE_NAME, STORAGE_NAME)
         self.account_username = self.settings.value("account/username", "", str)
-        self.account_secret = (
-            stored_account_password(self.account_username) if self.account_username else None
-        )
+        self.account_secret: str | None = None
+        self.accounts = self.settings.value("accounts/okam", [], list)
+        if self.account_username and self.account_username not in self.accounts:
+            self.accounts.insert(0, self.account_username)
         body = QWidget()
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -2728,7 +2743,7 @@ class MainWindow(QMainWindow):
         if QApplication.platformName() == "xcb":
             self.window_hints = X11WindowHints(self, self.tray is not None)
         self.set_status("Connecting to camera...")
-        if self.account_username and self.account_secret:
+        if self.accounts:
             QTimer.singleShot(0, self.find_cameras)
         else:
             QTimer.singleShot(0, self.change_account)
@@ -2756,6 +2771,11 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         self.window_action = menu.addAction("Hide window")
         self.window_action.triggered.connect(self.toggle_window)
+        self.cameras_menu = menu.addMenu("Cameras")
+        self.cameras_menu.aboutToShow.connect(self.update_cameras_menu)
+        add_camera_menu = menu.addMenu("Add camera")
+        self.add_account_action = add_camera_menu.addAction("O-KAM account...")
+        self.add_account_action.triggered.connect(self.change_account)
         menu.addSeparator()
         for button in (
             self.live_button,
@@ -2804,6 +2824,7 @@ class MainWindow(QMainWindow):
 
     def update_tray_menu(self) -> None:
         self.window_action.setText("Hide window" if self.isVisible() else "Show window")
+        self.add_account_action.setEnabled(self.account_worker is None)
         text_color = self.tray.contextMenu().palette().color(QPalette.ColorRole.WindowText)
         for action, button in self.tray_actions:
             action.setIcon(menu_icon(button.property(ICON_NAME_PROPERTY), text_color))
@@ -2811,6 +2832,23 @@ class MainWindow(QMainWindow):
             action.setEnabled(button.isEnabled() and self.isVisible())
             action.setVisible(button.isVisibleTo(self.overlay))
         self.quality_menu.setEnabled(self.quality_button.isEnabled() and self.isVisible())
+
+    def update_cameras_menu(self) -> None:
+        self.cameras_menu.clear()
+        for device in self.devices:
+            username = self.device_accounts[device.uid]
+            action = self.cameras_menu.addAction(f"{device.name} · O-KAM ({username})")
+            action.setCheckable(True)
+            action.setChecked(device is getattr(self, "selected_device", None))
+            action.triggered.connect(
+                lambda checked=False, account=username, uid=device.uid: self.select_camera(account, uid)
+            )
+        if not self.devices:
+            self.cameras_menu.addAction("No cameras available").setEnabled(False)
+        self.cameras_menu.addSeparator()
+        refresh = self.cameras_menu.addAction("Refresh camera list")
+        refresh.setEnabled(self.account_worker is None)
+        refresh.triggered.connect(self.refresh_cameras)
 
     def detection_days(self) -> list[str]:
         now = datetime.now()
@@ -2841,13 +2879,18 @@ class MainWindow(QMainWindow):
         self.detection_worker = None
         if self.close_pending:
             self.close()
+        elif self.pending_camera is not None and self.stream_worker is None:
+            self.apply_pending_camera()
 
     def on_detections_listed(self, names: list[str]) -> None:
-        last_seen = self.settings.value(DETECTION_SETTING, "", str)
+        setting = f"{DETECTION_SETTING}/{self.selected_device.uid}"
+        last_seen = self.settings.value(setting, "", str)
+        if not last_seen and not self.settings.contains(setting) and len(self.devices) == 1:
+            last_seen = self.settings.value(DETECTION_SETTING, "", str)
         new_names = sorted(name for name in names if name > last_seen)
         if not new_names:
             return
-        self.settings.setValue(DETECTION_SETTING, new_names[-1])
+        self.settings.setValue(setting, new_names[-1])
         self.settings.sync()
         if not last_seen:
             return
@@ -2918,7 +2961,7 @@ class MainWindow(QMainWindow):
 
     def change_account(self) -> None:
         dialog = QDialog(self)
-        dialog.setWindowTitle("O-KAM account")
+        dialog.setWindowTitle("Add O-KAM account")
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
         username = QLineEdit(self.account_username)
@@ -2939,17 +2982,41 @@ class MainWindow(QMainWindow):
         if not username.text().strip() or not password.text():
             self.set_status("Enter your O-KAM account and password.")
             return
-        self.account_username = username.text().strip()
-        self.account_secret = password.text()
-        self.find_cameras()
+        if self.account_worker is not None:
+            self.show_notice("An account is already loading.")
+            return
+        self.start_account_lookup(username.text().strip(), password.text())
 
     def find_cameras(self) -> None:
-        if not self.account_username or not self.account_secret:
+        if self.account_worker is not None:
+            return
+        self.devices = []
+        self.device_accounts = {}
+        self.refresh_cameras()
+
+    def refresh_cameras(self) -> None:
+        if self.account_worker is not None:
+            return
+        self.account_queue = [
+            (username, password)
+            for username in self.accounts
+            if (password := stored_account_password(username))
+        ]
+        if not self.account_queue:
             self.change_account()
             return
         self.reconnect_timer.stop()
         self.retry_pending = False
-        self.devices = []
+        self.set_status("Finding cameras...")
+        self.start_next_account_lookup()
+
+    def start_next_account_lookup(self) -> None:
+        username, password = self.account_queue.pop(0)
+        self.start_account_lookup(username, password)
+
+    def start_account_lookup(self, username: str, password: str) -> None:
+        self.account_username = username
+        self.account_secret = password
         self.set_status("Finding cameras...")
         self.account_worker = AccountWorker(self.account_username, self.account_secret)
         self.account_worker.devices_found.connect(self.on_devices_found)
@@ -2958,26 +3025,62 @@ class MainWindow(QMainWindow):
         self.account_worker.start()
 
     def on_devices_found(self, devices: list[AccountDevice]) -> None:
-        self.devices = devices
-        saved_username = self.settings.value("account/username", "", str)
         if not save_account_password(self.account_username, self.account_secret):
             self.set_status("The keyring could not save the account.")
         else:
-            if saved_username and saved_username != self.account_username:
-                clear_account_password(saved_username)
-            self.settings.setValue("account/username", self.account_username)
+            if self.account_username not in self.accounts:
+                self.accounts.append(self.account_username)
+            self.settings.setValue("accounts/okam", self.accounts)
+            if not self.settings.value("account/username", "", str):
+                self.settings.setValue("account/username", self.account_username)
             self.settings.sync()
+        for device in devices:
+            if device.uid not in self.device_accounts:
+                self.devices.append(device)
+                self.device_accounts[device.uid] = self.account_username
         if devices:
-            self.selected_device = next((device for device in devices if device.name == "Jardin"), devices[0])
-            if not self.status_text.startswith("The keyring could not"):
-                credential_status = (
-                    "O-KAM supplied a camera credential."
-                    if self.selected_device.device_password
-                    else "O-KAM supplied no camera credential."
+            self.retry_pending = False
+            saved_uid = self.settings.value("camera/selected_uid", "", str)
+            if not hasattr(self, "selected_device") or self.selected_device.uid not in self.device_accounts:
+                self.selected_device = next(
+                    (device for device in self.devices if device.uid == saved_uid), self.devices[0]
                 )
-                self.set_status(f"Found {len(devices)} camera(s). {credential_status}")
+            if not self.status_text.startswith("The keyring could not"):
+                self.set_status(f"Found {len(self.devices)} camera(s).")
         else:
-            self.set_status("No cameras are visible to this account.")
+            if not self.devices:
+                self.set_status("No cameras are visible to this account.")
+
+    def select_camera(self, username: str, uid: str) -> None:
+        if self.device_accounts.get(uid) != username:
+            return
+        if getattr(self, "selected_device", None) is not None and self.selected_device.uid == uid:
+            self.show_window()
+            return
+        self.pending_camera = (username, uid)
+        self.reconnect_timer.stop()
+        self.retry_pending = False
+        self.exit_replay(False)
+        if self.stream_worker is not None:
+            self.stop_stream()
+        elif self.detection_worker is None:
+            self.apply_pending_camera()
+
+    def apply_pending_camera(self) -> None:
+        if self.pending_camera is None:
+            return
+        username, uid = self.pending_camera
+        self.pending_camera = None
+        self.selected_device = next(device for device in self.devices if device.uid == uid)
+        self.settings.setValue("camera/selected_uid", uid)
+        self.settings.setValue("camera/selected_account", username)
+        self.settings.sync()
+        self.latest_detection = None
+        self.sync_quality_actions()
+        self.on_capabilities_found([], None)
+        self.stop_player()
+        self.show_window_without_stream()
+        self.watch_live()
 
     def on_account_failed(self, message: str) -> None:
         self.retry_pending = message != ACCOUNT_REJECTED_MESSAGE
@@ -3061,10 +3164,30 @@ class MainWindow(QMainWindow):
     def on_account_finished(self) -> None:
         self.replay_button.setEnabled(bool(self.devices))
         self.account_worker = None
+        self.account_secret = None
         if self.close_pending:
             self.close()
+        elif self.account_queue:
+            self.start_next_account_lookup()
         elif self.devices:
-            self.watch_live()
+            saved_uid = self.settings.value("camera/selected_uid", "", str)
+            self.selected_device = next(
+                (device for device in self.devices if device.uid == saved_uid),
+                next((device for device in self.devices if device.name == "Jardin"), self.devices[0]),
+            )
+            if not saved_uid:
+                self.settings.setValue("camera/selected_uid", self.selected_device.uid)
+                self.settings.setValue("camera/selected_account", self.device_accounts[self.selected_device.uid])
+                legacy_detection = self.settings.value(DETECTION_SETTING, "", str)
+                if legacy_detection:
+                    self.settings.setValue(f"{DETECTION_SETTING}/{self.selected_device.uid}", legacy_detection)
+                legacy_quality = self.settings.value(QUALITY_SETTING, "", str)
+                if legacy_quality:
+                    self.settings.setValue(f"{QUALITY_SETTING}/{self.selected_device.uid}", legacy_quality)
+                self.settings.sync()
+            self.sync_quality_actions()
+            if self.stream_worker is None:
+                self.watch_live()
         elif self.retry_pending:
             self.schedule_reconnect(self.status_text)
 
@@ -3096,7 +3219,7 @@ class MainWindow(QMainWindow):
         self.zoom_level = 0
         set_button_icon(self.sound_button, "sound", "Listen to camera")
         try:
-            continuous = ContinuousRecorder(continuous_directory(), self.selected_device.name)
+            continuous = ContinuousRecorder(continuous_directory(), safe_camera_name(self.selected_device.name))
         except OSError:
             continuous = None
             self.show_notice("Unable to create the continuous recording folder.")
@@ -3239,7 +3362,7 @@ class MainWindow(QMainWindow):
         if not self.stream_live and self.replay is None:
             return
         try:
-            path = media_directory() / f"Jardin_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
+            path = media_directory() / f"{safe_camera_name(self.selected_device.name)}_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
         except OSError:
             self.show_notice("Unable to create the picture folder.")
             return
@@ -3253,7 +3376,7 @@ class MainWindow(QMainWindow):
             return
         if self.recording_path is None:
             try:
-                path = media_directory() / f"Jardin_{datetime.now():%Y%m%d_%H%M%S_%f}.mkv"
+                path = media_directory() / f"{safe_camera_name(self.selected_device.name)}_{datetime.now():%Y%m%d_%H%M%S_%f}.mkv"
             except OSError:
                 self.show_notice("Unable to create the recording folder.")
                 return
@@ -3365,7 +3488,9 @@ class MainWindow(QMainWindow):
             self.update_recording_badge()
 
     def quality_label(self) -> str:
-        quality = self.settings.value(QUALITY_SETTING, "", str)
+        device = getattr(self, "selected_device", None)
+        setting = f"{QUALITY_SETTING}/{device.uid}" if device is not None else QUALITY_SETTING
+        quality = self.settings.value(setting, "", str)
         return quality if quality in VIDEO_QUALITIES else DEFAULT_QUALITY_LABEL
 
     def show_quality_menu(self) -> None:
@@ -3419,10 +3544,10 @@ class MainWindow(QMainWindow):
             self.sync_quality_actions()
 
     def sync_quality_actions(self) -> None:
-        current = self.settings.value(QUALITY_SETTING, "", str)
+        current = self.quality_label()
         for quality, action in self.quality_actions.items():
             action.setChecked(quality == current)
-        self.quality_button.setText(self.quality_label())
+        self.quality_button.setText(current)
 
     def on_setting_completed(self, name: str, value: object) -> None:
         self.setting_pending = False
@@ -3433,7 +3558,7 @@ class MainWindow(QMainWindow):
             self.update_light_button()
             self.show_notice("White light on." if self.light_on else "White light off.")
         else:
-            self.settings.setValue(QUALITY_SETTING, value)
+            self.settings.setValue(f"{QUALITY_SETTING}/{self.selected_device.uid}", value)
             self.settings.sync()
             self.sync_quality_actions()
             self.show_notice(f"Video quality set to {value}.")
@@ -3559,6 +3684,9 @@ class MainWindow(QMainWindow):
             self.set_status("Camera stopped.")
         if self.close_pending:
             self.close()
+        elif self.pending_camera is not None:
+            if self.detection_worker is None:
+                self.apply_pending_camera()
         elif self.pending_replay is not None:
             start = self.pending_replay[0]
             self.pending_replay = None
@@ -3590,11 +3718,15 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "--forget-account":
-        settings = QSettings(APPLICATION_NAME, APPLICATION_NAME)
+        settings = QSettings(STORAGE_NAME, STORAGE_NAME)
+        accounts = settings.value("accounts/okam", [], list)
         username = settings.value("account/username", "", str)
-        if username and not clear_account_password(username):
+        if username and username not in accounts:
+            accounts.append(username)
+        if any(not clear_account_password(account) for account in accounts):
             return 1
         settings.remove("account/username")
+        settings.remove("accounts/okam")
         settings.sync()
         return 0 if settings.status() == QSettings.Status.NoError else 1
     if sys.argv[1:] == [CAMERA_PASSWORD_ARGUMENT]:
@@ -3604,18 +3736,6 @@ def main() -> int:
         return 2
     app = QApplication(sys.argv)
     configure_logging()
-    try:
-        directory = continuous_directory()
-    except OSError:
-        directory = None
-    if directory is not None:
-        threading.Thread(
-            target=lambda: (
-                recover_continuous_recordings(directory),
-                prune_continuous_recordings(directory, datetime.now(), CONTINUOUS_RETENTION),
-            ),
-            daemon=True,
-        ).start()
     server_name = f"{INSTANCE_SERVER_PREFIX}-{os.getuid()}"
     running_instance = QLocalSocket()
     running_instance.connectToServer(server_name)
@@ -3629,6 +3749,19 @@ def main() -> int:
     instance_server = QLocalServer()
     if not instance_server.listen(server_name):
         return 1
+    try:
+        directory = continuous_directory()
+    except OSError:
+        directory = None
+    if directory is not None:
+        raw_paths = tuple(directory.glob(f"*{MATROSKA_SUFFIX}{RAW_RECORDING_SUFFIX}"))
+        threading.Thread(
+            target=lambda: (
+                recover_continuous_recordings(directory, raw_paths),
+                prune_continuous_recordings(directory, datetime.now(), CONTINUOUS_RETENTION),
+            ),
+            daemon=True,
+        ).start()
     window = MainWindow()
     signal.signal(signal.SIGTERM, lambda number, frame: QTimer.singleShot(0, window.quit_application))
     signal_timer = QTimer()
@@ -3641,19 +3774,26 @@ def main() -> int:
 
 
 def print_camera_passwords() -> int:
-    username = QSettings(APPLICATION_NAME, APPLICATION_NAME).value("account/username", "", str)
-    password = stored_account_password(username) if username else None
-    if not username or not password:
-        print("No saved O-KAM account. Start O-KAM Linux and sign in first.", file=sys.stderr)
+    settings = QSettings(STORAGE_NAME, STORAGE_NAME)
+    accounts = settings.value("accounts/okam", [], list)
+    username = settings.value("account/username", "", str)
+    if username and username not in accounts:
+        accounts.append(username)
+    available = [(account, stored_account_password(account)) for account in accounts]
+    if not any(password for account, password in available):
+        print("No saved O-KAM account. Start Camera Viewer and sign in first.", file=sys.stderr)
         return 1
-    try:
-        devices = Eye4AccountClient(opener=account_request).enumerate(username, password)
-    except AccountError as ex:
-        print(str(ex), file=sys.stderr)
-        return 1
-    for device in devices:
-        credential = stored_camera_password(device.uid) or device.device_password
-        print(f"{device.name} ({device.uid}): {credential or 'not provided by O-KAM; the camera uses its initial password'}")
+    for account, password in available:
+        if not password:
+            continue
+        try:
+            devices = Eye4AccountClient(opener=account_request).enumerate(account, password)
+        except AccountError as ex:
+            print(f"{account}: {ex}", file=sys.stderr)
+            return 1
+        for device in devices:
+            credential = stored_camera_password(device.uid) or device.device_password
+            print(f"{account}: {device.name} ({device.uid}): {credential or 'not provided by O-KAM; the camera uses its initial password'}")
     return 0
 
 

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from app import ContinuousRecorder, prune_continuous_recordings, recover_continuous_recordings
+from app import ContinuousRecorder, main, prune_continuous_recordings, recover_continuous_recordings
 
 from test_video_recorder import FRAME_SECONDS, encoded_frames, probe_duration
 
@@ -63,6 +63,30 @@ class ContinuousRecorderTest(unittest.TestCase):
         output = self.path / f"Jardin_{start:%Y%m%d_%H%M%S}.mkv"
         self.assertFalse(raw.exists())
         self.assertAlmostEqual(probe_duration(output), 3.0, delta=0.4)
+
+    def test_second_instance_does_not_recover_recordings(self) -> None:
+        with mock.patch("app.sys.argv", ["app.py"]), mock.patch("app.QApplication"), mock.patch(
+            "app.configure_logging"
+        ), mock.patch("app.continuous_directory", return_value=self.path) as directory, mock.patch(
+            "app.QLocalSocket"
+        ) as socket, mock.patch("app.threading.Thread") as thread:
+            socket.return_value.waitForConnected.return_value = True
+            self.assertEqual(main(), 0)
+            directory.assert_not_called()
+            thread.assert_not_called()
+
+    def test_recovery_only_touches_files_present_before_live_start(self) -> None:
+        frames = encoded_frames()
+        start = (datetime.now() - timedelta(seconds=3)).replace(microsecond=0)
+        stale = self.path / f"Stale_{start:%Y%m%d_%H%M%S}.mkv.h264"
+        active = self.path / f"Active_{start:%Y%m%d_%H%M%S}.mkv.h264"
+        stale.write_bytes(b"".join(frames))
+        os.utime(stale, (start.timestamp() + 3, start.timestamp() + 3))
+        startup_files = tuple(self.path.glob("*.mkv.h264"))
+        active.write_bytes(b"".join(frames))
+        recover_continuous_recordings(self.path, startup_files)
+        self.assertTrue(active.exists())
+        self.assertFalse(stale.exists())
 
 
 if __name__ == "__main__":

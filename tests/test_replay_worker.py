@@ -173,6 +173,23 @@ class ReplayLoadingTest(unittest.TestCase):
         finally:
             controller.stop()
 
+    def test_repeated_cut_short_recording_stops_after_retry_limit(self) -> None:
+        controller = ReplayController(SimpleNamespace(), "", TimelineWidget())
+        try:
+            downloads: list[str] = []
+            controller.worker.download = lambda buffer: downloads.append(buffer.recording.name)
+            target = recording("20260926042458_100.mp4")
+            controller.recordings["20260926"] = [target]
+            controller.seek(target.start)
+            for _ in range(3):
+                controller.on_position(camera_timestamp(target.start))
+                controller.on_finished(target.name)
+            self.assertEqual(downloads, [target.name] * 3)
+            self.assertEqual(controller.reloads, 2)
+            self.assertFalse(controller.playing)
+        finally:
+            controller.stop()
+
 
     def test_previous_detection_waits_for_a_day_already_requested(self) -> None:
         controller = ReplayController(SimpleNamespace(), "", TimelineWidget())

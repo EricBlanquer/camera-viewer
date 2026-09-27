@@ -51,6 +51,25 @@ class ReliableSessionTest(unittest.TestCase):
         self.assertEqual(bytes(session._channel_buffers[4]), b"A")
         self.assertEqual(session.acknowledged, [0, 0])
 
+    def test_discard_skips_acknowledged_out_of_order_packets(self) -> None:
+        session = RecordingSession()
+        session._handle_data(data_packet(1, b"old"))
+        session.discard_channel(4, 0, 0)
+        session._handle_data(data_packet(2, b"new"))
+        session._handle_data(data_packet(0, b"late"))
+        self.assertEqual(bytes(session._channel_buffers[4]), b"new")
+        self.assertEqual(session._incoming_sequence[4], 3)
+
+    def test_discard_advances_across_sequence_wrap(self) -> None:
+        session = RecordingSession()
+        session._incoming_sequence[4] = 65534
+        session._handle_data(data_packet(0, b"old 0"))
+        session._handle_data(data_packet(65535, b"old 65535"))
+        session.discard_channel(4, 0, 0)
+        session._handle_data(data_packet(1, b"new"))
+        self.assertEqual(bytes(session._channel_buffers[4]), b"new")
+        self.assertEqual(session._incoming_sequence[4], 2)
+
 
 def remember_path(session: ReliableCS2Session, *args: object, prefer_relay: bool = True) -> None:
     session.prefer_relay = prefer_relay
