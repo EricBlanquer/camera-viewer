@@ -92,6 +92,9 @@ class ReplayLoadingTest(unittest.TestCase):
             controller.timeline.center = datetime(2026, 9, 26, 12, 0, 0)
             controller.jump_to_detection(-1)
             self.assertEqual(controller.current.recording.name, "20260926100000_011.mp4")
+            controller.timeline.center = datetime(2026, 9, 26, 12, 0, 30)
+            controller.jump_to_detection(-1)
+            self.assertEqual(controller.current.recording.name, "20260926100000_011.mp4")
         finally:
             controller.stop()
 

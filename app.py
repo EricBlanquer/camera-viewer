@@ -1986,8 +1986,17 @@ class ReplayController(QObject):
         direction = self.pending_jump
         detections = [recording for recording in self.all_recordings() if recording.detection]
         if direction < 0:
+            playing = next(
+                (recording for recording in detections if recording.start <= self.jump_origin < recording.end),
+                None,
+            )
+            limit = playing.start if playing is not None else self.jump_origin
             found = next(
-                (recording for recording in reversed(detections) if recording.start < self.jump_origin - timedelta(seconds=DETECTION_JUMP_MARGIN_SECONDS)),
+                (
+                    recording
+                    for recording in reversed(detections)
+                    if recording.start < limit - timedelta(seconds=DETECTION_JUMP_MARGIN_SECONDS)
+                ),
                 None,
             )
         else:
