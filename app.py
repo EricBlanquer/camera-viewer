@@ -57,9 +57,11 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMenu,
     QPushButton,
+    QSlider,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -258,6 +260,7 @@ CONTINUOUS_TIME_FORMAT = "%Y%m%d_%H%M%S"
 CONTINUOUS_NAME_PATTERN = re.compile(r"[^/]+_(\d{8}_\d{6})\.mkv")
 CONTINUOUS_SEGMENT_SECONDS = 10 * 60
 CONTINUOUS_RETENTION = timedelta(hours=24)
+REPLAY_FILE_IDLE_SECONDS = 5
 CONTINUOUS_SETTING = "recording/continuous"
 DETECTION_SETTING = "detections/last_seen"
 DETECTION_MESSAGE_MS = 15000
@@ -737,11 +740,38 @@ def continuous_directory() -> Path:
     return directory
 
 
+def continuous_prefix(camera: AccountDevice | RtspCamera) -> str:
+    name = safe_camera_name(camera.name)
+    return f"{name}_{camera.uid[5:13]}" if isinstance(camera, RtspCamera) else name
+
+
+def camera_recordings(camera: AccountDevice | RtspCamera, active: set[Path] | None = None) -> list[Path]:
+    cutoff = datetime.now() - CONTINUOUS_RETENTION
+    prefix = continuous_prefix(camera) + "_"
+    latest_write = time.time() - REPLAY_FILE_IDLE_SECONDS
+    active = active or set()
+    recordings = []
+    for path in continuous_directory().glob(f"{prefix}*{MATROSKA_SUFFIX}"):
+        started = segment_time(path)
+        if not path.name.startswith(prefix) or started is None or started < cutoff:
+            continue
+        try:
+            details = path.stat()
+        except OSError:
+            continue
+        if details.st_size > 0 and details.st_mtime <= latest_write and path not in active:
+            recordings.append(path)
+    return sorted(recordings, key=lambda path: path.name)
+
+
 def segment_time(path: Path) -> datetime | None:
     match = CONTINUOUS_NAME_PATTERN.fullmatch(path.name)
     if match is None:
         return None
-    return datetime.strptime(match.group(1), CONTINUOUS_TIME_FORMAT)
+    try:
+        return datetime.strptime(match.group(1), CONTINUOUS_TIME_FORMAT)
+    except ValueError:
+        return None
 
 
 def prune_continuous_recordings(directory: Path, now: datetime, retention: timedelta) -> None:
@@ -2760,26 +2790,119 @@ class RtspStreamWorker(QThread):
 
 class CameraPreview(QWidget):
     stopped = pyqtSignal()
+    replay_requested = pyqtSignal(object)
+    camera_replay_requested = pyqtSignal(object)
 
-    def __init__(self, camera: AccountDevice | RtspCamera) -> None:
+    def __init__(
+        self, camera: AccountDevice | RtspCamera, continuous_enabled: bool = False,
+        settings: QSettings | None = None,
+    ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.setStyleSheet("background-color: #171717;")
         self.camera = camera
+        self.continuous_enabled = continuous_enabled
+        self.settings = settings
         self.player: subprocess.Popen[bytes] | None = None
         self.mpv_directory: tempfile.TemporaryDirectory[str] | None = None
         self.worker: StreamWorker | RtspStreamWorker | None = None
         self.closing = False
         self.retry_enabled = True
         self.retry_seconds = 2
+        self.live = False
+        self.recording_path: Path | None = None
+        self.zoom_level = 0
+        self.sound_enabled = False
+        self.control_pending = False
+        self.setting_pending = False
+        self.light_on: bool | None = None
         self.retry_timer = QTimer(self)
         self.retry_timer.setSingleShot(True)
         self.retry_timer.timeout.connect(self.start)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        header = QWidget()
+        header.setStyleSheet("background-color: #242424;")
+        header.setFixedHeight(30)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 4, 0)
+        header_layout.setSpacing(0)
         self.label = CameraTitle(camera.uid, camera.name)
-        layout.addWidget(self.label)
+        header_layout.addWidget(self.label, 1)
+        self.replay_button = QPushButton()
+        set_button_icon(self.replay_button, "replay", "Play back recordings", 30)
+        if isinstance(camera, RtspCamera):
+            self.replay_button.clicked.connect(lambda: self.replay_requested.emit(self.camera))
+        else:
+            replay_menu = QMenu(self.replay_button)
+            replay_menu.addAction("Camera recordings").triggered.connect(
+                lambda: self.camera_replay_requested.emit(self.camera)
+            )
+            replay_menu.addAction("Local recordings (24 h)").triggered.connect(
+                lambda: self.replay_requested.emit(self.camera)
+            )
+            self.replay_button.setMenu(replay_menu)
+        self.replay_button.setStyleSheet("background: transparent; border: none;")
+        header_layout.addWidget(self.replay_button)
+        self.snapshot_button = QPushButton()
+        self.record_button = QPushButton()
+        self.zoom_out_button = QPushButton()
+        self.zoom_in_button = QPushButton()
+        for button, icon_name, label, handler in (
+            (self.snapshot_button, "photo", "Save picture", self.take_snapshot),
+            (self.record_button, "record", "Record video", self.toggle_recording),
+            (self.zoom_out_button, "zoom_out", "Zoom out", lambda: self.change_zoom(-1)),
+            (self.zoom_in_button, "zoom_in", "Zoom in", lambda: self.change_zoom(1)),
+        ):
+            set_button_icon(button, icon_name, label, 30)
+            button.setStyleSheet("background: transparent; border: none;")
+            button.setEnabled(False)
+            button.clicked.connect(handler)
+            header_layout.addWidget(button)
+        self.sound_button: QPushButton | None = None
+        self.ptz_button: QPushButton | None = None
+        self.light_action: QAction | None = None
+        self.quality_actions: dict[str, QAction] = {}
+        if not isinstance(camera, RtspCamera):
+            self.sound_button = QPushButton()
+            set_button_icon(self.sound_button, "sound", "Listen to camera", 30)
+            self.sound_button.setStyleSheet("background: transparent; border: none;")
+            self.sound_button.setEnabled(False)
+            self.sound_button.clicked.connect(self.toggle_sound)
+            header_layout.addWidget(self.sound_button)
+            self.ptz_button = QPushButton()
+            set_button_icon(self.ptz_button, "ptz", "Pan and tilt controls", 30)
+            self.ptz_button.setStyleSheet("background: transparent; border: none;")
+            self.ptz_button.setEnabled(False)
+            movement = QMenu(self.ptz_button)
+            for direction in ("Up", "Down", "Left", "Right"):
+                movement.addAction(direction).triggered.connect(
+                    lambda checked=False, value=direction: self.move_camera(value)
+                )
+            movement.addSeparator()
+            for index in range(1, 6):
+                movement.addAction(f"Preset {index}").triggered.connect(
+                    lambda checked=False, value=index: self.move_camera(f"Preset {value}")
+                )
+            movement.addSeparator()
+            self.light_action = movement.addAction("Turn white light on")
+            self.light_action.setVisible(False)
+            self.light_action.triggered.connect(self.toggle_light)
+            quality_menu = movement.addMenu("Video quality")
+            quality_menu.menuAction().setVisible(False)
+            quality_group = QActionGroup(quality_menu)
+            for quality in VIDEO_QUALITIES:
+                action = quality_menu.addAction(quality)
+                action.setCheckable(True)
+                action.setVisible(False)
+                action.triggered.connect(lambda checked=False, value=quality: self.choose_quality(value))
+                quality_group.addAction(action)
+                self.quality_actions[quality] = action
+            self.quality_menu = quality_menu
+            self.ptz_button.setMenu(movement)
+            header_layout.addWidget(self.ptz_button)
+        layout.addWidget(header)
         self.video = QWidget()
         self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.video.setStyleSheet("background-color: #171717;")
@@ -2816,31 +2939,224 @@ class CameraPreview(QWidget):
             self.worker = RtspStreamWorker(rtsp_camera, self.player, socket_path)
         else:
             assert self.player.stdin is not None
+            try:
+                continuous = ContinuousRecorder(continuous_directory(), continuous_prefix(self.camera))
+            except OSError:
+                continuous = None
+                self.label.setText(f"{self.camera.name} · Unable to create the recording folder")
             self.worker = StreamWorker(
-                self.camera, stored_camera_password(self.camera.uid) or "", self.player.stdin,
+                self.camera, stored_camera_password(self.camera.uid) or "", self.player.stdin, continuous,
             )
             self.worker.set_display(self.isVisible())
+        self.worker.set_continuous(self.continuous_enabled)
         self.worker.status_changed.connect(self._on_status)
         self.worker.failed.connect(self._on_failed)
+        self.worker.recording_started.connect(self._on_recording_started)
+        self.worker.recording_saved.connect(self._on_recording_saved)
+        self.worker.recording_failed.connect(self._on_recording_failed)
+        if isinstance(self.worker, RtspStreamWorker):
+            self.worker.continuous_failed.connect(self._on_continuous_failed)
+        if isinstance(self.worker, StreamWorker):
+            self.worker.sound_changed.connect(self._on_sound_changed)
+            self.worker.sound_failed.connect(self._on_sound_failed)
+            self.worker.control_completed.connect(self._on_control_finished)
+            self.worker.control_failed.connect(self._on_control_failed)
+            self.worker.capabilities_found.connect(self._on_capabilities)
+            self.worker.setting_completed.connect(self._on_setting_completed)
+            self.worker.setting_failed.connect(self._on_setting_failed)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
 
     def _on_status(self, message: str) -> None:
         if message == "Live video":
             self.retry_seconds = 2
+            self.live = True
+            self.snapshot_button.setEnabled(True)
+            self.record_button.setEnabled(True)
+            self.zoom_in_button.setEnabled(True)
+            if self.sound_button is not None:
+                self.sound_button.setEnabled(True)
+            if self.ptz_button is not None:
+                self.ptz_button.setEnabled(True)
         self.label.setText(f"{self.camera.name} · {message}")
 
     def _on_failed(self, message: str) -> None:
+        self.control_pending = False
+        self.setting_pending = False
         self.label.setText(f"{self.camera.name} · {message}")
         self.retry_enabled = message != "The camera rejected the available credentials."
 
     def _on_finished(self) -> None:
+        self.live = False
+        self.recording_path = None
+        self.zoom_level = 0
+        self.sound_enabled = False
+        self.control_pending = False
+        for button in (self.snapshot_button, self.record_button, self.zoom_out_button, self.zoom_in_button,
+                       self.sound_button, self.ptz_button):
+            if button is not None:
+                button.setEnabled(False)
+        set_button_icon(self.record_button, "record", "Record video", 30)
         self.worker = None
         self._cleanup_player()
         if self.closing:
             self.stopped.emit()
         elif self.retry_enabled:
             self._retry()
+
+    def _mpv_command(self, command: list[object]) -> bool:
+        socket_path = Path(self.mpv_directory.name) / "control.sock" if self.mpv_directory is not None else None
+        return mpv_request(socket_path, command)[0]
+
+    def take_snapshot(self) -> None:
+        if not self.live:
+            return
+        try:
+            path = media_directory() / f"{safe_camera_name(self.camera.name)}_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
+        except OSError:
+            self._on_failed("Unable to create the picture folder.")
+            return
+        if not self._mpv_command(["screenshot-to-file", str(path), "video"]):
+            self._on_failed("Unable to save a picture.")
+
+    def toggle_recording(self) -> None:
+        if not self.live or self.worker is None:
+            return
+        if self.recording_path is None:
+            try:
+                self.recording_path = media_directory() / f"{safe_camera_name(self.camera.name)}_{datetime.now():%Y%m%d_%H%M%S_%f}.mkv"
+            except OSError:
+                self._on_failed("Unable to create the recording folder.")
+                return
+            self.worker.set_recording(self.recording_path)
+            set_button_icon(self.record_button, "recording", "Stop recording", 30)
+        else:
+            self.worker.set_recording(None)
+            self.recording_path = None
+            set_button_icon(self.record_button, "record", "Record video", 30)
+
+    def _on_recording_started(self) -> None:
+        self.label.setText(f"{self.camera.name} · Recording video")
+
+    def _on_recording_saved(self, path: str) -> None:
+        self.label.setText(f"{self.camera.name} · Live video")
+
+    def _on_recording_failed(self, message: str) -> None:
+        self.recording_path = None
+        set_button_icon(self.record_button, "record", "Record video", 30)
+        self.label.setText(f"{self.camera.name} · {message}")
+
+    def _on_continuous_failed(self, message: str) -> None:
+        self.label.setText(f"{self.camera.name} · {message}")
+
+    def set_continuous(self, enabled: bool) -> None:
+        self.continuous_enabled = enabled
+        if self.worker is not None:
+            self.worker.set_continuous(enabled)
+
+    def change_zoom(self, step: int) -> None:
+        if not self.live:
+            return
+        level = min(MAX_ZOOM_LEVEL, max(0, self.zoom_level + step))
+        if level == self.zoom_level or not self._mpv_command(["set_property", "video-zoom", level / 2]):
+            return
+        self.zoom_level = level
+        self.zoom_out_button.setEnabled(level > 0)
+        self.zoom_in_button.setEnabled(level < MAX_ZOOM_LEVEL)
+
+    def toggle_sound(self) -> None:
+        if isinstance(self.worker, StreamWorker) and self.sound_button is not None:
+            self.sound_button.setEnabled(False)
+            self.worker.set_sound(not self.sound_enabled)
+
+    def _on_sound_changed(self, enabled: bool) -> None:
+        self.sound_enabled = enabled
+        if self.sound_button is not None:
+            set_button_icon(self.sound_button, "sound_on" if enabled else "sound",
+                            "Mute camera" if enabled else "Listen to camera", 30)
+            self.sound_button.setEnabled(self.live)
+
+    def _on_sound_failed(self, message: str) -> None:
+        if self.sound_button is not None:
+            self.sound_button.setEnabled(self.live)
+        self.label.setText(f"{self.camera.name} · {message}")
+
+    def move_camera(self, direction: str) -> None:
+        if not self.live or not isinstance(self.worker, StreamWorker) or self.control_pending:
+            return
+        if self.worker.queue_control((direction,)):
+            self.control_pending = True
+            if self.ptz_button is not None:
+                self.ptz_button.setEnabled(False)
+
+    def _on_control_finished(self, command: str) -> None:
+        self.control_pending = False
+        if self.ptz_button is not None:
+            self.ptz_button.setEnabled(self.live)
+
+    def _on_control_failed(self, message: str) -> None:
+        self._on_control_finished("")
+        self.label.setText(f"{self.camera.name} · {message}")
+
+    def _on_capabilities(self, qualities: list[str], light_on: bool | None) -> None:
+        self.light_on = light_on
+        if self.light_action is not None:
+            self.light_action.setVisible(light_on is not None)
+            self._update_light_action()
+        for quality, action in self.quality_actions.items():
+            action.setVisible(quality in qualities)
+            action.setChecked(
+                self.settings is not None
+                and quality == self.settings.value(f"{QUALITY_SETTING}/{self.camera.uid}", "", str)
+            )
+        if self.ptz_button is not None:
+            self.quality_menu.menuAction().setVisible(bool(qualities))
+
+    def _update_light_action(self) -> None:
+        if self.light_action is not None:
+            self.light_action.setText("Turn white light off" if self.light_on else "Turn white light on")
+
+    def _queue_setting(self, name: str, value: object) -> None:
+        if not self.live or not isinstance(self.worker, StreamWorker) or self.setting_pending:
+            return
+        if self.worker.queue_setting(name, value):
+            self.setting_pending = True
+            if self.light_action is not None:
+                self.light_action.setEnabled(False)
+            self.quality_menu.setEnabled(False)
+
+    def toggle_light(self) -> None:
+        if self.light_on is not None:
+            self._queue_setting(SETTING_LIGHT, not self.light_on)
+
+    def choose_quality(self, quality: str) -> None:
+        if self.recording_path is None:
+            self._queue_setting(SETTING_QUALITY, quality)
+
+    def _on_setting_completed(self, name: str, value: object) -> None:
+        self.setting_pending = False
+        if self.light_action is not None:
+            self.light_action.setEnabled(True)
+        self.quality_menu.setEnabled(True)
+        if name == SETTING_LIGHT:
+            self.light_on = bool(value)
+            self._update_light_action()
+        elif self.settings is not None:
+            self.settings.setValue(f"{QUALITY_SETTING}/{self.camera.uid}", value)
+            self.settings.sync()
+            for quality, action in self.quality_actions.items():
+                action.setChecked(quality == value)
+
+    def _on_setting_failed(self, name: str, message: str) -> None:
+        self.setting_pending = False
+        if self.light_action is not None:
+            self.light_action.setEnabled(True)
+        self.quality_menu.setEnabled(True)
+        if name == SETTING_QUALITY:
+            saved = self.settings.value(f"{QUALITY_SETTING}/{self.camera.uid}", "", str) if self.settings is not None else ""
+            for quality, action in self.quality_actions.items():
+                action.setChecked(quality == saved)
+        self.label.setText(f"{self.camera.name} · {message}")
 
     def _retry(self) -> None:
         if self.closing:
@@ -2869,6 +3185,206 @@ class CameraPreview(QWidget):
             self.stopped.emit()
 
 
+class LocalReplayDialog(QDialog):
+    def __init__(
+        self, camera: AccountDevice | RtspCamera, parent: QWidget,
+        worker: StreamWorker | RtspStreamWorker | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.camera = camera
+        self.worker = worker
+        self.setWindowTitle(f"{camera.name} · Local recordings")
+        self.setStyleSheet(
+            "QDialog { background-color: #171717; color: white; }"
+            "QListWidget { background-color: #242424; color: white; border: none; }"
+            "QPushButton { background-color: #303030; color: white; border: none; padding: 6px; }"
+            "QLabel { color: white; }"
+        )
+        self.resize(960, 720)
+        self.player: subprocess.Popen[bytes] | None = None
+        self.mpv_directory: tempfile.TemporaryDirectory[str] | None = None
+        self.socket_path: Path | None = None
+        self.zoom_level = 0
+        self.speed_index = 0
+        layout = QVBoxLayout(self)
+        self.video = QWidget()
+        self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+        self.video.setStyleSheet("background-color: #171717;")
+        self.frame = AspectVideoFrame(self.video)
+        layout.addWidget(self.frame, 1)
+        controls = QHBoxLayout()
+        self.play_button = QPushButton("Pause")
+        self.play_button.clicked.connect(self.toggle_playing)
+        controls.addWidget(self.play_button)
+        self.speed_button = QPushButton("1×")
+        self.speed_button.clicked.connect(self.change_speed)
+        controls.addWidget(self.speed_button)
+        self.position = QSlider(Qt.Orientation.Horizontal)
+        self.position.setRange(0, 0)
+        self.position.sliderReleased.connect(self.seek)
+        controls.addWidget(self.position, 1)
+        self.time_label = QLabel("00:00 / 00:00")
+        controls.addWidget(self.time_label)
+        self.zoom_out_button = QPushButton("−")
+        self.zoom_out_button.clicked.connect(lambda: self.change_zoom(-1))
+        controls.addWidget(self.zoom_out_button)
+        self.zoom_in_button = QPushButton("+")
+        self.zoom_in_button.clicked.connect(lambda: self.change_zoom(1))
+        controls.addWidget(self.zoom_in_button)
+        self.photo_button = QPushButton("Photo")
+        self.photo_button.clicked.connect(self.take_snapshot)
+        controls.addWidget(self.photo_button)
+        fullscreen = QPushButton("Full screen")
+        fullscreen.clicked.connect(self.toggle_fullscreen)
+        controls.addWidget(fullscreen)
+        layout.addLayout(controls)
+        self.recordings = QListWidget()
+        self.recordings.setAccessibleName("Local recordings from the last 24 hours")
+        self.recordings.currentRowChanged.connect(self.play_selected)
+        layout.addWidget(self.recordings)
+        refresh = QPushButton("Refresh recordings")
+        refresh.clicked.connect(self.refresh_recordings)
+        layout.addWidget(refresh)
+        self.progress_timer = QTimer(self)
+        self.progress_timer.timeout.connect(self.update_progress)
+        QTimer.singleShot(0, self.refresh_recordings)
+
+    def refresh_recordings(self) -> None:
+        current = self.recordings.currentItem()
+        selected = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
+        self.recordings.blockSignals(True)
+        self.recordings.clear()
+        for path in camera_recordings(self.camera, self.active_recordings()):
+            started = segment_time(path)
+            self.recordings.addItem(started.strftime("%d/%m/%Y %H:%M:%S") if started is not None else path.name)
+            self.recordings.item(self.recordings.count() - 1).setData(Qt.ItemDataRole.UserRole, str(path))
+        self.recordings.blockSignals(False)
+        if self.recordings.count():
+            row = next((index for index in range(self.recordings.count())
+                        if self.recordings.item(index).data(Qt.ItemDataRole.UserRole) == selected),
+                       self.recordings.count() - 1)
+            self.recordings.setCurrentRow(row)
+        else:
+            self.stop_player()
+            self.time_label.setText("No local recordings from the last 24 hours")
+
+    def active_recordings(self) -> set[Path]:
+        if not isinstance(self.worker, RtspStreamWorker):
+            return set()
+        process = self.worker.continuous
+        if process is None or process.poll() is not None:
+            return set()
+        active = set()
+        try:
+            for descriptor in Path(f"/proc/{process.pid}/fd").iterdir():
+                try:
+                    path = Path(os.readlink(descriptor))
+                except OSError:
+                    continue
+                if path.suffix == MATROSKA_SUFFIX:
+                    active.add(path)
+        except OSError:
+            return set()
+        return active
+
+    def play_selected(self, row: int) -> None:
+        item = self.recordings.item(row)
+        if item is None:
+            return
+        path = Path(item.data(Qt.ItemDataRole.UserRole))
+        self.stop_player()
+        try:
+            self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-replay-")
+            self.socket_path = Path(self.mpv_directory.name) / "control.sock"
+            self.player = subprocess.Popen(
+                ["mpv", "--no-config", "--no-terminal", "--really-quiet", "--vo=x11", "--osc=no",
+                 "--input-default-bindings=no", "--input-cursor=no", "--force-window=yes", "--keep-open=yes",
+                 f"--input-ipc-server={self.socket_path}", f"--wid={int(self.video.winId())}", str(path)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            self.time_label.setText("Unable to open the recording")
+            self.stop_player()
+            return
+        self.zoom_level = 0
+        self.speed_index = 0
+        self.speed_button.setText("1×")
+        self.position.setRange(0, 0)
+        self.play_button.setText("Pause")
+        self.progress_timer.start(500)
+
+    def update_progress(self) -> None:
+        if self.player is None or self.player.poll() is not None:
+            self.progress_timer.stop()
+            self.time_label.setText("Playback stopped")
+            return
+        position_ready, current = mpv_request(self.socket_path, ["get_property", "time-pos"])
+        duration_ready, duration = mpv_request(self.socket_path, ["get_property", "duration"])
+        if not position_ready or not duration_ready or not isinstance(current, (int, float)) or not isinstance(duration, (int, float)):
+            return
+        if not self.position.isSliderDown():
+            self.position.setRange(0, max(0, round(duration)))
+            self.position.setValue(round(current))
+        self.time_label.setText(
+            f"{int(current) // 60:02d}:{int(current) % 60:02d} / {int(duration) // 60:02d}:{int(duration) % 60:02d}"
+        )
+        ended, eof = mpv_request(self.socket_path, ["get_property", "eof-reached"])
+        if ended and eof is True and self.recordings.currentRow() + 1 < self.recordings.count():
+            self.recordings.setCurrentRow(self.recordings.currentRow() + 1)
+
+    def seek(self) -> None:
+        mpv_request(self.socket_path, ["seek", self.position.value(), "absolute"])
+
+    def toggle_playing(self) -> None:
+        ready, paused = mpv_request(self.socket_path, ["get_property", "pause"])
+        if ready and mpv_request(self.socket_path, ["set_property", "pause", not paused])[0]:
+            self.play_button.setText("Play" if not paused else "Pause")
+
+    def change_zoom(self, step: int) -> None:
+        level = min(MAX_ZOOM_LEVEL, max(0, self.zoom_level + step))
+        if mpv_request(self.socket_path, ["set_property", "video-zoom", level / 2])[0]:
+            self.zoom_level = level
+
+    def change_speed(self) -> None:
+        index = (self.speed_index + 1) % len(REPLAY_SPEEDS)
+        speed = REPLAY_SPEEDS[index]
+        if mpv_request(self.socket_path, ["set_property", "speed", speed])[0]:
+            self.speed_index = index
+            self.speed_button.setText(f"{speed}×")
+
+    def toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def take_snapshot(self) -> None:
+        try:
+            path = media_directory() / f"{safe_camera_name(self.camera.name)}_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
+        except OSError:
+            self.time_label.setText("Unable to create the picture folder")
+            return
+        if not mpv_request(self.socket_path, ["screenshot-to-file", str(path), "video"])[0]:
+            self.time_label.setText("Unable to save a picture")
+
+    def stop_player(self) -> None:
+        self.progress_timer.stop()
+        stop_mpv_player(self.player)
+        self.player = None
+        if self.mpv_directory is not None:
+            self.mpv_directory.cleanup()
+            self.mpv_directory = None
+            self.socket_path = None
+
+    def closeEvent(self, event: object) -> None:
+        self.stop_player()
+        super().closeEvent(event)
+
+    def done(self, result: int) -> None:
+        self.stop_player()
+        super().done(result)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2895,6 +3411,8 @@ class MainWindow(QMainWindow):
         self.layout_refresh_timer.setSingleShot(True)
         self.layout_refresh_timer.timeout.connect(self.sync_previews)
         self.pending_camera: tuple[str, str] | None = None
+        self.pending_camera_replay: str | None = None
+        self.pending_selection_start: tuple[str, bool] | None = None
         self.account_queue: list[tuple[str, str]] = []
         self.account_worker: AccountWorker | None = None
         self.stream_worker: StreamWorker | RtspStreamWorker | None = None
@@ -2961,17 +3479,13 @@ class MainWindow(QMainWindow):
         primary_layout.setSpacing(0)
         primary_header = QWidget()
         primary_header.setStyleSheet("background-color: #242424;")
+        primary_header.setFixedHeight(30)
         primary_header_layout = QHBoxLayout(primary_header)
-        primary_header_layout.setContentsMargins(0, 0, 4, 0)
+        primary_header_layout.setContentsMargins(0, 0, 0, 0)
         primary_header_layout.setSpacing(0)
         self.primary_label = CameraTitle("", "")
         self.primary_label.moved.connect(self.swap_cameras)
         primary_header_layout.addWidget(self.primary_label, 1)
-        self.controls_button = QPushButton("Controls")
-        self.controls_button.setAccessibleName("Show camera controls")
-        self.controls_button.setStyleSheet("color: white; background-color: #242424; border: none; padding: 4px 8px;")
-        self.controls_button.clicked.connect(self.toggle_overlay)
-        primary_header_layout.addWidget(self.controls_button)
         primary_layout.addWidget(primary_header)
         self.primary_frame = AspectVideoFrame(self.video)
         primary_layout.addWidget(self.primary_frame, 1)
@@ -3018,7 +3532,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.quality_button)
         self.replay_button = QPushButton("Playback")
         self.replay_button.setEnabled(False)
-        self.replay_button.clicked.connect(lambda: self.enter_replay(None))
+        self.replay_button.clicked.connect(self.open_camera_replay)
         controls.addWidget(self.replay_button)
         self.snapshot_button = QPushButton("Photo")
         self.snapshot_button.setToolTip("Save a picture of the live video")
@@ -3413,7 +3927,38 @@ class MainWindow(QMainWindow):
         self.settings.sync()
         if self.stream_worker is not None:
             self.stream_worker.set_continuous(enabled)
+        for preview in self.previews.values():
+            preview.set_continuous(enabled)
         self.show_notice("Continuous recording on." if enabled else "Continuous recording off.")
+
+    def open_camera_replay(self) -> None:
+        camera = getattr(self, "selected_device", None)
+        if isinstance(camera, RtspCamera):
+            self.open_local_replay(camera)
+        elif camera is not None:
+            self.enter_replay(None)
+
+    def open_local_replay(self, camera: AccountDevice | RtspCamera) -> None:
+        worker = (
+            self.stream_worker if camera.uid == getattr(getattr(self, "selected_device", None), "uid", None)
+            else self.previews[camera.uid].worker if camera.uid in self.previews else None
+        )
+        try:
+            dialog = LocalReplayDialog(camera, self, worker)
+        except OSError:
+            self.show_notice("Unable to open local recordings.")
+            return
+        dialog.exec()
+
+    def open_camera_sd_replay(self, camera: AccountDevice) -> None:
+        username = self.device_accounts.get(camera.uid)
+        if username is None:
+            return
+        if camera.uid == getattr(getattr(self, "selected_device", None), "uid", None):
+            self.enter_replay(None)
+            return
+        self.pending_camera_replay = camera.uid
+        self.select_camera(username, camera.uid)
 
     def open_recordings_folder(self) -> None:
         try:
@@ -3493,8 +4038,20 @@ class MainWindow(QMainWindow):
     def _preview_stopped(self, preview: CameraPreview) -> None:
         self.retired_previews.remove(preview)
         preview.deleteLater()
+        if self.pending_selection_start is not None and self.pending_selection_start[0] == preview.camera.uid:
+            QTimer.singleShot(0, self._finish_selected_camera)
         if self.close_pending and self.stream_worker is None and self.account_worker is None:
             QTimer.singleShot(0, self.close)
+
+    def _finish_selected_camera(self) -> None:
+        pending = self.pending_selection_start
+        self.pending_selection_start = None
+        if pending is None or self.close_pending or getattr(getattr(self, "selected_device", None), "uid", None) != pending[0]:
+            return
+        if pending[1]:
+            self.enter_replay(None)
+        else:
+            self.watch_live()
 
     def sync_previews(self) -> None:
         selected = getattr(self, "selected_device", None)
@@ -3511,6 +4068,8 @@ class MainWindow(QMainWindow):
                 del self.previews[uid]
                 self._retire_preview(preview)
         visible = ordered if cameras else ([selected] if selected is not None else [])
+        self.video_grid.setColumnStretch(0, 1)
+        self.video_grid.setColumnStretch(1, 1 if layout == "horizontal" and len(visible) > 1 else 0)
         for index, camera in enumerate(visible):
             row, column = (index, 0) if layout == "vertical" else (index // 2, index % 2)
             if selected is not None and camera.uid == selected.uid:
@@ -3518,8 +4077,10 @@ class MainWindow(QMainWindow):
                 continue
             preview = self.previews.get(camera.uid)
             if preview is None:
-                preview = CameraPreview(camera)
+                preview = CameraPreview(camera, self.continuous_recording_enabled(), self.settings)
                 preview.label.moved.connect(self.swap_cameras)
+                preview.replay_requested.connect(self.open_local_replay)
+                preview.camera_replay_requested.connect(self.open_camera_sd_replay)
                 self.previews[camera.uid] = preview
                 self.video_grid.addWidget(preview, row, column)
                 preview.show()
@@ -3699,6 +4260,8 @@ class MainWindow(QMainWindow):
     def select_camera(self, username: str, uid: str) -> None:
         if self.device_accounts.get(uid) != username:
             return
+        if uid != self.pending_camera_replay:
+            self.pending_camera_replay = None
         if getattr(self, "selected_device", None) is not None and self.selected_device.uid == uid:
             self.show_window()
             return
@@ -3725,13 +4288,21 @@ class MainWindow(QMainWindow):
         self.latest_detection = None
         self.sync_quality_actions()
         self.on_capabilities_found([], None)
-        self.replay_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
+        self.replay_button.setEnabled(True)
         self.ptz_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
+        self.ptz_button.setVisible(not isinstance(self.selected_device, RtspCamera))
+        self.sound_button.setVisible(not isinstance(self.selected_device, RtspCamera))
         self.ptz_panel.hide()
         self.stop_player()
+        switching_preview = uid in self.previews or any(preview.camera.uid == uid for preview in self.retired_previews)
+        replay_requested = self.pending_camera_replay == uid
+        self.pending_camera_replay = None
+        self.pending_selection_start = (uid, replay_requested) if switching_preview else None
         self.sync_previews()
         self.show_window_without_stream()
-        self.watch_live()
+        if not switching_preview:
+            self.pending_selection_start = (uid, replay_requested)
+            self._finish_selected_camera()
 
     def on_account_failed(self, message: str) -> None:
         self.retry_pending = message != ACCOUNT_REJECTED_MESSAGE
@@ -3827,8 +4398,10 @@ class MainWindow(QMainWindow):
             )
             self.primary_label.uid = self.selected_device.uid
             self.primary_label.setText(self.selected_device.name)
-            self.replay_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
+            self.replay_button.setEnabled(True)
             self.ptz_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
+            self.ptz_button.setVisible(not isinstance(self.selected_device, RtspCamera))
+            self.sound_button.setVisible(not isinstance(self.selected_device, RtspCamera))
             if isinstance(self.selected_device, RtspCamera):
                 self.ptz_panel.hide()
             if saved_uid != self.selected_device.uid:

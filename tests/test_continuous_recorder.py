@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from app import ContinuousRecorder, main, prune_continuous_recordings, recover_continuous_recordings
+from app import ContinuousRecorder, RtspCamera, camera_recordings, continuous_prefix, main, prune_continuous_recordings, recover_continuous_recordings, segment_time
 
 from test_video_recorder import FRAME_SECONDS, encoded_frames, probe_duration
 
@@ -51,6 +51,22 @@ class ContinuousRecorderTest(unittest.TestCase):
             path.write_bytes(b"x")
         prune_continuous_recordings(self.path, now, timedelta(hours=24))
         self.assertEqual(sorted(path.name for path in self.path.iterdir()), [recent.name, other.name])
+
+    def test_local_replay_lists_only_its_camera_within_last_day(self) -> None:
+        camera = RtspCamera("rtsp:27b7804d", "Entrée", "rtsp://192.0.2.10:8001/0")
+        now = datetime.now()
+        recent = self.path / f"{continuous_prefix(camera)}_{now:%Y%m%d_%H%M%S}.mkv"
+        old = self.path / f"{continuous_prefix(camera)}_{now - timedelta(hours=25):%Y%m%d_%H%M%S}.mkv"
+        other = self.path / f"Other_27b7804d_{now:%Y%m%d_%H%M%S}.mkv"
+        active = self.path / f"{continuous_prefix(camera)}_{now - timedelta(minutes=1):%Y%m%d_%H%M%S}.mkv"
+        for path in (recent, old, other):
+            path.write_bytes(b"video")
+            os.utime(path, (time.time() - 10, time.time() - 10))
+        active.write_bytes(b"incomplete video")
+        self.assertIsNone(segment_time(self.path / "Entrée_27b7804d_20261340_999999.mkv"))
+        with mock.patch("app.continuous_directory", return_value=self.path):
+            self.assertEqual(camera_recordings(camera), [recent])
+            self.assertEqual(camera_recordings(camera, {recent}), [])
 
     def test_interrupted_segment_is_recovered(self) -> None:
         frames = encoded_frames()

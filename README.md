@@ -34,8 +34,13 @@ With **Show all cameras** enabled in the tray menu, the selected camera and the 
 Use **Camera layout > Side by side** or **Stacked** to place the feeds horizontally or vertically; the layout choice is remembered.
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 Drag one camera title onto another to exchange their positions; the order is remembered without restarting either stream.
-The selected camera keeps the live controls, sound, photo, recording, and replay features available for its type; the other camera views display live video and reconnect independently.
-In multi-camera view, the selected camera's controls remain visible and its **Controls** button can show or hide them.
+The camera panes share the available space equally in a side-by-side layout.
+Each camera has its own local playback, photo, recording, and zoom controls; O-KAM camera panes also have sound, pan-and-tilt, saved positions, light, and video quality controls when the camera supports them.
+Local playback lists that camera's recordings from the last 24 hours with pause, seeking, speeds up to 8x, zoom, photo, and full-screen controls.
+For an O-KAM pane, the playback button offers the camera's microSD recordings and its local 24-hour recordings.
+Selecting microSD playback makes that camera the selected pane while the other live feed remains visible.
+The other camera views reconnect independently.
+In multi-camera view, click the selected camera's video to show or hide its control bar.
 Turn off **Show all cameras** to return to one video.
 Use **Refresh camera list** there after adding a camera to an existing O-KAM account.
 Later launches show only the video and its controls.
@@ -44,7 +49,7 @@ Run `.venv/bin/python app.py --forget-account` to remove all saved O-KAM account
 The TERUHAL QW55 used with iCam365 provides an RTSP stream at `rtsp://<camera-LAN-address>:8001/0`.
 Select UDP transport for this model.
 Give the camera a stable LAN address so the saved URL remains valid.
-For RTSP cameras, live view, photo, local video recording, and continuous recording are available; iCam365 playback, sound, detection notifications, and camera movement controls are not available through this RTSP connection.
+For RTSP cameras, live view, photo, local video recording, continuous recording, and playback of local recordings are available; iCam365 microSD playback, sound, detection notifications, and camera movement controls are not available through this RTSP connection.
 An RTSP URL is reachable outside the home only when the computer has a secure route to the camera's LAN, such as a VPN; the iCam365 account relay is not integrated.
 
 Each camera keeps its 16:9 ratio in single-camera and multi-camera views, including when the window is resized.
@@ -75,7 +80,7 @@ Clicking a detection notification opens the playback at that detection.
 Every minute, Camera Viewer checks the selected O-KAM camera's microSD card for new detection recordings and shows a desktop notification with the time of the latest one.
 The check uses the live connection.
 
-Camera Viewer also records the selected live video continuously on this computer, in ten-minute Matroska files in `Videos/O-KAM Linux/Continuous`, and deletes files older than 24 hours.
+With **Show all cameras** enabled, Camera Viewer records every displayed live video continuously on this computer, in ten-minute Matroska files in the desktop's `Videos/O-KAM Linux/Continuous` folder, and deletes files older than 24 hours.
 This keeps a copy of the last day even if the camera and its microSD card are taken, as long as the computer and the application are running.
 The tray menu switches continuous recording on or off and opens the recordings folder.
 A segment interrupted by a crash or power loss is recovered at the next start.
