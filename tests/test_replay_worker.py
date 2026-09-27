@@ -10,7 +10,6 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from PyQt6.QtWidgets import QApplication
 
 from app import (
-    LOADING_DONE,
     REPLAY_DOWNLOAD_REQUEST,
     REPLAY_LIST_REQUEST,
     CardRecording,
@@ -61,15 +60,18 @@ class ReplayLoadingTest(unittest.TestCase):
         controller = ReplayController(SimpleNamespace(), "", TimelineWidget())
         try:
             controller.worker.download = lambda buffer: None
-            loading: list[int] = []
-            controller.loading_changed.connect(loading.append)
+            loading: list[str] = []
+            controller.status_changed.connect(loading.append)
             target = recording("20260926192758_100.mp4")
             controller.recordings["20260926"] = [target]
             controller.seek(datetime(2026, 9, 26, 19, 30, 28))
             controller.on_progress(target.name, 0.25)
             controller.on_progress(target.name, 0.6)
             controller.on_position(camera_timestamp(datetime(2026, 9, 26, 19, 30, 28)))
-            self.assertEqual(loading, [0, 50, 99, LOADING_DONE])
+            self.assertEqual(
+                loading,
+                ["Loading recording 0%", "Loading recording 50%", "Loading recording 99%", "Playback 26/09/2026 19:30:28"],
+            )
         finally:
             controller.stop()
 
