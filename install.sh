@@ -5,6 +5,8 @@ app_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 data_dir="$HOME/.local/share/okam-linux/vendor"
 desktop_dir="$HOME/.local/share/applications"
 autostart_dir="$HOME/.config/autostart"
+launcher_name="camera-viewer.desktop"
+legacy_launcher_name="okam-linux.desktop"
 
 git -C "$app_dir" submodule update --init
 python3 -m venv --system-site-packages "$app_dir/.venv"
@@ -14,7 +16,7 @@ if [ ! -f "$data_dir/device_wakeup_server.dart" ]; then
     "$app_dir/.venv/bin/python" "$app_dir/vendor/okam-ha-native/tools/fetch_official_sdk.py" --wake-only --destination "$data_dir"
 fi
 chmod 600 "$data_dir/device_wakeup_server.dart"
-cat > "$desktop_dir/okam-linux.desktop" <<EOF
+cat > "$desktop_dir/$launcher_name" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Camera Viewer
@@ -25,10 +27,11 @@ Icon=$app_dir/assets/icons/app.svg
 Terminal=false
 Categories=AudioVideo;Video;
 EOF
-chmod 644 "$desktop_dir/okam-linux.desktop"
+chmod 644 "$desktop_dir/$launcher_name"
 mkdir -p "$autostart_dir"
 sed -e "s|^Exec=.*|Exec=$app_dir/.venv/bin/python $app_dir/app.py --tray|" \
     -e '$a X-GNOME-Autostart-enabled=true' \
     -e '$a X-GNOME-Autostart-Delay=10' \
-    "$desktop_dir/okam-linux.desktop" > "$autostart_dir/okam-linux.desktop"
-chmod 644 "$autostart_dir/okam-linux.desktop"
+    "$desktop_dir/$launcher_name" > "$autostart_dir/$launcher_name"
+chmod 644 "$autostart_dir/$launcher_name"
+rm -f "$desktop_dir/$legacy_launcher_name" "$autostart_dir/$legacy_launcher_name"

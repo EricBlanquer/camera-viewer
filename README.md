@@ -12,8 +12,8 @@ O-KAM accounts also require `secret-tool` with an unlocked desktop keyring and n
 On this computer these programs are already installed.
 
 ```sh
-git clone --recurse-submodules <repository-url> okam-linux
-cd okam-linux
+git clone --recurse-submodules https://github.com/EricBlanquer/camera-viewer.git
+cd camera-viewer
 ./install.sh
 ```
 
