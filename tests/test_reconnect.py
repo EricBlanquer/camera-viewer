@@ -105,6 +105,19 @@ class ReconnectTest(unittest.TestCase):
         self.assertEqual(self.window.zoom_level, 0)
         self.assertEqual(toggles, [])
 
+    def test_zoom_notice_returns_to_the_current_status(self) -> None:
+        self.window._mpv_command = lambda command: True
+        self.window.stream_live = True
+        self.window.set_status("Live video")
+        self.window.change_zoom(1)
+        self.window.change_zoom(-1)
+        self.assertEqual(self.window.status_text, "Zoom 1.0×.")
+        self.assertTrue(self.window.notice_timer.isActive())
+        self.window.set_status("Live video")
+        self.assertEqual(self.window.status_text, "Zoom 1.0×.")
+        self.window.notice_timer.timeout.emit()
+        self.assertEqual(self.window.status_text, "Live video")
+
     def test_rejected_camera_credentials_do_not_retry(self) -> None:
         self.window.on_stream_error("The camera rejected the available credentials.")
         self.window.on_stream_finished()

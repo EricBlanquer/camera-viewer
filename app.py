@@ -94,6 +94,7 @@ LOG_FILE_NAME = "okam-linux.log"
 LOG_MAX_BYTES = 1024 * 1024
 LOG_BACKUPS = 2
 TRAY_ARGUMENT = "--tray"
+NOTICE_MS = 4000
 CAMERA_PASSWORD_ARGUMENT = "--camera-password"
 SIGNAL_POLL_MS = 500
 INSTANCE_SERVER_PREFIX = "okam-linux"
@@ -2319,6 +2320,10 @@ class MainWindow(QMainWindow):
         self.resize(980, 590)
         self.quit_requested = False
         self.status_text = ""
+        self.base_status = ""
+        self.notice_timer = QTimer(self)
+        self.notice_timer.setSingleShot(True)
+        self.notice_timer.timeout.connect(self.restore_status)
         self.aspect_fitted = False
         self.tray: QSystemTrayIcon | None = None
         self.tray_actions: list[tuple[QAction, QPushButton]] = []
@@ -2591,6 +2596,18 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.change_account)
 
     def set_status(self, text: str) -> None:
+        self.base_status = text
+        if not self.notice_timer.isActive():
+            self.display_status(text)
+
+    def show_notice(self, text: str) -> None:
+        self.display_status(text)
+        self.notice_timer.start(NOTICE_MS)
+
+    def restore_status(self) -> None:
+        self.display_status(self.base_status)
+
+    def display_status(self, text: str) -> None:
         self.status_text = text
         self.setWindowTitle(f"{APPLICATION_NAME} \u00b7 {text}")
         if self.tray is not None:
@@ -2870,7 +2887,7 @@ class MainWindow(QMainWindow):
             self.set_status("Unable to save the recording.")
             return
         if path is not None:
-            self.set_status(f"Recording saved: {path}")
+            self.show_notice(f"Recording saved: {path}")
 
     def on_account_finished(self) -> None:
         self.replay_button.setEnabled(bool(self.devices))
@@ -3048,7 +3065,7 @@ class MainWindow(QMainWindow):
             self.set_status("Unable to create the picture folder.")
             return
         if self._mpv_command(["screenshot-to-file", str(path), "video"]):
-            self.set_status(f"Picture saved: {path}")
+            self.show_notice(f"Picture saved: {path}")
         else:
             self.set_status("Unable to save a picture.")
 
@@ -3100,7 +3117,7 @@ class MainWindow(QMainWindow):
         self.video.raise_interaction_layer()
 
     def on_recording_saved(self, path: str) -> None:
-        self.set_status(f"Recording saved: {path}")
+        self.show_notice(f"Recording saved: {path}")
 
     def on_recording_failed(self, message: str) -> None:
         if self.recording_path is not None:
@@ -3135,7 +3152,7 @@ class MainWindow(QMainWindow):
         self.apply_video_pan()
         self.zoom_out_button.setEnabled(level > 0)
         self.zoom_in_button.setEnabled(level < MAX_ZOOM_LEVEL)
-        self.set_status(f"Zoom {2 ** (level / 2):.1f}×.")
+        self.show_notice(f"Zoom {2 ** (level / 2):.1f}×.")
 
     def toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -3241,12 +3258,12 @@ class MainWindow(QMainWindow):
         if name == SETTING_LIGHT:
             self.light_on = bool(value)
             self.update_light_button()
-            self.set_status("White light on." if self.light_on else "White light off.")
+            self.show_notice("White light on." if self.light_on else "White light off.")
         else:
             self.settings.setValue(QUALITY_SETTING, value)
             self.settings.sync()
             self.sync_quality_actions()
-            self.set_status(f"Video quality set to {value}.")
+            self.show_notice(f"Video quality set to {value}.")
 
     def on_setting_failed(self, name: str, message: str) -> None:
         self.setting_pending = False
@@ -3271,7 +3288,7 @@ class MainWindow(QMainWindow):
             "Mute camera" if enabled else "Listen to camera",
         )
         self.sound_button.setEnabled(self.stream_live)
-        self.set_status("Camera sound on." if enabled else "Camera sound off.")
+        self.show_notice("Camera sound on." if enabled else "Camera sound off.")
 
     def on_sound_failed(self, message: str) -> None:
         self.sound_button.setEnabled(self.stream_live)
@@ -3322,11 +3339,11 @@ class MainWindow(QMainWindow):
         self.control_pending = False
         self.set_controls_enabled(self.stream_live)
         if command == "Drag":
-            self.set_status("Camera moved with mouse.")
+            self.show_notice("Camera moved with mouse.")
         elif command.startswith("Preset "):
-            self.set_status(f"Camera moved to {command.lower()}.")
+            self.show_notice(f"Camera moved to {command.lower()}.")
         else:
-            self.set_status(f"Camera moved {command.lower()}.")
+            self.show_notice(f"Camera moved {command.lower()}.")
 
     def on_control_failed(self, message: str) -> None:
         self.control_pending = False
