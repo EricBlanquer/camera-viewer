@@ -1109,7 +1109,7 @@ class MainWindow(QMainWindow):
         badge_layout = QHBoxLayout(self.recording_badge)
         badge_layout.setContentsMargins(16, 6, 16, 6)
         self.recording_label = QLabel()
-        self.recording_label.setStyleSheet("color: white; font-weight: 600;")
+        self.recording_label.setStyleSheet("color: white; background: transparent; font-weight: 600;")
         self.recording_label.setAccessibleName("Recording duration")
         badge_layout.addWidget(self.recording_label)
         self.video.set_recording_badge(self.recording_badge)
