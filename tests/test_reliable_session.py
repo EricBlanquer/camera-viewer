@@ -64,7 +64,7 @@ class SessionPathTest(unittest.TestCase):
             attempts.append(session.prefer_relay)
             if not session.prefer_relay and not direct_works:
                 raise CS2Error("camera did not establish a native P2P session")
-            session._peer = ("192.168.1.17", 25717)
+            session._peer = ("192.0.2.17", 25717)
 
         return attempts, connect
 
