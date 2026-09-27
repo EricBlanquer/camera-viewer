@@ -391,6 +391,67 @@ class CameraFrameReader:
         return frame, frame_type
 
 
+def remux_to_matroska(
+    video_path: Path,
+    frame_rate: float,
+    output_path: Path,
+    audio_path: Path | None = None,
+    audio_offset: float = 0.0,
+) -> None:
+    command = [
+        "ffmpeg",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-y",
+        "-fflags",
+        "+genpts",
+        "-framerate",
+        f"{frame_rate:.3f}",
+        "-f",
+        "h264",
+        "-i",
+        str(video_path),
+    ]
+    if audio_path is not None:
+        command += ["-itsoffset", f"{audio_offset:.3f}", "-f", "aac", "-i", str(audio_path), "-map", "0:v", "-map", "1:a"]
+    command += ["-c", "copy", "-f", "matroska", str(output_path)]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=RECORDING_REMUX_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        output_path.unlink(missing_ok=True)
+        raise OSError("ffmpeg did not finish the recording.") from None
+    if result.returncode != 0 or not output_path.is_file() or output_path.stat().st_size == 0:
+        output_path.unlink(missing_ok=True)
+        raise OSError(result.stderr.decode("utf-8", "replace").strip() or "ffmpeg failed.")
+
+
+def mpv_request(socket_path: Path | None, command: list[object]) -> tuple[bool, object]:
+    if socket_path is None:
+        return False, None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(str(socket_path))
+            connection.sendall(json.dumps({"command": command}).encode("utf-8") + b"\n")
+            response = bytearray()
+            while b"\n" not in response and len(response) < MAX_MPV_RESPONSE_BYTES:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                response.extend(chunk)
+        answer = json.loads(response.split(b"\n", 1)[0])
+        return answer.get("error") == "success", answer.get("data")
+    except (OSError, ValueError, IndexError, AttributeError):
+        return False, None
+
+
 class VideoRecorder:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -426,37 +487,7 @@ class VideoRecorder:
         try:
             if self.frames < MIN_RECORDING_FRAMES or self.last_frame_time <= self.first_frame_time:
                 raise OSError("The recording is too short.")
-            result = subprocess.run(
-                [
-                    "ffmpeg",
-                    "-nostdin",
-                    "-loglevel",
-                    "error",
-                    "-fflags",
-                    "+genpts",
-                    "-framerate",
-                    f"{self.frame_rate():.3f}",
-                    "-f",
-                    "h264",
-                    "-i",
-                    str(self.raw_path),
-                    "-c:v",
-                    "copy",
-                    "-f",
-                    "matroska",
-                    str(self.path),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=RECORDING_REMUX_TIMEOUT_SECONDS,
-                check=False,
-            )
-            if result.returncode != 0 or not self.path.is_file() or self.path.stat().st_size == 0:
-                self.path.unlink(missing_ok=True)
-                raise OSError(result.stderr.decode("utf-8", "replace").strip() or "ffmpeg failed.")
-        except subprocess.TimeoutExpired:
-            self.path.unlink(missing_ok=True)
-            raise OSError("ffmpeg did not finish the recording.") from None
+            remux_to_matroska(self.raw_path, self.frame_rate(), self.path)
         finally:
             self.raw_path.unlink(missing_ok=True)
         return self.path
@@ -1499,6 +1530,43 @@ class MainWindow(QMainWindow):
             return
         self.reconnect_timer.stop()
         self.retry_pending = False
+        if not self.start_player():
+            return
+        assert self.player.stdin is not None
+        self.stream_error = False
+        self.stream_live = False
+        self.control_pending = False
+        self.sound_enabled = False
+        self.reset_recording_state()
+        self.zoom_level = 0
+        set_button_icon(self.sound_button, "sound", "Listen to camera")
+        self.stream_worker = StreamWorker(
+            self.selected_device, stored_camera_password(self.selected_device.uid) or "", self.player.stdin
+        )
+        self.stream_worker.status_changed.connect(self.on_stream_status)
+        self.stream_worker.failed.connect(self.on_stream_error)
+        self.stream_worker.control_completed.connect(self.on_control_completed)
+        self.stream_worker.control_failed.connect(self.on_control_failed)
+        self.stream_worker.sound_changed.connect(self.on_sound_changed)
+        self.stream_worker.sound_failed.connect(self.on_sound_failed)
+        self.stream_worker.recording_started.connect(self.on_recording_started)
+        self.stream_worker.recording_saved.connect(self.on_recording_saved)
+        self.stream_worker.recording_failed.connect(self.on_recording_failed)
+        self.stream_worker.capabilities_found.connect(self.on_capabilities_found)
+        self.stream_worker.detections_listed.connect(self.on_detections_listed)
+        self.stream_worker.detections_failed.connect(self.on_detections_failed)
+        self.stream_worker.setting_completed.connect(self.on_setting_completed)
+        self.stream_worker.setting_failed.connect(self.on_setting_failed)
+        self.stream_worker.finished.connect(self.on_stream_finished)
+        self.stream_worker.start()
+        QTimer.singleShot(200, self.show_overlay)
+        QTimer.singleShot(500, self.video.raise_interaction_layer)
+
+    def start_player(self) -> bool:
+        if self.player is not None and self.player.poll() is None:
+            self._mpv_command(["set_property", "video-zoom", 0])
+            return True
+        self.stop_player()
         self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-mpv-")
         self.mpv_socket = Path(self.mpv_directory.name) / "control.sock"
         try:
@@ -1535,36 +1603,28 @@ class MainWindow(QMainWindow):
             self.mpv_directory.cleanup()
             self.mpv_directory = None
             self.set_status("The mpv video player is unavailable.")
-            return
-        assert self.player.stdin is not None
-        self.stream_error = False
-        self.stream_live = False
-        self.control_pending = False
-        self.sound_enabled = False
-        self.reset_recording_state()
-        self.zoom_level = 0
-        set_button_icon(self.sound_button, "sound", "Listen to camera")
-        self.stream_worker = StreamWorker(
-            self.selected_device, stored_camera_password(self.selected_device.uid) or "", self.player.stdin
-        )
-        self.stream_worker.status_changed.connect(self.on_stream_status)
-        self.stream_worker.failed.connect(self.on_stream_error)
-        self.stream_worker.control_completed.connect(self.on_control_completed)
-        self.stream_worker.control_failed.connect(self.on_control_failed)
-        self.stream_worker.sound_changed.connect(self.on_sound_changed)
-        self.stream_worker.sound_failed.connect(self.on_sound_failed)
-        self.stream_worker.recording_started.connect(self.on_recording_started)
-        self.stream_worker.recording_saved.connect(self.on_recording_saved)
-        self.stream_worker.recording_failed.connect(self.on_recording_failed)
-        self.stream_worker.capabilities_found.connect(self.on_capabilities_found)
-        self.stream_worker.detections_listed.connect(self.on_detections_listed)
-        self.stream_worker.detections_failed.connect(self.on_detections_failed)
-        self.stream_worker.setting_completed.connect(self.on_setting_completed)
-        self.stream_worker.setting_failed.connect(self.on_setting_failed)
-        self.stream_worker.finished.connect(self.on_stream_finished)
-        self.stream_worker.start()
-        QTimer.singleShot(200, self.show_overlay)
-        QTimer.singleShot(500, self.video.raise_interaction_layer)
+            return False
+        return True
+
+    def stop_player(self) -> None:
+        if self.player is not None:
+            if self.player.stdin is not None:
+                try:
+                    self.player.stdin.close()
+                except OSError:
+                    pass
+            if self.player.poll() is None:
+                self.player.terminate()
+                try:
+                    self.player.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.player.kill()
+                    self.player.wait(timeout=3)
+            self.player = None
+        if self.mpv_directory is not None:
+            self.mpv_directory.cleanup()
+            self.mpv_directory = None
+            self.mpv_socket = None
 
     def on_stream_status(self, message: str) -> None:
         self.set_status(message)
@@ -1623,22 +1683,7 @@ class MainWindow(QMainWindow):
         self.show_overlay()
 
     def _mpv_command(self, command: list[object]) -> bool:
-        if self.mpv_socket is None:
-            return False
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(2)
-                connection.connect(str(self.mpv_socket))
-                connection.sendall(json.dumps({"command": command}).encode("utf-8") + b"\n")
-                response = bytearray()
-                while b"\n" not in response and len(response) < MAX_MPV_RESPONSE_BYTES:
-                    chunk = connection.recv(4096)
-                    if not chunk:
-                        break
-                    response.extend(chunk)
-            return json.loads(response.split(b"\n", 1)[0]).get("error") == "success"
-        except (OSError, ValueError, IndexError):
-            return False
+        return mpv_request(self.mpv_socket, command)[0]
 
     def _media_directory(self) -> Path:
         pictures = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)
@@ -1923,6 +1968,7 @@ class MainWindow(QMainWindow):
             self.set_status("Stopping camera...")
             self.stream_worker.stop()
         else:
+            self.stop_player()
             self.set_status("Camera stopped.")
 
     def on_stream_finished(self) -> None:
@@ -1930,21 +1976,8 @@ class MainWindow(QMainWindow):
         self.stream_live = False
         self.control_pending = False
         self.sound_enabled = False
-        if self.player is not None:
-            if self.player.stdin is not None:
-                self.player.stdin.close()
-            if self.player.poll() is None:
-                self.player.terminate()
-                try:
-                    self.player.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self.player.kill()
-                    self.player.wait(timeout=3)
-            self.player = None
-        if self.mpv_directory is not None:
-            self.mpv_directory.cleanup()
-            self.mpv_directory = None
-            self.mpv_socket = None
+        if not self.retry_pending or self.close_pending:
+            self.stop_player()
         self.reset_recording_state()
         self.zoom_level = 0
         self.disable_live_controls()

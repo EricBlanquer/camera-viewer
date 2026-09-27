@@ -8,6 +8,21 @@ from PyQt6.QtWidgets import QApplication
 from app import ACCOUNT_REJECTED_MESSAGE, MainWindow
 
 
+class FakePlayer:
+    def __init__(self) -> None:
+        self.stdin = None
+        self.terminated = False
+
+    def poll(self) -> int | None:
+        return 0 if self.terminated else None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def wait(self, timeout: float) -> int:
+        return 0
+
+
 class ReconnectTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -25,6 +40,17 @@ class ReconnectTest(unittest.TestCase):
         self.assertTrue(self.window.reconnect_timer.isActive())
         self.window.stop_stream()
         self.assertFalse(self.window.reconnect_timer.isActive())
+
+    def test_player_keeps_last_image_while_reconnecting(self) -> None:
+        player = FakePlayer()
+        self.window.player = player
+        self.window.on_stream_error("camera closed the native P2P session")
+        self.window.on_stream_finished()
+        self.assertIs(self.window.player, player)
+        self.assertFalse(player.terminated)
+        self.window.stop_stream()
+        self.assertIsNone(self.window.player)
+        self.assertTrue(player.terminated)
 
     def test_rejected_camera_credentials_do_not_retry(self) -> None:
         self.window.on_stream_error("The camera rejected the available credentials.")
