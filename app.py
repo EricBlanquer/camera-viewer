@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import logging
 import logging.handlers
@@ -57,11 +58,10 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
     QMainWindow,
     QMenu,
     QPushButton,
-    QSlider,
+    QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -135,6 +135,16 @@ VIDEO_STALL_SECONDS = 12
 AUDIO_RESPONSE_COMMAND = 0x6031
 RECONNECT_MAX_SECONDS = 30
 OVERLAY_TIMEOUT_MS = 5000
+ICAM365_LIGHT_PORT = 8001
+ICAM365_LIGHT_PATH = "/whitelight"
+ICAM365_LIGHT_ON = "on"
+ICAM365_LIGHT_AUTO = "2"
+RTSP_DENOISE_FILTER = "--vf=lavfi=[hqdn3d=4:3:6:4.5]"
+ICAM365_SERVER = "TAS-Tech IPCam"
+TOOLTIP_STYLE = (
+    "QToolTip { color: white; background-color: rgb(32, 32, 32);"
+    " border: 1px solid rgba(255, 255, 255, 60); border-radius: 6px; padding: 4px 8px; }"
+)
 MAX_ZOOM_LEVEL = 4
 X11_WHEEL_UP = 4
 X11_WHEEL_DOWN = 5
@@ -299,6 +309,12 @@ def set_button_icon(button: QPushButton, name: str, label: str, size: int = 44) 
     button.setFixedSize(size, size)
     button.setToolTip(label)
     button.setAccessibleName(label)
+
+
+def set_icam365_light_icon(button: QPushButton, mode: str | None) -> None:
+    enabled = mode == ICAM365_LIGHT_ON
+    set_button_icon(button, "light_on" if enabled else "light",
+                    "Use automatic white light" if enabled else "Turn white light on")
 
 
 class X11WindowHints:
@@ -593,6 +609,9 @@ def mpv_rtsp_command(socket_path: Path, window_id: int, fill: bool, camera: Rtsp
     command = mpv_stream_command(socket_path, window_id, fill)
     command.remove("--demuxer-lavf-format=h264")
     command.remove("--untimed")
+    command.remove("--no-audio")
+    command.insert(-1, "--mute=yes")
+    command.insert(-1, RTSP_DENOISE_FILTER)
     command[-1] = camera.url
     command.insert(-1, f"--rtsp-transport={camera.transport}")
     return command
@@ -631,7 +650,24 @@ class RtspCamera:
     uid: str
     name: str
     url: str
-    transport: str = "udp"
+    transport: str = "tcp"
+
+
+def icam365_light_request(camera: RtspCamera, mode: str | None = None) -> bool:
+    host = urllib.parse.urlsplit(camera.url).hostname
+    if host is None or mode is not None and mode not in (ICAM365_LIGHT_ON, ICAM365_LIGHT_AUTO):
+        return False
+    connection = http.client.HTTPConnection(host, ICAM365_LIGHT_PORT, timeout=3)
+    try:
+        path = ICAM365_LIGHT_PATH if mode is None else f"{ICAM365_LIGHT_PATH}?mode={mode}"
+        connection.request("HEAD" if mode is None else "GET", path)
+        response = connection.getresponse()
+        supported = response.status == 200 and response.getheader("Server") == ICAM365_SERVER
+        return supported and (mode is None or response.read() == b"OK")
+    except (OSError, http.client.HTTPException):
+        return False
+    finally:
+        connection.close()
 
 
 def valid_rtsp_url(url: str) -> bool:
@@ -649,7 +685,7 @@ def load_rtsp_cameras(settings: QSettings) -> list[RtspCamera]:
         if not isinstance(records, list):
             return []
         return [
-            RtspCamera(record["uid"], record["name"], record["url"], record.get("transport", "udp"))
+            RtspCamera(record["uid"], record["name"], record["url"], record.get("transport", "tcp"))
             for record in records
             if isinstance(record, dict)
             and isinstance(record.get("uid"), str)
@@ -658,7 +694,7 @@ def load_rtsp_cameras(settings: QSettings) -> list[RtspCamera]:
             and record["name"].strip()
             and isinstance(record.get("url"), str)
             and valid_rtsp_url(record["url"])
-            and record.get("transport", "udp") in ("udp", "tcp")
+            and record.get("transport", "tcp") in ("udp", "tcp")
         ]
     except (ValueError, TypeError):
         return []
@@ -690,6 +726,37 @@ def mpv_request(socket_path: Path | None, command: list[object]) -> tuple[bool, 
         return answer.get("error") == "success", answer.get("data")
     except (OSError, ValueError, IndexError, AttributeError):
         return False, None
+
+
+def zoomed_video_pan(
+    pan: tuple[float, float], old_level: int, new_level: int,
+    x: int, y: int, width: int, height: int,
+) -> tuple[float, float]:
+    old_scale = 2 ** (old_level / 2)
+    new_scale = 2 ** (new_level / 2)
+    offset_x = (x - width / 2) / max(1, width)
+    offset_y = (y - height / 2) / max(1, height)
+    return (
+        offset_x / new_scale - (offset_x / old_scale - pan[0]),
+        offset_y / new_scale - (offset_y / old_scale - pan[1]),
+    )
+
+
+def dragged_video_pan(
+    pan: tuple[float, float], level: int, dx: int, dy: int, width: int, height: int,
+) -> tuple[float, float]:
+    scale = 2 ** (level / 2)
+    return (pan[0] + dx / max(1, width * scale), pan[1] + dy / max(1, height * scale))
+
+
+def apply_mpv_video_pan(
+    command: Callable[[list[object]], bool], pan: tuple[float, float], level: int,
+) -> tuple[float, float]:
+    limit = (1 - 1 / 2 ** (level / 2)) / 2
+    clamped = tuple(min(limit, max(-limit, value)) for value in pan)
+    command(["set_property", "video-pan-x", clamped[0]])
+    command(["set_property", "video-pan-y", clamped[1]])
+    return clamped
 
 
 class VideoRecorder:
@@ -862,6 +929,37 @@ class ControlsOverlay(QWidget):
         radius = min(self.height() / 2, OVERLAY_MAX_RADIUS)
         painter.drawRoundedRect(self.rect(), radius, radius)
         painter.end()
+
+
+class VideoStatusOverlay(ControlsOverlay):
+    def __init__(self, video: VideoWidget) -> None:
+        super().__init__(video)
+        self.label = QLabel()
+        self.label.setStyleSheet("color: white; background: transparent; font-weight: 600;")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 8, 18, 8)
+        layout.addWidget(self.label)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.hide)
+        video.set_status_overlay(self)
+        self.hide()
+
+    def display(self, message: str) -> None:
+        if message.startswith("Playback "):
+            self.timer.stop()
+            self.hide()
+            return
+        self.label.setText(message)
+        self.label.setWordWrap(self.parentWidget().width() < 400)
+        self.adjustSize()
+        self.parentWidget().place_overlay()
+        self.show()
+        self.raise_()
+        if message.startswith("Loading") or message.startswith("Looking"):
+            self.timer.stop()
+        else:
+            self.timer.start(NOTICE_MS)
 
 
 class ReliableCS2Session(CS2Session):
@@ -1996,6 +2094,7 @@ class VideoWidget(QWidget):
         self.click_timer.timeout.connect(self.clicked.emit)
         self.controls_overlay: QWidget | None = None
         self.recording_badge: QWidget | None = None
+        self.status_overlay: QWidget | None = None
         self.x_display = xdisplay.Display() if QApplication.platformName() == "xcb" else None
         self.input_window = None
         self.input_timer = QTimer(self)
@@ -2005,6 +2104,9 @@ class VideoWidget(QWidget):
 
     def set_recording_badge(self, badge: QWidget) -> None:
         self.recording_badge = badge
+
+    def set_status_overlay(self, overlay: QWidget) -> None:
+        self.status_overlay = overlay
 
     def set_controls_overlay(self, overlay: QWidget) -> None:
         self.controls_overlay = overlay
@@ -2030,13 +2132,22 @@ class VideoWidget(QWidget):
     def raise_interaction_layer(self) -> None:
         if self.input_window is not None:
             self.input_window.configure(stack_mode=X11.Above)
-        for overlay in (self.controls_overlay, self.recording_badge):
+        for overlay in (self.controls_overlay, self.recording_badge, self.status_overlay):
             if overlay is not None and overlay.isVisible():
                 overlay.raise_()
         if self.x_display is not None:
             self.x_display.flush()
 
     def place_overlay(self) -> None:
+        if self.status_overlay is not None:
+            self.status_overlay.setMaximumWidth(max(1, self.width() - 2 * OVERLAY_MARGIN))
+            status_size = self.status_overlay.sizeHint()
+            self.status_overlay.setGeometry(
+                QRect(
+                    self.mapToGlobal(QPoint((self.width() - status_size.width()) // 2, OVERLAY_MARGIN)),
+                    status_size,
+                )
+            )
         if self.recording_badge is not None:
             badge_size = self.recording_badge.sizeHint()
             self.recording_badge.setGeometry(
@@ -2353,6 +2464,65 @@ class TimelineWidget(QWidget):
         self.zoom(-1 if event.angleDelta().y() > 0 else 1)
 
 
+class ReplayControls(QWidget):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("replayBar")
+        controls = QHBoxLayout(self)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(12)
+        self.live_button = QPushButton(LIVE_BUTTON_LABEL)
+        self.live_button.setObjectName("pillButton")
+        self.live_button.setFixedSize(64, 44)
+        self.live_button.setToolTip("Back to live video")
+        self.live_button.setAccessibleName("Back to live video")
+        self.previous_button = QPushButton()
+        self.play_button = QPushButton()
+        self.next_button = QPushButton()
+        self.sound_button = QPushButton()
+        self.speed_button = QPushButton(REPLAY_SPEED_LABEL.format(speed=REPLAY_SPEEDS[0]))
+        self.speed_button.setObjectName("pillButton")
+        self.speed_button.setFixedSize(56, 44)
+        self.speed_button.setToolTip("Playback speed")
+        self.speed_button.setAccessibleName("Playback speed")
+        self.snapshot_button = QPushButton()
+        self.save_button = QPushButton()
+        self.zoom_out_button = QPushButton()
+        self.zoom_in_button = QPushButton()
+        self.fullscreen_button = QPushButton()
+        for button, icon_name, label in (
+            (self.previous_button, "previous_detection", "Previous recording"),
+            (self.play_button, "pause", "Pause"),
+            (self.next_button, "next_detection", "Next recording"),
+            (self.sound_button, "sound_on", "Mute playback"),
+            (self.snapshot_button, "photo", "Save picture"),
+            (self.save_button, "download", "Save this recording"),
+            (self.zoom_out_button, "zoom_out", "Show a longer period"),
+            (self.zoom_in_button, "zoom_in", "Show a shorter period"),
+            (self.fullscreen_button, "fullscreen", "Full screen"),
+        ):
+            set_button_icon(button, icon_name, label)
+        controls.addStretch(1)
+        for button in (
+            self.live_button,
+            self.previous_button,
+            self.play_button,
+            self.next_button,
+            self.sound_button,
+            self.speed_button,
+            self.snapshot_button,
+            self.save_button,
+            self.zoom_out_button,
+            self.zoom_in_button,
+            self.fullscreen_button,
+        ):
+            controls.addWidget(button)
+        controls.addStretch(1)
+        self.timeline = TimelineWidget()
+        self.zoom_out_button.clicked.connect(lambda: self.timeline.zoom(1))
+        self.zoom_in_button.clicked.connect(lambda: self.timeline.zoom(-1))
+
+
 class ReplayController(QObject):
     status_changed = pyqtSignal(str)
     position_changed = pyqtSignal(float)
@@ -2643,6 +2813,10 @@ class RtspStreamWorker(QThread):
     recording_saved = pyqtSignal(str)
     recording_failed = pyqtSignal(str)
     continuous_failed = pyqtSignal(str)
+    audio_available = pyqtSignal()
+    light_available = pyqtSignal()
+    light_changed = pyqtSignal(str)
+    light_failed = pyqtSignal()
 
     def __init__(self, camera: RtspCamera, player: subprocess.Popen[bytes], socket_path: Path) -> None:
         super().__init__()
@@ -2656,6 +2830,8 @@ class RtspStreamWorker(QThread):
         self.recording_path: Path | None = None
         self.recording_announced = False
         self.continuous: subprocess.Popen[bytes] | None = None
+        self.light_lock = threading.Lock()
+        self.light_request: str | None = None
 
     def set_continuous(self, enabled: bool) -> None:
         if enabled:
@@ -2666,13 +2842,17 @@ class RtspStreamWorker(QThread):
     def set_recording(self, path: Path | None) -> None:
         self.recording_request = path
 
+    def set_light(self, mode: str) -> None:
+        with self.light_lock:
+            self.light_request = mode
+
     def stop(self) -> None:
         self.stop_requested.set()
 
     def _ffmpeg(self, output: Path, segmented: bool) -> subprocess.Popen[bytes]:
         command = [
             "ffmpeg", "-nostats", "-loglevel", "error", "-rtsp_transport", self.camera.transport,
-            "-i", self.camera.url, "-map", "0:v:0", "-an", "-c:v", "copy",
+            "-i", self.camera.url, "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
         ]
         if segmented:
             command += [
@@ -2726,12 +2906,28 @@ class RtspStreamWorker(QThread):
             if self.stop_requested.is_set():
                 return
             self.status_changed.emit("Live video")
+            tracks_ready, tracks = mpv_request(self.socket_path, ["get_property", "track-list"])
+            if tracks_ready and isinstance(tracks, list) and any(
+                isinstance(track, dict) and track.get("type") == "audio" for track in tracks
+            ):
+                self.audio_available.emit()
+            light_supported = icam365_light_request(self.camera)
+            if light_supported:
+                self.light_available.emit()
             last_prune = 0.0
             last_position = None
             last_progress_at = time.monotonic()
             while not self.stop_requested.is_set():
                 if self.player.poll() is not None:
                     raise OSError("The RTSP video player stopped.")
+                with self.light_lock:
+                    light_mode = self.light_request
+                    self.light_request = None
+                if light_mode is not None:
+                    if light_supported and icam365_light_request(self.camera, light_mode):
+                        self.light_changed.emit(light_mode)
+                    else:
+                        self.light_failed.emit()
                 position_ready, position = mpv_request(self.socket_path, ["get_property", "time-pos"])
                 if position_ready and isinstance(position, (int, float)) and position != last_position:
                     last_position = position
@@ -2792,6 +2988,7 @@ class CameraPreview(QWidget):
     stopped = pyqtSignal()
     replay_requested = pyqtSignal(object)
     camera_replay_requested = pyqtSignal(object)
+    fullscreen_requested = pyqtSignal()
 
     def __init__(
         self, camera: AccountDevice | RtspCamera, continuous_enabled: bool = False,
@@ -2812,6 +3009,7 @@ class CameraPreview(QWidget):
         self.live = False
         self.recording_path: Path | None = None
         self.zoom_level = 0
+        self.video_pan = (0.0, 0.0)
         self.sound_enabled = False
         self.control_pending = False
         self.setting_pending = False
@@ -2819,6 +3017,9 @@ class CameraPreview(QWidget):
         self.retry_timer = QTimer(self)
         self.retry_timer.setSingleShot(True)
         self.retry_timer.timeout.connect(self.start)
+        self.overlay_timer = QTimer(self)
+        self.overlay_timer.setSingleShot(True)
+        self.overlay_timer.timeout.connect(self.hide_overlay)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -2830,8 +3031,32 @@ class CameraPreview(QWidget):
         header_layout.setSpacing(0)
         self.label = CameraTitle(camera.uid, camera.name)
         header_layout.addWidget(self.label, 1)
+        layout.addWidget(header)
+        self.video = VideoWidget()
+        self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+        self.video.setStyleSheet("background-color: #171717;")
+        self.video.clicked.connect(self.toggle_overlay)
+        self.video.double_clicked.connect(lambda x, y: self.fullscreen_requested.emit())
+        self.video.wheel_zoomed.connect(self.change_zoom)
+        self.video.drag_moved.connect(self.pan_zoomed_video)
+        self.frame = AspectVideoFrame(self.video)
+        self.video_stack = QStackedWidget()
+        self.video_stack.addWidget(self.frame)
+        layout.addWidget(self.video_stack, 1)
+        self.overlay = ControlsOverlay(self.video)
+        self.overlay.setObjectName("cameraControls")
+        self.overlay.setStyleSheet(
+            "#cameraControls QPushButton { color: white; background-color: transparent;"
+            " border: none; border-radius: 6px; padding: 4px; }"
+            "#cameraControls QPushButton:hover { background-color: rgba(255, 255, 255, 35); }"
+            + TOOLTIP_STYLE
+        )
+        controls = QHBoxLayout(self.overlay)
+        controls.setContentsMargins(24, 10, 24, 10)
+        controls.setSpacing(12)
+        controls.addStretch(1)
         self.replay_button = QPushButton()
-        set_button_icon(self.replay_button, "replay", "Play back recordings", 30)
+        set_button_icon(self.replay_button, "replay", "Play back recordings")
         if isinstance(camera, RtspCamera):
             self.replay_button.clicked.connect(lambda: self.replay_requested.emit(self.camera))
         else:
@@ -2843,8 +3068,7 @@ class CameraPreview(QWidget):
                 lambda: self.replay_requested.emit(self.camera)
             )
             self.replay_button.setMenu(replay_menu)
-        self.replay_button.setStyleSheet("background: transparent; border: none;")
-        header_layout.addWidget(self.replay_button)
+        controls.addWidget(self.replay_button)
         self.snapshot_button = QPushButton()
         self.record_button = QPushButton()
         self.zoom_out_button = QPushButton()
@@ -2852,28 +3076,39 @@ class CameraPreview(QWidget):
         for button, icon_name, label, handler in (
             (self.snapshot_button, "photo", "Save picture", self.take_snapshot),
             (self.record_button, "record", "Record video", self.toggle_recording),
+        ):
+            set_button_icon(button, icon_name, label)
+            button.setEnabled(False)
+            button.clicked.connect(handler)
+            controls.addWidget(button)
+        self.sound_button = QPushButton()
+        set_button_icon(self.sound_button, "sound", "Listen to camera")
+        self.sound_button.setEnabled(False)
+        self.sound_button.clicked.connect(self.toggle_sound)
+        self.sound_button.setVisible(not isinstance(camera, RtspCamera))
+        controls.addWidget(self.sound_button)
+        self.ptz_button: QPushButton | None = None
+        self.rtsp_light_button: QPushButton | None = None
+        self.rtsp_light_mode: str | None = None
+        self.light_action: QAction | None = None
+        self.quality_actions: dict[str, QAction] = {}
+        if isinstance(camera, RtspCamera):
+            self.rtsp_light_button = QPushButton()
+            set_icam365_light_icon(self.rtsp_light_button, None)
+            self.rtsp_light_button.clicked.connect(self.toggle_rtsp_light)
+            self.rtsp_light_button.hide()
+            controls.addWidget(self.rtsp_light_button)
+        for button, icon_name, label, handler in (
             (self.zoom_out_button, "zoom_out", "Zoom out", lambda: self.change_zoom(-1)),
             (self.zoom_in_button, "zoom_in", "Zoom in", lambda: self.change_zoom(1)),
         ):
-            set_button_icon(button, icon_name, label, 30)
-            button.setStyleSheet("background: transparent; border: none;")
+            set_button_icon(button, icon_name, label)
             button.setEnabled(False)
             button.clicked.connect(handler)
-            header_layout.addWidget(button)
-        self.sound_button: QPushButton | None = None
-        self.ptz_button: QPushButton | None = None
-        self.light_action: QAction | None = None
-        self.quality_actions: dict[str, QAction] = {}
+            controls.addWidget(button)
         if not isinstance(camera, RtspCamera):
-            self.sound_button = QPushButton()
-            set_button_icon(self.sound_button, "sound", "Listen to camera", 30)
-            self.sound_button.setStyleSheet("background: transparent; border: none;")
-            self.sound_button.setEnabled(False)
-            self.sound_button.clicked.connect(self.toggle_sound)
-            header_layout.addWidget(self.sound_button)
             self.ptz_button = QPushButton()
-            set_button_icon(self.ptz_button, "ptz", "Pan and tilt controls", 30)
-            self.ptz_button.setStyleSheet("background: transparent; border: none;")
+            set_button_icon(self.ptz_button, "ptz", "Pan and tilt controls")
             self.ptz_button.setEnabled(False)
             movement = QMenu(self.ptz_button)
             for direction in ("Up", "Down", "Left", "Right"):
@@ -2901,17 +3136,45 @@ class CameraPreview(QWidget):
                 self.quality_actions[quality] = action
             self.quality_menu = quality_menu
             self.ptz_button.setMenu(movement)
-            header_layout.addWidget(self.ptz_button)
-        layout.addWidget(header)
-        self.video = QWidget()
-        self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
-        self.video.setStyleSheet("background-color: #171717;")
-        self.frame = AspectVideoFrame(self.video)
-        layout.addWidget(self.frame, 1)
+            controls.addWidget(self.ptz_button)
+        self.fullscreen_button = QPushButton()
+        set_button_icon(self.fullscreen_button, "fullscreen", "Full screen")
+        self.fullscreen_button.clicked.connect(self.fullscreen_requested.emit)
+        controls.addWidget(self.fullscreen_button)
+        controls.addStretch(1)
+        self.video.set_controls_overlay(self.overlay)
+        for button in self.overlay.findChildren(QPushButton):
+            button.clicked.connect(self.show_overlay)
+        self.overlay.hide()
+
+    def show_overlay(self) -> None:
+        if not self.isVisible():
+            return
+        self.video.place_overlay()
+        self.overlay.show()
+        self.video.raise_interaction_layer()
+        self.overlay_timer.start(OVERLAY_TIMEOUT_MS)
+
+    def hide_overlay(self) -> None:
+        self.overlay.hide()
+
+    def toggle_overlay(self) -> None:
+        if self.overlay.isVisible():
+            self.overlay_timer.stop()
+            self.hide_overlay()
+        else:
+            self.show_overlay()
 
     def start(self) -> None:
         if self.closing or self.worker is not None:
             return
+        if isinstance(self.camera, RtspCamera):
+            self.sound_button.hide()
+            set_button_icon(self.sound_button, "sound", "Listen to camera")
+        if self.rtsp_light_button is not None:
+            self.rtsp_light_button.hide()
+            self.rtsp_light_mode = None
+            set_icam365_light_icon(self.rtsp_light_button, None)
         self.label.setText(f"{self.camera.name} · Connecting...")
         try:
             self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-mpv-")
@@ -2956,6 +3219,10 @@ class CameraPreview(QWidget):
         self.worker.recording_failed.connect(self._on_recording_failed)
         if isinstance(self.worker, RtspStreamWorker):
             self.worker.continuous_failed.connect(self._on_continuous_failed)
+            self.worker.audio_available.connect(self._on_rtsp_audio_available)
+            self.worker.light_available.connect(self._on_rtsp_light_available)
+            self.worker.light_changed.connect(self._on_rtsp_light_changed)
+            self.worker.light_failed.connect(self._on_rtsp_light_failed)
         if isinstance(self.worker, StreamWorker):
             self.worker.sound_changed.connect(self._on_sound_changed)
             self.worker.sound_failed.connect(self._on_sound_failed)
@@ -2974,7 +3241,7 @@ class CameraPreview(QWidget):
             self.snapshot_button.setEnabled(True)
             self.record_button.setEnabled(True)
             self.zoom_in_button.setEnabled(True)
-            if self.sound_button is not None:
+            if self.sound_button is not None and not isinstance(self.worker, RtspStreamWorker):
                 self.sound_button.setEnabled(True)
             if self.ptz_button is not None:
                 self.ptz_button.setEnabled(True)
@@ -2990,10 +3257,11 @@ class CameraPreview(QWidget):
         self.live = False
         self.recording_path = None
         self.zoom_level = 0
+        self.video_pan = (0.0, 0.0)
         self.sound_enabled = False
         self.control_pending = False
         for button in (self.snapshot_button, self.record_button, self.zoom_out_button, self.zoom_in_button,
-                       self.sound_button, self.ptz_button):
+                       self.sound_button, self.ptz_button, self.rtsp_light_button):
             if button is not None:
                 button.setEnabled(False)
         set_button_icon(self.record_button, "record", "Record video", 30)
@@ -3049,25 +3317,79 @@ class CameraPreview(QWidget):
     def _on_continuous_failed(self, message: str) -> None:
         self.label.setText(f"{self.camera.name} · {message}")
 
+    def _on_rtsp_light_available(self) -> None:
+        if self.rtsp_light_button is not None and self.live:
+            self.rtsp_light_button.setEnabled(True)
+            self.rtsp_light_button.show()
+            self.video.place_overlay()
+
+    def set_rtsp_light(self, mode: str) -> None:
+        if isinstance(self.worker, RtspStreamWorker) and self.live:
+            if self.rtsp_light_button is not None:
+                self.rtsp_light_button.setEnabled(False)
+            self.worker.set_light(mode)
+
+    def toggle_rtsp_light(self) -> None:
+        self.set_rtsp_light(ICAM365_LIGHT_AUTO if self.rtsp_light_mode == ICAM365_LIGHT_ON else ICAM365_LIGHT_ON)
+
+    def _on_rtsp_light_changed(self, mode: str) -> None:
+        self.rtsp_light_mode = mode
+        if self.rtsp_light_button is not None:
+            set_icam365_light_icon(self.rtsp_light_button, mode)
+            self.rtsp_light_button.setEnabled(self.live)
+
+    def _on_rtsp_light_failed(self) -> None:
+        if self.rtsp_light_button is not None:
+            self.rtsp_light_button.setEnabled(self.live)
+        self.label.setText(f"{self.camera.name} · Unable to change white light mode")
+
     def set_continuous(self, enabled: bool) -> None:
         self.continuous_enabled = enabled
         if self.worker is not None:
             self.worker.set_continuous(enabled)
 
-    def change_zoom(self, step: int) -> None:
+    def change_zoom(self, step: int, x: int | None = None, y: int | None = None) -> None:
         if not self.live:
             return
         level = min(MAX_ZOOM_LEVEL, max(0, self.zoom_level + step))
         if level == self.zoom_level or not self._mpv_command(["set_property", "video-zoom", level / 2]):
             return
+        if x is not None and y is not None:
+            self.video_pan = zoomed_video_pan(
+                self.video_pan, self.zoom_level, level, x, y, self.video.width(), self.video.height()
+            )
         self.zoom_level = level
+        self.apply_video_pan()
         self.zoom_out_button.setEnabled(level > 0)
         self.zoom_in_button.setEnabled(level < MAX_ZOOM_LEVEL)
 
+    def pan_zoomed_video(self, dx: int, dy: int) -> None:
+        if not self.live or self.zoom_level == 0:
+            return
+        self.video_pan = dragged_video_pan(
+            self.video_pan, self.zoom_level, dx, dy, self.video.width(), self.video.height()
+        )
+        self.apply_video_pan()
+
+    def apply_video_pan(self) -> None:
+        self.video_pan = apply_mpv_video_pan(self._mpv_command, self.video_pan, self.zoom_level)
+
     def toggle_sound(self) -> None:
+        if isinstance(self.worker, RtspStreamWorker):
+            if self._mpv_command(["set_property", "mute", self.sound_enabled]):
+                self._on_sound_changed(not self.sound_enabled)
+            else:
+                self._on_sound_failed("Unable to change camera sound")
+            return
         if isinstance(self.worker, StreamWorker) and self.sound_button is not None:
             self.sound_button.setEnabled(False)
             self.worker.set_sound(not self.sound_enabled)
+
+    def _on_rtsp_audio_available(self) -> None:
+        if self.live and isinstance(self.worker, RtspStreamWorker):
+            self.sound_button.setEnabled(True)
+            self.sound_button.show()
+            self.video.place_overlay()
 
     def _on_sound_changed(self, enabled: bool) -> None:
         self.sound_enabled = enabled
@@ -3172,12 +3494,17 @@ class CameraPreview(QWidget):
             self.mpv_directory = None
 
     def set_display(self, enabled: bool) -> None:
+        if not enabled:
+            self.overlay_timer.stop()
+            self.hide_overlay()
         if isinstance(self.worker, StreamWorker):
             self.worker.set_display(enabled)
 
     def stop(self) -> None:
         self.closing = True
         self.retry_timer.stop()
+        self.overlay_timer.stop()
+        self.hide_overlay()
         if self.worker is not None:
             self.worker.stop()
         else:
@@ -3185,7 +3512,10 @@ class CameraPreview(QWidget):
             self.stopped.emit()
 
 
-class LocalReplayDialog(QDialog):
+class LocalReplayPane(QWidget):
+    live_requested = pyqtSignal()
+    fullscreen_requested = pyqtSignal()
+
     def __init__(
         self, camera: AccountDevice | RtspCamera, parent: QWidget,
         worker: StreamWorker | RtspStreamWorker | None = None,
@@ -3193,80 +3523,112 @@ class LocalReplayDialog(QDialog):
         super().__init__(parent)
         self.camera = camera
         self.worker = worker
-        self.setWindowTitle(f"{camera.name} · Local recordings")
-        self.setStyleSheet(
-            "QDialog { background-color: #171717; color: white; }"
-            "QListWidget { background-color: #242424; color: white; border: none; }"
-            "QPushButton { background-color: #303030; color: white; border: none; padding: 6px; }"
-            "QLabel { color: white; }"
-        )
-        self.resize(960, 720)
+        self.live_title = ""
+        self.playback_title = f"{camera.name} · Playback"
         self.player: subprocess.Popen[bytes] | None = None
         self.mpv_directory: tempfile.TemporaryDirectory[str] | None = None
         self.socket_path: Path | None = None
+        self.recordings: list[Path] = []
+        self.current_path: Path | None = None
+        self.segment_durations: dict[Path, int] = {}
+        self.pending_seek: float | None = None
+        self.rewind_after_load = False
         self.zoom_level = 0
         self.speed_index = 0
         layout = QVBoxLayout(self)
-        self.video = QWidget()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.video = VideoWidget()
         self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.video.setStyleSheet("background-color: #171717;")
+        self.video.clicked.connect(self.toggle_overlay)
+        self.video.double_clicked.connect(lambda x, y: self.fullscreen_requested.emit())
+        self.video.wheel_zoomed.connect(lambda step, x, y: self.change_zoom(step))
         self.frame = AspectVideoFrame(self.video)
         layout.addWidget(self.frame, 1)
-        controls = QHBoxLayout()
-        self.play_button = QPushButton("Pause")
-        self.play_button.clicked.connect(self.toggle_playing)
-        controls.addWidget(self.play_button)
-        self.speed_button = QPushButton("1×")
-        self.speed_button.clicked.connect(self.change_speed)
-        controls.addWidget(self.speed_button)
-        self.position = QSlider(Qt.Orientation.Horizontal)
-        self.position.setRange(0, 0)
-        self.position.sliderReleased.connect(self.seek)
-        controls.addWidget(self.position, 1)
-        self.time_label = QLabel("00:00 / 00:00")
-        controls.addWidget(self.time_label)
-        self.zoom_out_button = QPushButton("−")
-        self.zoom_out_button.clicked.connect(lambda: self.change_zoom(-1))
-        controls.addWidget(self.zoom_out_button)
-        self.zoom_in_button = QPushButton("+")
-        self.zoom_in_button.clicked.connect(lambda: self.change_zoom(1))
-        controls.addWidget(self.zoom_in_button)
-        self.photo_button = QPushButton("Photo")
-        self.photo_button.clicked.connect(self.take_snapshot)
-        controls.addWidget(self.photo_button)
-        fullscreen = QPushButton("Full screen")
-        fullscreen.clicked.connect(self.toggle_fullscreen)
-        controls.addWidget(fullscreen)
-        layout.addLayout(controls)
-        self.recordings = QListWidget()
-        self.recordings.setAccessibleName("Local recordings from the last 24 hours")
-        self.recordings.currentRowChanged.connect(self.play_selected)
-        layout.addWidget(self.recordings)
-        refresh = QPushButton("Refresh recordings")
-        refresh.clicked.connect(self.refresh_recordings)
-        layout.addWidget(refresh)
+        self.overlay = ControlsOverlay(self.video)
+        self.overlay.setObjectName("cameraControls")
+        self.overlay.setStyleSheet(
+            "#cameraControls QPushButton { color: white; background-color: transparent;"
+            " border: none; border-radius: 6px; padding: 4px; }"
+            "#cameraControls QPushButton:hover { background-color: rgba(255, 255, 255, 35); }"
+            "#cameraControls #pillButton { border: 2px solid white; border-radius: 8px;"
+            " font-weight: 600; margin: 6px 2px; }"
+            "#cameraControls QPushButton:disabled { color: rgba(255, 255, 255, 90); }"
+            + TOOLTIP_STYLE
+        )
+        controls_layout = QVBoxLayout(self.overlay)
+        controls_layout.setContentsMargins(24, 10, 24, 10)
+        self.controls = ReplayControls(self.overlay)
+        self.timeline = self.controls.timeline
+        controls_layout.addWidget(self.controls)
+        controls_layout.addWidget(self.timeline)
+        self.controls.live_button.clicked.connect(self.live_requested.emit)
+        self.controls.previous_button.clicked.connect(lambda: self.select_relative(-1))
+        self.controls.play_button.clicked.connect(self.toggle_playing)
+        self.controls.next_button.clicked.connect(lambda: self.select_relative(1))
+        self.controls.sound_button.clicked.connect(self.toggle_sound)
+        self.controls.speed_button.clicked.connect(self.change_speed)
+        self.controls.snapshot_button.clicked.connect(self.take_snapshot)
+        self.controls.save_button.clicked.connect(self.save_clip)
+        self.controls.fullscreen_button.clicked.connect(self.fullscreen_requested.emit)
+        self.timeline.seek_requested.connect(self.seek_time)
+        self.controls.save_button.setEnabled(False)
+        self.video.set_controls_overlay(self.overlay)
+        self.overlay.hide()
+        self.overlay_timer = QTimer(self)
+        self.overlay_timer.setSingleShot(True)
+        self.overlay_timer.timeout.connect(self.overlay.hide)
+        for button in self.controls.findChildren(QPushButton):
+            button.clicked.connect(self.show_overlay)
+        self.status_overlay = VideoStatusOverlay(self.video)
         self.progress_timer = QTimer(self)
         self.progress_timer.timeout.connect(self.update_progress)
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh_recordings)
+        self.refresh_timer.start(60_000)
         QTimer.singleShot(0, self.refresh_recordings)
 
-    def refresh_recordings(self) -> None:
-        current = self.recordings.currentItem()
-        selected = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
-        self.recordings.blockSignals(True)
-        self.recordings.clear()
-        for path in camera_recordings(self.camera, self.active_recordings()):
-            started = segment_time(path)
-            self.recordings.addItem(started.strftime("%d/%m/%Y %H:%M:%S") if started is not None else path.name)
-            self.recordings.item(self.recordings.count() - 1).setData(Qt.ItemDataRole.UserRole, str(path))
-        self.recordings.blockSignals(False)
-        if self.recordings.count():
-            row = next((index for index in range(self.recordings.count())
-                        if self.recordings.item(index).data(Qt.ItemDataRole.UserRole) == selected),
-                       self.recordings.count() - 1)
-            self.recordings.setCurrentRow(row)
+    def show_overlay(self) -> None:
+        if not self.isVisible():
+            return
+        self.video.place_overlay()
+        self.overlay.show()
+        self.video.raise_interaction_layer()
+        self.overlay_timer.start(OVERLAY_TIMEOUT_MS)
+
+    def toggle_overlay(self) -> None:
+        if self.overlay.isVisible():
+            self.overlay_timer.stop()
+            self.overlay.hide()
         else:
+            self.show_overlay()
+
+    def refresh_recordings(self) -> None:
+        try:
+            self.recordings = camera_recordings(self.camera, self.active_recordings())
+        except OSError:
+            self.status_overlay.display("Unable to read local recordings")
+            return
+        timeline_recordings = []
+        for path in self.recordings:
+            started = segment_time(path)
+            if started is not None:
+                timeline_recordings.append(CardRecording(
+                    path.name, started, self.segment_durations.get(path, CONTINUOUS_SEGMENT_SECONDS), 0,
+                ))
+        self.timeline.set_recordings(timeline_recordings)
+        if not self.recordings:
             self.stop_player()
-            self.time_label.setText("No local recordings from the last 24 hours")
+            self.status_overlay.display("No local recordings from the last 24 hours")
+        elif self.current_path not in self.recordings:
+            self.play_selected(len(self.recordings) - 1, rewind=True)
+
+    def select_relative(self, step: int) -> None:
+        if self.current_path not in self.recordings:
+            return
+        row = self.recordings.index(self.current_path) + step
+        if 0 <= row < len(self.recordings):
+            self.play_selected(row)
 
     def active_recordings(self) -> set[Path]:
         if not isinstance(self.worker, RtspStreamWorker):
@@ -3287,58 +3649,104 @@ class LocalReplayDialog(QDialog):
             return set()
         return active
 
-    def play_selected(self, row: int) -> None:
-        item = self.recordings.item(row)
-        if item is None:
+    def play_selected(self, row: int, offset: float = 0, rewind: bool = False) -> None:
+        if not 0 <= row < len(self.recordings):
             return
-        path = Path(item.data(Qt.ItemDataRole.UserRole))
+        path = self.recordings[row]
         self.stop_player()
+        self.current_path = path
+        self.pending_seek = offset
+        self.rewind_after_load = rewind
+        started = segment_time(path)
+        if started is not None:
+            self.timeline.set_center(started + timedelta(seconds=offset))
+        self.status_overlay.display("Loading recording...")
         try:
             self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-replay-")
             self.socket_path = Path(self.mpv_directory.name) / "control.sock"
+            command = [
+                "mpv", "--no-config", "--no-terminal", "--really-quiet", "--vo=x11", "--osc=no",
+                "--input-default-bindings=no", "--input-cursor=no", "--force-window=yes", "--keep-open=yes",
+                f"--input-ipc-server={self.socket_path}", f"--wid={int(self.video.winId())}",
+            ]
+            if isinstance(self.camera, RtspCamera):
+                command.append(RTSP_DENOISE_FILTER)
             self.player = subprocess.Popen(
-                ["mpv", "--no-config", "--no-terminal", "--really-quiet", "--vo=x11", "--osc=no",
-                 "--input-default-bindings=no", "--input-cursor=no", "--force-window=yes", "--keep-open=yes",
-                 f"--input-ipc-server={self.socket_path}", f"--wid={int(self.video.winId())}", str(path)],
+                command + [str(path)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except OSError:
-            self.time_label.setText("Unable to open the recording")
+            self.status_overlay.display("Unable to open the recording")
             self.stop_player()
             return
         self.zoom_level = 0
         self.speed_index = 0
-        self.speed_button.setText("1×")
-        self.position.setRange(0, 0)
-        self.play_button.setText("Pause")
+        self.controls.speed_button.setText(REPLAY_SPEED_LABEL.format(speed=REPLAY_SPEEDS[0]))
+        set_button_icon(self.controls.play_button, "pause", "Pause")
+        self.controls.save_button.setEnabled(True)
         self.progress_timer.start(500)
+
+    def seek_time(self, moment: datetime) -> None:
+        for row, path in enumerate(self.recordings):
+            started = segment_time(path)
+            if started is None:
+                continue
+            end = started + timedelta(seconds=self.segment_durations.get(path, CONTINUOUS_SEGMENT_SECONDS))
+            if moment < end:
+                offset = max(0.0, (moment - started).total_seconds())
+                if path == self.current_path and mpv_request(self.socket_path, ["seek", offset, "absolute"])[0]:
+                    self.timeline.set_center(started + timedelta(seconds=offset))
+                else:
+                    self.play_selected(row, offset)
+                return
+        self.status_overlay.display("No recording at this time")
 
     def update_progress(self) -> None:
         if self.player is None or self.player.poll() is not None:
             self.progress_timer.stop()
-            self.time_label.setText("Playback stopped")
+            self.status_overlay.display("Playback stopped")
             return
         position_ready, current = mpv_request(self.socket_path, ["get_property", "time-pos"])
         duration_ready, duration = mpv_request(self.socket_path, ["get_property", "duration"])
         if not position_ready or not duration_ready or not isinstance(current, (int, float)) or not isinstance(duration, (int, float)):
             return
-        if not self.position.isSliderDown():
-            self.position.setRange(0, max(0, round(duration)))
-            self.position.setValue(round(current))
-        self.time_label.setText(
-            f"{int(current) // 60:02d}:{int(current) % 60:02d} / {int(duration) // 60:02d}:{int(duration) % 60:02d}"
-        )
+        if self.rewind_after_load:
+            self.pending_seek = max(0.0, duration - REPLAY_DEFAULT_REWIND_SECONDS)
+            self.rewind_after_load = False
+        if self.pending_seek is not None:
+            offset = min(self.pending_seek, max(0.0, duration))
+            self.pending_seek = None
+            if offset > 0:
+                mpv_request(self.socket_path, ["seek", offset, "absolute"])
+                return
+        path = self.current_path
+        if path is not None:
+            rounded_duration = max(1, round(duration))
+            if self.segment_durations.get(path) != rounded_duration:
+                self.segment_durations[path] = rounded_duration
+                self.refresh_recordings()
+                if self.current_path != path:
+                    return
+            started = segment_time(path)
+            if started is not None:
+                self.timeline.set_center(started + timedelta(seconds=current))
+        self.status_overlay.hide()
         ended, eof = mpv_request(self.socket_path, ["get_property", "eof-reached"])
-        if ended and eof is True and self.recordings.currentRow() + 1 < self.recordings.count():
-            self.recordings.setCurrentRow(self.recordings.currentRow() + 1)
-
-    def seek(self) -> None:
-        mpv_request(self.socket_path, ["seek", self.position.value(), "absolute"])
+        if ended and eof is True:
+            self.select_relative(1)
+            if path == self.current_path:
+                set_button_icon(self.controls.play_button, "play", "Play")
 
     def toggle_playing(self) -> None:
         ready, paused = mpv_request(self.socket_path, ["get_property", "pause"])
         if ready and mpv_request(self.socket_path, ["set_property", "pause", not paused])[0]:
-            self.play_button.setText("Play" if not paused else "Pause")
+            set_button_icon(self.controls.play_button, "play" if not paused else "pause", "Play" if not paused else "Pause")
+
+    def toggle_sound(self) -> None:
+        ready, muted = mpv_request(self.socket_path, ["get_property", "mute"])
+        if ready and mpv_request(self.socket_path, ["set_property", "mute", not muted])[0]:
+            set_button_icon(self.controls.sound_button, "sound" if not muted else "sound_on",
+                            "Listen to playback" if not muted else "Mute playback")
 
     def change_zoom(self, step: int) -> None:
         level = min(MAX_ZOOM_LEVEL, max(0, self.zoom_level + step))
@@ -3350,22 +3758,27 @@ class LocalReplayDialog(QDialog):
         speed = REPLAY_SPEEDS[index]
         if mpv_request(self.socket_path, ["set_property", "speed", speed])[0]:
             self.speed_index = index
-            self.speed_button.setText(f"{speed}×")
-
-    def toggle_fullscreen(self) -> None:
-        if self.isFullScreen():
-            self.showNormal()
-        else:
-            self.showFullScreen()
+            self.controls.speed_button.setText(REPLAY_SPEED_LABEL.format(speed=speed))
 
     def take_snapshot(self) -> None:
         try:
             path = media_directory() / f"{safe_camera_name(self.camera.name)}_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
         except OSError:
-            self.time_label.setText("Unable to create the picture folder")
+            self.status_overlay.display("Unable to create the picture folder")
             return
         if not mpv_request(self.socket_path, ["screenshot-to-file", str(path), "video"])[0]:
-            self.time_label.setText("Unable to save a picture")
+            self.status_overlay.display("Unable to save a picture")
+
+    def save_clip(self) -> None:
+        if self.current_path is None:
+            return
+        try:
+            target = media_directory() / self.current_path.name
+            shutil.copyfile(self.current_path, target)
+        except OSError:
+            self.status_overlay.display("Unable to save the recording")
+            return
+        self.status_overlay.display(f"Recording saved: {target.name}")
 
     def stop_player(self) -> None:
         self.progress_timer.stop()
@@ -3376,13 +3789,13 @@ class LocalReplayDialog(QDialog):
             self.mpv_directory = None
             self.socket_path = None
 
-    def closeEvent(self, event: object) -> None:
+    def stop(self) -> None:
+        self.overlay_timer.stop()
+        self.refresh_timer.stop()
+        self.overlay.hide()
+        self.status_overlay.timer.stop()
+        self.status_overlay.hide()
         self.stop_player()
-        super().closeEvent(event)
-
-    def done(self, result: int) -> None:
-        self.stop_player()
-        super().done(result)
 
 
 class MainWindow(QMainWindow):
@@ -3405,6 +3818,7 @@ class MainWindow(QMainWindow):
         self.devices: list[AccountDevice | RtspCamera] = []
         self.device_accounts: dict[str, str] = {}
         self.previews: dict[str, CameraPreview] = {}
+        self.local_replays: dict[str, LocalReplayPane] = {}
         self.retired_previews: list[CameraPreview] = []
         self.preview_layout: str | None = None
         self.layout_refresh_timer = QTimer(self)
@@ -3488,7 +3902,9 @@ class MainWindow(QMainWindow):
         primary_header_layout.addWidget(self.primary_label, 1)
         primary_layout.addWidget(primary_header)
         self.primary_frame = AspectVideoFrame(self.video)
-        primary_layout.addWidget(self.primary_frame, 1)
+        self.primary_video_stack = QStackedWidget()
+        self.primary_video_stack.addWidget(self.primary_frame)
+        primary_layout.addWidget(self.primary_video_stack, 1)
         self.video_grid.addWidget(self.primary_pane, 0, 0)
         layout.addLayout(self.video_grid, 1)
         self.overlay = ControlsOverlay(self.video)
@@ -3502,10 +3918,9 @@ class MainWindow(QMainWindow):
             "#ptzPanel, #liveBar, #replayBar { background: transparent; }"
             "#cameraControls #pillButton { border: 2px solid white; border-radius: 8px;"
             " font-weight: 600; margin: 6px 2px; }"
-            "QToolTip { color: white; background-color: rgb(32, 32, 32);"
-            " border: 1px solid rgba(255, 255, 255, 60); border-radius: 6px; padding: 4px 8px; }"
             "#cameraControls QPushButton:disabled { color: rgba(255, 255, 255, 90);"
             " border-color: rgba(255, 255, 255, 90); }"
+            + TOOLTIP_STYLE
         )
         overlay_layout = QVBoxLayout(self.overlay)
         overlay_layout.setContentsMargins(24, 10, 24, 10)
@@ -3552,6 +3967,7 @@ class MainWindow(QMainWindow):
         self.light_button.setEnabled(False)
         self.light_button.hide()
         self.light_button.clicked.connect(self.toggle_light)
+        self.rtsp_light_mode: str | None = None
         controls.addWidget(self.light_button)
         self.zoom_out_button = QPushButton("−")
         self.zoom_out_button.setToolTip("Zoom out")
@@ -3569,8 +3985,6 @@ class MainWindow(QMainWindow):
         self.fullscreen_button = QPushButton("Full screen")
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         controls.addWidget(self.fullscreen_button)
-        self.fullscreen_replay_button = QPushButton()
-        self.fullscreen_replay_button.clicked.connect(self.toggle_fullscreen)
         controls.addStretch(1)
         for button, icon_name, label in (
             (self.replay_button, "replay", "Play back recordings"),
@@ -3582,65 +3996,30 @@ class MainWindow(QMainWindow):
             (self.zoom_in_button, "zoom_in", "Zoom in"),
             (self.ptz_button, "ptz", "Pan and tilt controls"),
             (self.fullscreen_button, "fullscreen", "Full screen"),
-            (self.fullscreen_replay_button, "fullscreen", "Full screen"),
         ):
             set_button_icon(button, icon_name, label)
         self.live_bar = QWidget(self.overlay)
         self.live_bar.setObjectName("liveBar")
         self.live_bar.setLayout(controls)
         overlay_layout.addWidget(self.live_bar)
-        self.replay_bar = QWidget(self.overlay)
-        self.replay_bar.setObjectName("replayBar")
-        replay_controls = QHBoxLayout(self.replay_bar)
-        replay_controls.setContentsMargins(0, 0, 0, 0)
-        replay_controls.setSpacing(12)
-        self.live_button = QPushButton(LIVE_BUTTON_LABEL)
-        self.live_button.setObjectName("pillButton")
-        self.live_button.setFixedSize(64, 44)
-        self.live_button.setToolTip("Back to live video")
-        self.live_button.setAccessibleName("Back to live video")
-        self.live_button.clicked.connect(lambda: self.exit_replay())
-        self.replay_play_button = QPushButton()
-        self.replay_sound_button = QPushButton()
-        self.replay_speed_button = QPushButton(REPLAY_SPEED_LABEL.format(speed=REPLAY_SPEEDS[0]))
-        self.replay_speed_button.setObjectName("pillButton")
-        self.replay_speed_button.setFixedSize(56, 44)
-        self.replay_speed_button.setToolTip("Playback speed")
-        self.replay_speed_button.setAccessibleName("Playback speed")
-        self.previous_detection_button = QPushButton()
-        self.next_detection_button = QPushButton()
-        self.replay_snapshot_button = QPushButton()
-        self.replay_save_button = QPushButton()
-        self.timeline_zoom_out_button = QPushButton()
-        self.timeline_zoom_in_button = QPushButton()
-        for button, icon_name, label in (
-            (self.previous_detection_button, "previous_detection", "Previous detection"),
-            (self.replay_play_button, "pause", "Pause"),
-            (self.next_detection_button, "next_detection", "Next detection"),
-            (self.replay_sound_button, "sound_on", "Mute playback"),
-            (self.replay_snapshot_button, "photo", "Save picture"),
-            (self.replay_save_button, "download", "Save this recording"),
-            (self.timeline_zoom_out_button, "zoom_out", "Show a longer period"),
-            (self.timeline_zoom_in_button, "zoom_in", "Show a shorter period"),
-        ):
-            set_button_icon(button, icon_name, label)
-        replay_controls.addStretch(1)
-        for button in (
-            self.live_button,
-            self.previous_detection_button,
-            self.replay_play_button,
-            self.next_detection_button,
-            self.replay_sound_button,
-            self.replay_speed_button,
-            self.replay_snapshot_button,
-            self.replay_save_button,
-            self.timeline_zoom_out_button,
-            self.timeline_zoom_in_button,
-            self.fullscreen_replay_button,
-        ):
-            replay_controls.addWidget(button)
-        replay_controls.addStretch(1)
+        self.replay_controls = ReplayControls(self.overlay)
+        self.replay_bar = self.replay_controls
+        self.live_button = self.replay_controls.live_button
+        self.replay_play_button = self.replay_controls.play_button
+        self.replay_sound_button = self.replay_controls.sound_button
+        self.replay_speed_button = self.replay_controls.speed_button
+        self.previous_detection_button = self.replay_controls.previous_button
+        self.next_detection_button = self.replay_controls.next_button
+        self.replay_snapshot_button = self.replay_controls.snapshot_button
+        self.replay_save_button = self.replay_controls.save_button
+        self.timeline_zoom_out_button = self.replay_controls.zoom_out_button
+        self.timeline_zoom_in_button = self.replay_controls.zoom_in_button
+        self.fullscreen_replay_button = self.replay_controls.fullscreen_button
+        self.timeline = self.replay_controls.timeline
+        set_button_icon(self.previous_detection_button, "previous_detection", "Previous detection")
+        set_button_icon(self.next_detection_button, "next_detection", "Next detection")
         self.replay_save_button.setEnabled(False)
+        self.live_button.clicked.connect(lambda: self.exit_replay())
         self.replay_play_button.clicked.connect(lambda: self.replay is not None and self.replay.toggle_playing())
         self.replay_sound_button.clicked.connect(self.toggle_replay_sound)
         self.previous_detection_button.clicked.connect(lambda: self.replay is not None and self.replay.jump_to_detection(-1))
@@ -3648,9 +4027,7 @@ class MainWindow(QMainWindow):
         self.replay_speed_button.clicked.connect(self.change_replay_speed)
         self.replay_snapshot_button.clicked.connect(self.take_snapshot)
         self.replay_save_button.clicked.connect(self.save_replay_clip)
-        self.timeline = TimelineWidget()
-        self.timeline_zoom_out_button.clicked.connect(lambda: self.timeline.zoom(1))
-        self.timeline_zoom_in_button.clicked.connect(lambda: self.timeline.zoom(-1))
+        self.fullscreen_replay_button.clicked.connect(self.toggle_fullscreen)
         overlay_layout.addWidget(self.replay_bar)
         overlay_layout.addWidget(self.timeline)
         self.replay_bar.hide()
@@ -3691,6 +4068,7 @@ class MainWindow(QMainWindow):
         badge_layout.addWidget(self.recording_label)
         self.video.set_recording_badge(self.recording_badge)
         self.video.set_controls_overlay(self.overlay)
+        self.replay_status_overlay: VideoStatusOverlay | None = None
         for button in self.overlay.findChildren(QPushButton):
             button.clicked.connect(self.show_overlay)
         self.setCentralWidget(body)
@@ -3718,7 +4096,7 @@ class MainWindow(QMainWindow):
 
     def display_status(self, text: str) -> None:
         self.status_text = text
-        self.setWindowTitle(f"{APPLICATION_NAME} \u00b7 {text}")
+        self.setWindowTitle(APPLICATION_NAME if text == "Live video" else f"{APPLICATION_NAME} \u00b7 {text}")
         if self.tray is not None:
             self.tray.setToolTip(f"{APPLICATION_NAME}\n{text}")
 
@@ -3746,9 +4124,10 @@ class MainWindow(QMainWindow):
         self.add_account_action.triggered.connect(self.change_account)
         add_camera_menu.addAction("RTSP camera...").triggered.connect(self.add_rtsp_camera)
         menu.addSeparator()
+        self.add_tray_action(menu, self.replay_button)
+        controls_menu = menu.addMenu("Camera controls")
         for button in (
             self.live_button,
-            self.replay_button,
             self.replay_play_button,
             self.snapshot_button,
             self.record_button,
@@ -3758,14 +4137,11 @@ class MainWindow(QMainWindow):
             self.zoom_out_button,
             self.fullscreen_button,
         ):
-            if button is None:
-                menu.addSeparator()
-            else:
-                self.add_tray_action(menu, button)
+            self.add_tray_action(controls_menu, button)
         self.quality_menu.setTitle("Video quality")
-        menu.addMenu(self.quality_menu)
+        controls_menu.addMenu(self.quality_menu)
         self.quality_menu.menuAction().setVisible(False)
-        movement = menu.addMenu("Move camera")
+        movement = controls_menu.addMenu("Move camera")
         for button in self.camera_buttons:
             self.add_tray_action(movement, button)
         menu.addSeparator()
@@ -3939,16 +4315,55 @@ class MainWindow(QMainWindow):
             self.enter_replay(None)
 
     def open_local_replay(self, camera: AccountDevice | RtspCamera) -> None:
-        worker = (
-            self.stream_worker if camera.uid == getattr(getattr(self, "selected_device", None), "uid", None)
-            else self.previews[camera.uid].worker if camera.uid in self.previews else None
-        )
+        if camera.uid in self.local_replays:
+            self.local_replays[camera.uid].show_overlay()
+            return
+        selected = camera.uid == getattr(getattr(self, "selected_device", None), "uid", None)
+        preview = self.previews.get(camera.uid)
+        if not selected and preview is None:
+            return
+        stack = self.primary_video_stack if selected else preview.video_stack
+        worker = self.stream_worker if selected else preview.worker
         try:
-            dialog = LocalReplayDialog(camera, self, worker)
+            replay = LocalReplayPane(camera, self.primary_pane if selected else preview, worker)
         except OSError:
             self.show_notice("Unable to open local recordings.")
             return
-        dialog.exec()
+        replay.live_requested.connect(lambda uid=camera.uid: self.close_local_replay(uid))
+        replay.fullscreen_requested.connect(self.toggle_fullscreen)
+        self.local_replays[camera.uid] = replay
+        label = self.primary_label if selected else preview.label
+        replay.live_title = label.text()
+        label.setText(replay.playback_title)
+        if selected:
+            self.hide_overlay()
+        else:
+            preview.hide_overlay()
+        stack.addWidget(replay)
+        stack.setCurrentWidget(replay)
+        if isinstance(worker, StreamWorker):
+            worker.set_display(False)
+        replay.show()
+
+    def close_local_replay(self, uid: str) -> None:
+        replay = self.local_replays.pop(uid, None)
+        if replay is None:
+            return
+        stack = self.primary_video_stack if uid == getattr(getattr(self, "selected_device", None), "uid", None) else (
+            self.previews[uid].video_stack if uid in self.previews else None
+        )
+        label = self.primary_label if stack is self.primary_video_stack else (
+            self.previews[uid].label if uid in self.previews else None
+        )
+        replay.stop()
+        if label is not None and label.text() == replay.playback_title:
+            label.setText(replay.live_title)
+        if stack is not None:
+            stack.setCurrentIndex(0)
+            stack.removeWidget(replay)
+        if isinstance(replay.worker, StreamWorker):
+            replay.worker.set_display(True)
+        replay.deleteLater()
 
     def open_camera_sd_replay(self, camera: AccountDevice) -> None:
         username = self.device_accounts.get(camera.uid)
@@ -4029,6 +4444,7 @@ class MainWindow(QMainWindow):
         self.sync_previews()
 
     def _retire_preview(self, preview: CameraPreview) -> None:
+        self.close_local_replay(preview.camera.uid)
         self.video_grid.removeWidget(preview)
         preview.hide()
         self.retired_previews.append(preview)
@@ -4081,6 +4497,7 @@ class MainWindow(QMainWindow):
                 preview.label.moved.connect(self.swap_cameras)
                 preview.replay_requested.connect(self.open_local_replay)
                 preview.camera_replay_requested.connect(self.open_camera_sd_replay)
+                preview.fullscreen_requested.connect(self.toggle_fullscreen)
                 self.previews[camera.uid] = preview
                 self.video_grid.addWidget(preview, row, column)
                 preview.show()
@@ -4094,8 +4511,6 @@ class MainWindow(QMainWindow):
             self.aspect_fitted = False
             if self.isVisible():
                 QTimer.singleShot(0, self.fit_video_aspect)
-        if cameras and self.isVisible():
-            QTimer.singleShot(0, self.show_overlay)
 
     def add_rtsp_camera(self) -> None:
         dialog = QDialog(self)
@@ -4107,7 +4522,7 @@ class MainWindow(QMainWindow):
         url = QLineEdit()
         url.setPlaceholderText("rtsp://camera-host:554/stream")
         transport = QComboBox()
-        transport.addItems(["UDP", "TCP"])
+        transport.addItems(["TCP", "UDP"])
         form.addRow("Name", name)
         form.addRow("RTSP URL", url)
         form.addRow("Transport", transport)
@@ -4265,6 +4680,8 @@ class MainWindow(QMainWindow):
         if getattr(self, "selected_device", None) is not None and self.selected_device.uid == uid:
             self.show_window()
             return
+        for replay_uid in list(self.local_replays):
+            self.close_local_replay(replay_uid)
         self.pending_camera = (username, uid)
         self.reconnect_timer.stop()
         self.retry_pending = False
@@ -4288,6 +4705,7 @@ class MainWindow(QMainWindow):
         self.latest_detection = None
         self.sync_quality_actions()
         self.on_capabilities_found([], None)
+        self.rtsp_light_mode = None
         self.replay_button.setEnabled(True)
         self.ptz_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
         self.ptz_button.setVisible(not isinstance(self.selected_device, RtspCamera))
@@ -4329,7 +4747,9 @@ class MainWindow(QMainWindow):
         self.replay = ReplayController(
             self.selected_device, stored_camera_password(self.selected_device.uid) or "", self.timeline
         )
-        self.replay.status_changed.connect(self.set_status)
+        if self.replay_status_overlay is None:
+            self.replay_status_overlay = VideoStatusOverlay(self.video)
+        self.replay.status_changed.connect(self.replay_status_overlay.display)
         self.replay.playing_changed.connect(self.on_replay_playing_changed)
         self.replay.clip_available.connect(self.replay_save_button.setEnabled)
         self.live_bar.hide()
@@ -4337,8 +4757,8 @@ class MainWindow(QMainWindow):
         self.replay_bar.show()
         self.timeline.show()
         self.replay_save_button.setEnabled(False)
+        self.set_status("Playback")
         self.replay.start(self.player.stdin, start)
-        self.show_overlay()
 
     def exit_replay(self, resume: bool = True) -> None:
         if self.replay is None:
@@ -4346,10 +4766,11 @@ class MainWindow(QMainWindow):
         replay = self.replay
         self.replay = None
         replay.stop()
+        if self.replay_status_overlay is not None:
+            self.replay_status_overlay.hide()
         self.replay_bar.hide()
         self.timeline.hide()
         self.live_bar.show()
-        self.show_overlay()
         if resume and self.stream_worker is None and self.account_worker is None:
             self.reconnect()
 
@@ -4480,7 +4901,11 @@ class MainWindow(QMainWindow):
         self.stream_worker.recording_saved.connect(self.on_recording_saved)
         self.stream_worker.recording_failed.connect(self.on_recording_failed)
         if isinstance(self.stream_worker, RtspStreamWorker):
+            self.stream_worker.audio_available.connect(self.on_rtsp_audio_available)
             self.stream_worker.continuous_failed.connect(self.on_continuous_failed)
+            self.stream_worker.light_available.connect(self.on_rtsp_light_available)
+            self.stream_worker.light_changed.connect(self.on_rtsp_light_changed)
+            self.stream_worker.light_failed.connect(self.on_rtsp_light_failed)
         if isinstance(self.stream_worker, StreamWorker):
             self.stream_worker.capabilities_found.connect(self.on_capabilities_found)
             self.stream_worker.detections_listed.connect(self.on_detections_listed)
@@ -4489,7 +4914,6 @@ class MainWindow(QMainWindow):
             self.stream_worker.setting_failed.connect(self.on_setting_failed)
         self.stream_worker.finished.connect(self.on_stream_finished)
         self.stream_worker.start()
-        QTimer.singleShot(200, self.show_overlay)
         QTimer.singleShot(500, self.video.raise_interaction_layer)
 
     def start_player(self, rtsp_camera: RtspCamera | None = None) -> bool:
@@ -4529,6 +4953,9 @@ class MainWindow(QMainWindow):
 
     def on_stream_status(self, message: str) -> None:
         self.set_status(message)
+        self.primary_label.setText(
+            f"{self.selected_device.name} · Live video" if message == "Live video" else self.selected_device.name
+        )
         if message == "Live video":
             self.stream_live = True
             self.reconnect_attempts = 0
@@ -4564,10 +4991,7 @@ class MainWindow(QMainWindow):
         self.video.place_overlay()
         self.overlay.show()
         self.video.raise_interaction_layer()
-        if self.replay is None and not self.previews:
-            self.overlay_timer.start(OVERLAY_TIMEOUT_MS)
-        else:
-            self.overlay_timer.stop()
+        self.overlay_timer.start(OVERLAY_TIMEOUT_MS)
 
     def hide_overlay(self) -> None:
         self.overlay.hide()
@@ -4674,14 +5098,9 @@ class MainWindow(QMainWindow):
         if not self._mpv_command(["set_property", "video-zoom", level / 2]):
             self.show_notice("Unable to change zoom.")
             return
-        old_scale = 2 ** (self.zoom_level / 2)
-        new_scale = 2 ** (level / 2)
         if x is not None and y is not None:
-            offset_x = (x - self.video.width() / 2) / max(1, self.video.width())
-            offset_y = (y - self.video.height() / 2) / max(1, self.video.height())
-            self.video_pan = (
-                offset_x / new_scale - (offset_x / old_scale - self.video_pan[0]),
-                offset_y / new_scale - (offset_y / old_scale - self.video_pan[1]),
+            self.video_pan = zoomed_video_pan(
+                self.video_pan, self.zoom_level, level, x, y, self.video.width(), self.video.height()
             )
         self.zoom_level = level
         self.apply_video_pan()
@@ -4699,6 +5118,12 @@ class MainWindow(QMainWindow):
             self.normal_geometry = self.geometry()
             self.showFullScreen()
             set_button_icon(self.fullscreen_button, "exit_fullscreen", "Exit full screen")
+        for preview in self.previews.values():
+            set_button_icon(
+                preview.fullscreen_button,
+                "exit_fullscreen" if self.isFullScreen() else "fullscreen",
+                "Exit full screen" if self.isFullScreen() else "Full screen",
+            )
 
     def fit_video_aspect(self) -> None:
         if self.isFullScreen():
@@ -4728,12 +5153,15 @@ class MainWindow(QMainWindow):
         if not self.aspect_fitted:
             self.aspect_fitted = True
             QTimer.singleShot(0, self.fit_video_aspect)
-        QTimer.singleShot(0, self.show_overlay)
         QTimer.singleShot(0, self.update_recording_badge)
 
     def moveEvent(self, event: QMoveEvent) -> None:
         super().moveEvent(event)
         self.video.place_overlay()
+        for preview in self.previews.values():
+            preview.video.place_overlay()
+        for replay in self.local_replays.values():
+            replay.video.place_overlay()
 
     def changeEvent(self, event: QEvent) -> None:
         super().changeEvent(event)
@@ -4771,6 +5199,34 @@ class MainWindow(QMainWindow):
             "Turn white light off" if self.light_on else "Turn white light on",
         )
 
+    def on_rtsp_light_available(self) -> None:
+        if self.sender() is not self.stream_worker or not self.stream_live:
+            return
+        set_icam365_light_icon(self.light_button, self.rtsp_light_mode)
+        self.light_button.setEnabled(True)
+        self.light_button.show()
+        self.video.place_overlay()
+
+    def set_rtsp_light(self, mode: str) -> None:
+        if not self.stream_live or not isinstance(self.stream_worker, RtspStreamWorker):
+            return
+        self.light_button.setEnabled(False)
+        self.stream_worker.set_light(mode)
+
+    def on_rtsp_light_changed(self, mode: str) -> None:
+        if self.sender() is not self.stream_worker:
+            return
+        self.rtsp_light_mode = mode
+        set_icam365_light_icon(self.light_button, mode)
+        self.light_button.setEnabled(self.stream_live)
+        self.show_notice("White light on." if mode == ICAM365_LIGHT_ON else "Automatic white light.")
+
+    def on_rtsp_light_failed(self) -> None:
+        if self.sender() is not self.stream_worker:
+            return
+        self.light_button.setEnabled(self.stream_live)
+        self.show_notice("Unable to change white light mode.")
+
     def queue_setting(self, name: str, value: object, message: str) -> bool:
         if not self.stream_live or self.stream_worker is None or self.setting_pending:
             return False
@@ -4783,6 +5239,9 @@ class MainWindow(QMainWindow):
         return True
 
     def toggle_light(self) -> None:
+        if isinstance(self.stream_worker, RtspStreamWorker):
+            self.set_rtsp_light(ICAM365_LIGHT_AUTO if self.rtsp_light_mode == ICAM365_LIGHT_ON else ICAM365_LIGHT_ON)
+            return
         if self.light_on is None:
             return
         self.queue_setting(
@@ -4828,11 +5287,23 @@ class MainWindow(QMainWindow):
         self.show_notice(message)
 
     def toggle_sound(self) -> None:
+        if isinstance(self.stream_worker, RtspStreamWorker):
+            if self._mpv_command(["set_property", "mute", self.sound_enabled]):
+                self.on_sound_changed(not self.sound_enabled)
+            else:
+                self.on_sound_failed("Unable to change camera sound.")
+            return
         if not isinstance(self.stream_worker, StreamWorker):
             return
         self.sound_button.setEnabled(False)
         self.show_notice("Changing camera sound...")
         self.stream_worker.set_sound(not self.sound_enabled)
+
+    def on_rtsp_audio_available(self) -> None:
+        if self.sender() is self.stream_worker and self.stream_live:
+            self.sound_button.setEnabled(True)
+            self.sound_button.show()
+            self.video.place_overlay()
 
     def on_sound_changed(self, enabled: bool) -> None:
         self.sound_enabled = enabled
@@ -4851,18 +5322,13 @@ class MainWindow(QMainWindow):
     def pan_zoomed_video(self, dx: int, dy: int) -> None:
         if self.zoom_level == 0 or (not self.stream_live and self.replay is None):
             return
-        scale = 2 ** (self.zoom_level / 2)
-        self.video_pan = (
-            self.video_pan[0] + dx / max(1, self.video.width() * scale),
-            self.video_pan[1] + dy / max(1, self.video.height() * scale),
+        self.video_pan = dragged_video_pan(
+            self.video_pan, self.zoom_level, dx, dy, self.video.width(), self.video.height()
         )
         self.apply_video_pan()
 
     def apply_video_pan(self) -> None:
-        limit = (1 - 1 / 2 ** (self.zoom_level / 2)) / 2
-        self.video_pan = tuple(min(limit, max(-limit, value)) for value in self.video_pan)
-        self._mpv_command(["set_property", "video-pan-x", self.video_pan[0]])
-        self._mpv_command(["set_property", "video-pan-y", self.video_pan[1]])
+        self.video_pan = apply_mpv_video_pan(self._mpv_command, self.video_pan, self.zoom_level)
 
     def move_by_drag(self, dx: int, dy: int) -> None:
         if self.zoom_level > 0 or self.replay is not None or isinstance(getattr(self, "selected_device", None), RtspCamera):
@@ -4956,6 +5422,8 @@ class MainWindow(QMainWindow):
         self.reconnect_timer.stop()
         self.layout_refresh_timer.stop()
         self.retry_pending = False
+        for uid in list(self.local_replays):
+            self.close_local_replay(uid)
         for uid, preview in list(self.previews.items()):
             del self.previews[uid]
             self._retire_preview(preview)

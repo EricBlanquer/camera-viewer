@@ -35,25 +35,30 @@ Use **Camera layout > Side by side** or **Stacked** to place the feeds horizonta
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 Drag one camera title onto another to exchange their positions; the order is remembered without restarting either stream.
 The camera panes share the available space equally in a side-by-side layout.
-Each camera has its own local playback, photo, recording, and zoom controls; O-KAM camera panes also have sound, pan-and-tilt, saved positions, light, and video quality controls when the camera supports them.
-Local playback lists that camera's recordings from the last 24 hours with pause, seeking, speeds up to 8x, zoom, photo, and full-screen controls.
+Each camera has its own local playback, photo, recording, zoom, and full-screen controls; compatible RTSP panes also have sound, while O-KAM panes also have pan-and-tilt, saved positions, light, and video quality controls when the camera supports them.
+Compatible iCam365 camera panes have a bulb button that switches white light between On and Automatic.
+Local playback stays in that camera's video pane and uses the same controls and timeline as camera microSD playback, with recordings from the last 24 hours, pause, seeking, speeds up to 8x, sound, photo, saved clips, and full-screen controls; **LIVE** returns to the camera stream.
 For an O-KAM pane, the playback button offers the camera's microSD recordings and its local 24-hour recordings.
 Selecting microSD playback makes that camera the selected pane while the other live feed remains visible.
 The other camera views reconnect independently.
-In multi-camera view, click the selected camera's video to show or hide its control bar.
+Click either video to show or hide its own control bar; the bars are hidden initially and close after five seconds.
+Double-click either video to toggle full screen.
 Turn off **Show all cameras** to return to one video.
 Use **Refresh camera list** there after adding a camera to an existing O-KAM account.
-Later launches show only the video and its controls.
+Later launches show the video with controls available on click.
 Run `.venv/bin/python app.py --forget-account` to remove all saved O-KAM accounts.
 
-The TERUHAL QW55 used with iCam365 provides an RTSP stream at `rtsp://<camera-LAN-address>:8001/0`.
-Select UDP transport for this model.
+The TERUHAL QW55 used with iCam365 provides video and sound at `rtsp://<camera-LAN-address>:8001/0/av0`.
+Select TCP transport for this model.
 Give the camera a stable LAN address so the saved URL remains valid.
-For RTSP cameras, live view, photo, local video recording, continuous recording, and playback of local recordings are available; iCam365 microSD playback, sound, detection notifications, and camera movement controls are not available through this RTSP connection.
+For RTSP cameras, live view, photo, local video and audio recording, continuous recording, and playback of local recordings are available when the configured stream carries audio.
+RTSP live view and local playback apply noise reduction in the player; saved recordings retain the original camera stream.
+When the camera exposes the TAS-Tech local white light endpoint, the bulb button switches between On and Automatic.
+iCam365 microSD playback, talkback microphone, detection notifications, and camera movement or saved positions are not available through this RTSP connection.
 An RTSP URL is reachable outside the home only when the computer has a secure route to the camera's LAN, such as a VPN; the iCam365 account relay is not integrated.
 
 Each camera keeps its 16:9 ratio in single-camera and multi-camera views, including when the window is resized.
-The current state appears in the window title.
+The selected camera's live state appears next to its name; playback loading and errors appear over the affected video.
 Click the video to show or hide the translucent control bar.
 Live video starts automatically, and the viewer reconnects by itself after a network or transport interruption.
 Use **Full screen** to expand the viewer.
@@ -67,7 +72,7 @@ For O-KAM cameras, drag the video horizontally or vertically with the left mouse
 For O-KAM cameras, **Preset 1** through **Preset 5** recall its saved positions.
 
 When the desktop provides a notification area, Camera Viewer shows an icon there instead of a taskbar entry.
-Click the icon to show or hide the window, or open its menu to use the same controls or quit.
+Click the icon to show or hide the window, or open its menu for camera selection, playback, and the **Camera controls** submenu.
 Opening Camera Viewer again from the application menu shows the running instance instead of starting a second one.
 Closing the window hides it; live video keeps running in the background so continuous recording and detection checks continue.
 
