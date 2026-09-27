@@ -64,6 +64,22 @@ class ReconnectTest(unittest.TestCase):
         self.assertEqual(reconnected, [True])
         self.assertIsNone(self.window.replay)
 
+    def test_drag_pans_zoomed_video_instead_of_moving_camera(self) -> None:
+        moves: list[tuple[str, ...]] = []
+        commands: list[list[object]] = []
+        self.window.control_camera = moves.append
+        self.window._mpv_command = lambda command: commands.append(command) or True
+        self.window.stream_live = True
+        self.window.zoom_level = 2
+        self.window.video.resize(1000, 500)
+        self.window.pan_zoomed_video(100, 0)
+        self.window.move_by_drag(100, 0)
+        self.assertEqual(moves, [])
+        self.assertAlmostEqual(self.window.video_pan[0], 0.05)
+        self.window.pan_zoomed_video(10000, 0)
+        self.assertAlmostEqual(self.window.video_pan[0], 0.25)
+        self.assertEqual(commands[-2], ["set_property", "video-pan-x", 0.25])
+
     def test_rejected_camera_credentials_do_not_retry(self) -> None:
         self.window.on_stream_error("The camera rejected the available credentials.")
         self.window.on_stream_finished()

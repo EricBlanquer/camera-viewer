@@ -10,6 +10,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -93,6 +94,7 @@ LOG_FILE_NAME = "okam-linux.log"
 LOG_MAX_BYTES = 1024 * 1024
 LOG_BACKUPS = 2
 TRAY_ARGUMENT = "--tray"
+SIGNAL_POLL_MS = 500
 INSTANCE_SERVER_PREFIX = "okam-linux"
 INSTANCE_CONNECT_TIMEOUT_MS = 500
 SHOW_WINDOW_REQUEST = b"show"
@@ -1712,10 +1714,12 @@ class ReplayWorker(QThread):
 class VideoWidget(QWidget):
     clicked = pyqtSignal()
     dragged = pyqtSignal(int, int)
+    drag_moved = pyqtSignal(int, int)
 
     def __init__(self) -> None:
         super().__init__()
         self.drag_start: tuple[int, int] | None = None
+        self.drag_last: tuple[int, int] | None = None
         self.controls_overlay: QWidget | None = None
         self.recording_badge: QWidget | None = None
         self.x_display = xdisplay.Display() if QApplication.platformName() == "xcb" else None
@@ -1791,7 +1795,21 @@ class VideoWidget(QWidget):
             self.x_display.flush()
         self.place_overlay()
 
+    def _start_drag(self, x: int, y: int) -> None:
+        self.drag_start = (x, y)
+        self.drag_last = (x, y)
+
+    def _move_drag(self, x: int, y: int) -> None:
+        if self.drag_last is None:
+            return
+        dx = x - self.drag_last[0]
+        dy = y - self.drag_last[1]
+        self.drag_last = (x, y)
+        if dx or dy:
+            self.drag_moved.emit(dx, dy)
+
     def _finish_drag(self, x: int, y: int) -> None:
+        self.drag_last = None
         if self.drag_start is None:
             return
         dx = x - self.drag_start[0]
@@ -1804,10 +1822,13 @@ class VideoWidget(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_start = (round(event.position().x()), round(event.position().y()))
+            self._start_drag(round(event.position().x()), round(event.position().y()))
             event.accept()
         else:
             super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        self._move_drag(round(event.position().x()), round(event.position().y()))
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1819,6 +1840,7 @@ class VideoWidget(QWidget):
     def read_mouse_events(self) -> None:
         if self.x_display is None:
             return
+        motion: tuple[int, int] | None = None
         while self.x_display.pending_events():
             event = self.x_display.next_event()
             if self.input_window is None:
@@ -1826,12 +1848,20 @@ class VideoWidget(QWidget):
             if event.type == X11.MapNotify and event.window != self.input_window:
                 self.raise_interaction_layer()
                 continue
+            if event.type == X11.MotionNotify:
+                motion = (event.event_x, event.event_y)
+                continue
             if event.type not in (X11.ButtonPress, X11.ButtonRelease):
                 continue
+            if motion is not None:
+                self._move_drag(*motion)
+                motion = None
             if event.type == X11.ButtonPress and event.detail == 1:
-                self.drag_start = (event.event_x, event.event_y)
+                self._start_drag(event.event_x, event.event_y)
             elif event.type == X11.ButtonRelease and event.detail == 1 and self.drag_start is not None:
                 self._finish_drag(event.event_x, event.event_y)
+        if motion is not None:
+            self._move_drag(*motion)
 
     def closeEvent(self, event: object) -> None:
         self.input_timer.stop()
@@ -2287,6 +2317,7 @@ class MainWindow(QMainWindow):
         self.recording_timer = QTimer(self)
         self.recording_timer.timeout.connect(self.update_recording_badge)
         self.zoom_level = 0
+        self.video_pan = (0.0, 0.0)
         self.close_pending = False
         self.stream_error = False
         self.stream_live = False
@@ -2321,6 +2352,7 @@ class MainWindow(QMainWindow):
         self.video.setStyleSheet("background-color: #171717;")
         self.video.clicked.connect(self.toggle_overlay)
         self.video.dragged.connect(self.move_by_drag)
+        self.video.drag_moved.connect(self.pan_zoomed_video)
         layout.addWidget(self.video, 1)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
@@ -2879,6 +2911,8 @@ class MainWindow(QMainWindow):
     def start_player(self) -> bool:
         if self.player is not None and self.player.poll() is None:
             self._mpv_command(["set_property", "video-zoom", 0])
+            self.video_pan = (0.0, 0.0)
+            self.apply_video_pan()
             return True
         self.stop_player()
         self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-mpv-")
@@ -3059,6 +3093,7 @@ class MainWindow(QMainWindow):
             self.set_status("Unable to change zoom.")
             return
         self.zoom_level = level
+        self.apply_video_pan()
         self.zoom_out_button.setEnabled(level > 0)
         self.zoom_in_button.setEnabled(level < MAX_ZOOM_LEVEL)
         self.set_status(f"Zoom {2 ** (level / 2):.1f}×.")
@@ -3203,7 +3238,25 @@ class MainWindow(QMainWindow):
         self.sound_button.setEnabled(self.stream_live)
         self.set_status(message)
 
+    def pan_zoomed_video(self, dx: int, dy: int) -> None:
+        if self.zoom_level == 0 or not self.stream_live:
+            return
+        scale = 2 ** (self.zoom_level / 2)
+        self.video_pan = (
+            self.video_pan[0] + dx / max(1, self.video.width() * scale),
+            self.video_pan[1] + dy / max(1, self.video.height() * scale),
+        )
+        self.apply_video_pan()
+
+    def apply_video_pan(self) -> None:
+        limit = (1 - 1 / 2 ** (self.zoom_level / 2)) / 2
+        self.video_pan = tuple(min(limit, max(-limit, value)) for value in self.video_pan)
+        self._mpv_command(["set_property", "video-pan-x", self.video_pan[0]])
+        self._mpv_command(["set_property", "video-pan-y", self.video_pan[1]])
+
     def move_by_drag(self, dx: int, dy: int) -> None:
+        if self.zoom_level > 0:
+            return
         if abs(dx) < DRAG_PIXELS_PER_STEP // 2 and abs(dy) < DRAG_PIXELS_PER_STEP // 2:
             return
         if abs(dx) >= abs(dy):
@@ -3334,6 +3387,10 @@ def main() -> int:
     if not instance_server.listen(server_name):
         return 1
     window = MainWindow()
+    signal.signal(signal.SIGTERM, lambda number, frame: QTimer.singleShot(0, window.quit_application))
+    signal_timer = QTimer()
+    signal_timer.timeout.connect(lambda: None)
+    signal_timer.start(SIGNAL_POLL_MS)
     instance_server.newConnection.connect(lambda: accept_instance_request(instance_server, window))
     if not start_in_tray or window.tray is None:
         window.show()
