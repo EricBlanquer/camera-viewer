@@ -173,6 +173,9 @@ CARD_CHANNEL = 4
 CARD_PLAY_RESPONSE_COMMAND = 0x6037
 CARD_RESPONSE_SECONDS = 10
 CARD_FRAME_SECONDS = 15
+CARD_QUIET_SECONDS = 0.3
+CARD_DRAIN_SECONDS = 3.0
+CARD_TIME_MARGIN_SECONDS = 15
 CARD_START_FRAME_TYPE = 0x63
 CARD_END_FRAME_TYPE = 0x64
 CARD_VIDEO_FRAME_TYPES = (0x00, 0x01)
@@ -640,6 +643,21 @@ class ControlsOverlay(QWidget):
 
 
 class ReliableCS2Session(CS2Session):
+    def discard_channel(self, channel: int, quiet_seconds: float, limit_seconds: float) -> None:
+        deadline = time.monotonic() + limit_seconds
+        last_size = -1
+        quiet_since = time.monotonic()
+        while time.monotonic() < deadline:
+            size = len(self._channel_buffers[channel]) + len(self._out_of_order[channel])
+            if size != last_size:
+                last_size = size
+                quiet_since = time.monotonic()
+            elif time.monotonic() - quiet_since >= quiet_seconds:
+                break
+            self._pump()
+        self._channel_buffers[channel].clear()
+        self._out_of_order[channel].clear()
+
     def _handle_data(self, packet: bytes) -> None:
         declared = int.from_bytes(packet[2:4], "big") if len(packet) >= 4 else -1
         body = packet[4:]
@@ -820,7 +838,11 @@ def download_card_recording(
     cancelled: Callable[[], bool],
     idle: Callable[[], None] = lambda: None,
 ) -> bool:
+    if isinstance(session, ReliableCS2Session):
+        session.discard_channel(CARD_CHANNEL, CARD_QUIET_SECONDS, CARD_DRAIN_SECONDS)
     write_command(session, make_cgi_request(CARD_PLAY_PATH.format(name=recording.name), user, password))
+    earliest = camera_timestamp(recording.start) - CARD_TIME_MARGIN_SECONDS
+    latest = camera_timestamp(recording.end) + CARD_TIME_MARGIN_SECONDS
     response = read_command_result(session, (CARD_PLAY_RESPONSE_COMMAND,), timeout=CARD_RESPONSE_SECONDS)
     if response is None or response[1] != 0:
         raise CS2Error("The camera rejected the playback request.")
@@ -842,8 +864,13 @@ def download_card_recording(
             if not started:
                 continue
             if frame_type == CARD_END_FRAME_TYPE:
+                if received == 0:
+                    continue
                 return True
-            on_frame(frame_type, seconds + milliseconds / 1000, body)
+            timestamp = seconds + milliseconds / 1000
+            if not earliest <= timestamp <= latest:
+                continue
+            on_frame(frame_type, timestamp, body)
             idle()
             received += len(header) + length
             if recording.size > 0:

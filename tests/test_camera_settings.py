@@ -15,6 +15,7 @@ from app import (
     WHITE_LIGHT_STATUS_COMMAND,
     CardRecording,
     available_qualities,
+    camera_timestamp,
     download_card_recording,
     is_detection_recording,
     list_detections,
@@ -146,18 +147,24 @@ class ChannelSession:
         pass
 
 
-def card_frame(frame_type: int, body: bytes) -> list[bytes]:
+CLIP_START = datetime(2026, 9, 26, 23, 16, 4)
+
+
+def card_frame(frame_type: int, body: bytes, moment: datetime = CLIP_START) -> list[bytes]:
     header = bytearray(32)
     header[:4] = b"\x55\xaa\x15\xa8"
     header[4] = frame_type
+    header[8:12] = int(camera_timestamp(moment)).to_bytes(4, "little")
     header[16:20] = len(body).to_bytes(4, "little")
     return [bytes(header), body] if body else [bytes(header)]
 
 
 class CardDownloadTest(unittest.TestCase):
-    def test_download_serves_other_requests_between_frames(self) -> None:
-        frames = card_frame(CARD_START_FRAME_TYPE, b"") + card_frame(0, b"I") + card_frame(1, b"P")
-        frames += card_frame(CARD_END_FRAME_TYPE, b"")
+    def test_download_skips_stale_frames_and_serves_requests_between_frames(self) -> None:
+        stale = datetime(2026, 9, 26, 19, 3, 55)
+        frames = card_frame(CARD_START_FRAME_TYPE, b"") + card_frame(1, b"old", stale)
+        frames += card_frame(CARD_END_FRAME_TYPE, b"", stale)
+        frames += card_frame(0, b"I") + card_frame(1, b"P") + card_frame(CARD_END_FRAME_TYPE, b"")
         session = ChannelSession(
             {0: command_packet(CARD_PLAY_RESPONSE_COMMAND, b"result= 0;\r\n"), CARD_CHANNEL: frames}
         )
@@ -167,7 +174,7 @@ class CardDownloadTest(unittest.TestCase):
             session,
             "admin",
             "secret",
-            CardRecording("20260926231604_011.mp4", datetime(2026, 9, 26, 23, 16, 4), 180, 100),
+            CardRecording("20260926231604_011.mp4", CLIP_START, 180, 100),
             lambda frame_type, timestamp, body: received.append(body),
             lambda fraction: None,
             lambda: False,
