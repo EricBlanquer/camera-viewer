@@ -120,7 +120,6 @@ AUDIO_RESPONSE_COMMAND = 0x6031
 RECONNECT_MAX_SECONDS = 30
 OVERLAY_TIMEOUT_MS = 5000
 MAX_ZOOM_LEVEL = 4
-DOUBLE_CLICK_ZOOM_STEPS = 2
 X11_WHEEL_UP = 4
 X11_WHEEL_DOWN = 5
 MAX_MPV_RESPONSE_BYTES = 65536
@@ -2506,7 +2505,7 @@ class MainWindow(QMainWindow):
         self.video.dragged.connect(self.move_by_drag)
         self.video.drag_moved.connect(self.pan_zoomed_video)
         self.video.wheel_zoomed.connect(self.change_zoom)
-        self.video.double_clicked.connect(self.toggle_zoom_at)
+        self.video.double_clicked.connect(lambda x, y: self.toggle_fullscreen())
         layout.addWidget(self.video, 1)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
@@ -3290,12 +3289,6 @@ class MainWindow(QMainWindow):
         if self.recording_path is not None:
             self.reset_recording_state()
         self.show_notice(message)
-
-    def toggle_zoom_at(self, x: int, y: int) -> None:
-        if self.zoom_level > 0:
-            self.change_zoom(-self.zoom_level)
-        else:
-            self.change_zoom(DOUBLE_CLICK_ZOOM_STEPS, x, y)
 
     def change_zoom(self, step: int, x: int | None = None, y: int | None = None) -> None:
         if not self.stream_live and self.replay is None:

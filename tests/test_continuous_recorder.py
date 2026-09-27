@@ -54,7 +54,7 @@ class ContinuousRecorderTest(unittest.TestCase):
 
     def test_interrupted_segment_is_recovered(self) -> None:
         frames = encoded_frames()
-        start = datetime.now() - timedelta(seconds=3)
+        start = (datetime.now() - timedelta(seconds=3)).replace(microsecond=0)
         raw = self.path / f"Jardin_{start:%Y%m%d_%H%M%S}.mkv.h264"
         raw.write_bytes(b"".join(frames))
         mtime = start.timestamp() + 3
