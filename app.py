@@ -181,6 +181,12 @@ REPLAY_SPEEDS = (1, 2, 4, 8)
 REPLAY_DEFAULT_REWIND_SECONDS = 60
 REPLAY_SPEED_LABEL = "{speed}x"
 LIVE_BUTTON_LABEL = "LIVE"
+LOADING_DONE = -1
+DETECTION_JUMP_MARGIN_SECONDS = 5
+RECORDING_CHAIN_TOLERANCE_SECONDS = 5
+MAX_RECORDING_RELOADS = 2
+MAX_REPLAY_DAYS = 31
+LOADING_MIN_FRACTION = 0.02
 REPLAY_WORKER_WAIT_MS = 20000
 TIMELINE_HEIGHT = 84
 TIMELINE_HEADER_HEIGHT = 28
@@ -1501,7 +1507,7 @@ class ReplayWorker(QThread):
                     try:
                         self._handle(*request)
                         break
-                    except (CS2Error, P2PError, WakeError, OSError) as ex:
+                    except Exception as ex:
                         print(f"Replay error: {type(ex).__name__}: {ex}", file=sys.stderr, flush=True)
                         self._close_session()
                         retry = (
@@ -1873,6 +1879,7 @@ class ReplayController(QObject):
     playback_finished = pyqtSignal(str)
     playing_changed = pyqtSignal(bool)
     clip_available = pyqtSignal(bool)
+    loading_changed = pyqtSignal(int)
 
     def __init__(self, device: AccountDevice, camera_password: str, timeline: TimelineWidget) -> None:
         super().__init__()
@@ -1884,6 +1891,13 @@ class ReplayController(QObject):
         self.saved_clips: dict[str, Path] = {}
         self.start_request: datetime | None = None
         self.current: ReplayBuffer | None = None
+        self.prefetched: ReplayBuffer | None = None
+        self.target_fraction = 0.0
+        self.waiting_for_target = False
+        self.pending_jump = 0
+        self.jump_origin = datetime.now()
+        self.last_position: datetime | None = None
+        self.reloads = 0
         self.playing = False
         self.sound = True
         self.speed_index = 0
@@ -1893,6 +1907,7 @@ class ReplayController(QObject):
         self.worker.progress.connect(self.on_progress)
         self.worker.downloaded.connect(self.on_downloaded)
         self.worker.failed.connect(self.status_changed.emit)
+        self.worker.failed.connect(lambda message: self.loading_changed.emit(LOADING_DONE))
         self.position_changed.connect(self.on_position)
         self.playback_finished.connect(self.on_finished)
         self.timeline.seek_requested.connect(self.seek)
@@ -1943,6 +1958,9 @@ class ReplayController(QObject):
     def on_day_listed(self, day: str, recordings: list[CardRecording]) -> None:
         self.recordings[day] = recordings
         self.timeline.set_recordings(self.all_recordings())
+        if self.pending_jump:
+            self.continue_jump()
+            return
         if self.current is not None:
             return
         if self.start_request is not None:
@@ -1956,6 +1974,47 @@ class ReplayController(QObject):
             else:
                 self.status_changed.emit("No recording today.")
 
+    def jump_to_detection(self, direction: int) -> None:
+        self.jump_origin = self.timeline.center
+        self.pending_jump = direction
+        self.continue_jump()
+
+    def continue_jump(self) -> None:
+        direction = self.pending_jump
+        detections = [recording for recording in self.all_recordings() if recording.detection]
+        if direction < 0:
+            found = next(
+                (recording for recording in reversed(detections) if recording.start < self.jump_origin - timedelta(seconds=DETECTION_JUMP_MARGIN_SECONDS)),
+                None,
+            )
+        else:
+            found = next(
+                (recording for recording in detections if recording.start > self.jump_origin + timedelta(seconds=DETECTION_JUMP_MARGIN_SECONDS)),
+                None,
+            )
+        if found is not None:
+            self.pending_jump = 0
+            self.seek(found.start, found)
+            return
+        loaded = sorted(self.recordings)
+        today = datetime.now().strftime(RECORD_DAY_FORMAT)
+        if direction < 0 and loaded:
+            earlier = (datetime.strptime(loaded[0], RECORD_DAY_FORMAT) - timedelta(days=1)).strftime(RECORD_DAY_FORMAT)
+            if earlier not in self.requested_days and len(self.requested_days) < MAX_REPLAY_DAYS:
+                self.requested_days.add(earlier)
+                self.worker.list_day(earlier)
+                self.status_changed.emit("Looking for an earlier detection...")
+                return
+        elif direction > 0 and loaded and loaded[-1] < today:
+            later = (datetime.strptime(loaded[-1], RECORD_DAY_FORMAT) + timedelta(days=1)).strftime(RECORD_DAY_FORMAT)
+            if later not in self.requested_days:
+                self.requested_days.add(later)
+                self.worker.list_day(later)
+                self.status_changed.emit("Looking for a later detection...")
+                return
+        self.pending_jump = 0
+        self.status_changed.emit("No earlier detection." if direction < 0 else "No later detection.")
+
     def recording_at(self, moment: datetime) -> CardRecording | None:
         recordings = self.all_recordings()
         for recording in recordings:
@@ -1963,48 +2022,91 @@ class ReplayController(QObject):
                 return recording
         return next((recording for recording in recordings if recording.start > moment), None)
 
-    def seek(self, moment: datetime) -> None:
-        recording = self.recording_at(moment)
+    def seek(self, moment: datetime, preferred: CardRecording | None = None) -> None:
+        recording = preferred or self.recording_at(moment)
         if recording is None:
             self.status_changed.emit("No recording at this time.")
             return
         target = max(moment, recording.start)
         self.timeline.set_center(target)
         self.set_playing(True)
+        self.target_fraction = (target - recording.start).total_seconds() / max(1, recording.duration)
+        self.waiting_for_target = True
         if self.current is not None and self.current.recording == recording and self.current.frames:
             if self.pacer is not None:
                 self.pacer.seek(camera_timestamp(target))
             return
-        self.current = ReplayBuffer(recording)
         self.clip_available.emit(recording.name in self.saved_clips)
+        self.loading_changed.emit(0)
         self.status_changed.emit("Loading recording...")
-        self.worker.download(self.current)
+        if self.prefetched is not None and self.prefetched.recording == recording:
+            self.current = self.prefetched
+            self.prefetched = None
+            if recording.name in self.saved_clips:
+                self.prefetch_following()
+        else:
+            self.prefetched = None
+            self.current = ReplayBuffer(recording)
+            self.worker.download(self.current)
         if self.pacer is not None:
             self.pacer.load(self.current, camera_timestamp(target))
 
     def on_position(self, timestamp: float) -> None:
+        self.last_position = camera_time(timestamp)
+        self.reloads = 0
+        if self.waiting_for_target:
+            self.waiting_for_target = False
+            self.loading_changed.emit(LOADING_DONE)
         moment = camera_time(timestamp)
         self.timeline.set_center(moment)
         self.status_changed.emit(f"Playback {moment:%d/%m/%Y %H:%M:%S}")
 
+    def next_recording(self, recording: CardRecording) -> CardRecording | None:
+        threshold = recording.end - timedelta(seconds=RECORDING_CHAIN_TOLERANCE_SECONDS)
+        candidates = [candidate for candidate in self.all_recordings() if candidate.start >= threshold and candidate != recording]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda candidate: (candidate.start, candidate.detection != recording.detection))
+
     def on_finished(self, name: str) -> None:
         if self.current is None or self.current.recording.name != name:
             return
-        following = next((recording for recording in self.all_recordings() if recording.name > name), None)
+        recording = self.current.recording
+        resume = self.last_position
+        if name not in self.saved_clips and resume is not None and resume < recording.end and self.reloads < MAX_RECORDING_RELOADS:
+            self.reloads += 1
+            self.current = None
+            self.seek(resume, recording)
+            return
+        following = self.next_recording(recording)
         if following is None:
             self.set_playing(False)
+            self.loading_changed.emit(LOADING_DONE)
             self.status_changed.emit("End of the recordings.")
             return
-        self.seek(following.start)
+        self.seek(following.start, following)
 
     def on_progress(self, name: str, fraction: float) -> None:
-        if self.current is not None and self.current.recording.name == name and not self.current.frames:
-            self.status_changed.emit(f"Loading recording {fraction:.0%}")
+        if self.current is None or self.current.recording.name != name or not self.waiting_for_target:
+            return
+        percent = min(99, round(100 * fraction / max(self.target_fraction, LOADING_MIN_FRACTION)))
+        self.loading_changed.emit(percent)
+        self.status_changed.emit(f"Loading recording {percent}%")
 
     def on_downloaded(self, name: str, path: str) -> None:
         self.saved_clips[name] = Path(path)
-        if self.current is not None and self.current.recording.name == name:
-            self.clip_available.emit(True)
+        if self.current is None or self.current.recording.name != name:
+            return
+        self.clip_available.emit(True)
+        self.prefetch_following()
+
+    def prefetch_following(self) -> None:
+        if self.current is None or self.prefetched is not None:
+            return
+        following = self.next_recording(self.current.recording)
+        if following is not None:
+            self.prefetched = ReplayBuffer(following)
+            self.worker.download(self.prefetched)
 
     def set_playing(self, playing: bool) -> None:
         self.playing = playing
@@ -2109,6 +2211,7 @@ class MainWindow(QMainWindow):
             "#cameraControls #qualityButton { border: 2px solid white; border-radius: 8px;"
             " font-weight: 600; margin: 6px 2px; }"
             "#ptzPanel, #liveBar, #replayBar { background: transparent; }"
+            "#cameraControls #loadingLabel { color: white; background: transparent; font-weight: 600; }"
             "#cameraControls #pillButton { border: 2px solid white; border-radius: 8px;"
             " font-weight: 600; margin: 6px 2px; }"
             "QToolTip { color: white; background-color: rgb(32, 32, 32);"
@@ -2216,12 +2319,20 @@ class MainWindow(QMainWindow):
         self.replay_speed_button.setFixedSize(56, 44)
         self.replay_speed_button.setToolTip("Playback speed")
         self.replay_speed_button.setAccessibleName("Playback speed")
+        self.previous_detection_button = QPushButton()
+        self.next_detection_button = QPushButton()
+        self.replay_loading_label = QLabel()
+        self.replay_loading_label.setObjectName("loadingLabel")
+        self.replay_loading_label.setAccessibleName("Loading progress")
+        self.replay_loading_label.hide()
         self.replay_snapshot_button = QPushButton()
         self.replay_save_button = QPushButton()
         self.timeline_zoom_out_button = QPushButton()
         self.timeline_zoom_in_button = QPushButton()
         for button, icon_name, label in (
+            (self.previous_detection_button, "previous_detection", "Previous detection"),
             (self.replay_play_button, "pause", "Pause"),
+            (self.next_detection_button, "next_detection", "Next detection"),
             (self.replay_sound_button, "sound_on", "Mute playback"),
             (self.replay_snapshot_button, "photo", "Save picture"),
             (self.replay_save_button, "download", "Save this recording"),
@@ -2232,9 +2343,12 @@ class MainWindow(QMainWindow):
         replay_controls.addStretch(1)
         for button in (
             self.live_button,
+            self.previous_detection_button,
             self.replay_play_button,
+            self.next_detection_button,
             self.replay_sound_button,
             self.replay_speed_button,
+            self.replay_loading_label,
             self.replay_snapshot_button,
             self.replay_save_button,
             self.timeline_zoom_out_button,
@@ -2246,6 +2360,8 @@ class MainWindow(QMainWindow):
         self.replay_save_button.setEnabled(False)
         self.replay_play_button.clicked.connect(lambda: self.replay is not None and self.replay.toggle_playing())
         self.replay_sound_button.clicked.connect(self.toggle_replay_sound)
+        self.previous_detection_button.clicked.connect(lambda: self.replay is not None and self.replay.jump_to_detection(-1))
+        self.next_detection_button.clicked.connect(lambda: self.replay is not None and self.replay.jump_to_detection(1))
         self.replay_speed_button.clicked.connect(self.change_replay_speed)
         self.replay_snapshot_button.clicked.connect(self.take_snapshot)
         self.replay_save_button.clicked.connect(self.save_replay_clip)
@@ -2536,6 +2652,7 @@ class MainWindow(QMainWindow):
         self.replay.status_changed.connect(self.set_status)
         self.replay.playing_changed.connect(self.on_replay_playing_changed)
         self.replay.clip_available.connect(self.replay_save_button.setEnabled)
+        self.replay.loading_changed.connect(self.show_replay_loading)
         self.live_bar.hide()
         self.ptz_panel.hide()
         self.replay_bar.show()
@@ -2552,6 +2669,7 @@ class MainWindow(QMainWindow):
         replay.stop()
         self.replay_bar.hide()
         self.timeline.hide()
+        self.replay_loading_label.hide()
         self.live_bar.show()
         self.show_overlay()
         if resume and self.isVisible() and self.stream_worker is None and self.account_worker is None:
@@ -2562,6 +2680,10 @@ class MainWindow(QMainWindow):
             self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    def show_replay_loading(self, percent: int) -> None:
+        self.replay_loading_label.setVisible(percent != LOADING_DONE)
+        self.replay_loading_label.setText(f"Loading {percent}%")
 
     def on_replay_playing_changed(self, playing: bool) -> None:
         set_button_icon(self.replay_play_button, "pause" if playing else "play", "Pause" if playing else "Play")

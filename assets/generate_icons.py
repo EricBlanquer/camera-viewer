@@ -5,6 +5,8 @@ ICON_SHAPES = {
     "play": '<path d="M8 5 19 12 8 19Z"/>',
     "pause": '<path d="M9 5v14m6-14v14"/>',
     "replay": '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/>',
+    "previous_detection": '<path d="M6 5v14"/><path d="M18 5 9 12l9 7Z"/>',
+    "next_detection": '<path d="M18 5v14"/><path d="M6 5l9 7-9 7Z"/>',
     "download": '<path d="M12 4v11m-5-5 5 5 5-5M5 20h14"/>',
     "photo": '<path d="M3 7h4l2-2h6l2 2h4v12H3Z"/><circle cx="12" cy="13" r="3.5"/>',
     "record": '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4" fill="#f55" stroke="none"/>',
