@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import signal
+import queue
+import re
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import BinaryIO
+from datetime import datetime
 
-from PyQt6.QtCore import QSettings, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QActionGroup, QColor, QIcon, QMouseEvent, QMoveEvent, QPainter, QResizeEvent, QShowEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -25,40 +30,207 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QPushButton,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
 
 from okam_native.account import AccountDevice, AccountError, Eye4AccountClient
-from okam_native.cs2 import CS2Error, CS2Session, make_cgi_request, read_command_result, write_command
+from okam_native.cs2 import (
+    LIVE_STREAM_RESPONSE_COMMANDS,
+    LOGIN_RESPONSE_COMMAND,
+    MAX_FRAME_BYTES,
+    CS2Error,
+    CS2Session,
+    CS2Timeout,
+    CameraLoginRejected,
+    authenticate_camera,
+    inspect_h264,
+    make_cgi_request,
+    parse_result,
+    read_command,
+    read_command_result,
+    write_command,
+)
 from okam_native.p2p import (
     P2PError,
     get_service_parameter,
-    open_stream_process,
     resolve_client_id,
     select_camera_password,
 )
 from okam_native.wakeup import WakeError, load_wake_credentials, wake_camera
+from Xlib import X as X11, Xutil, display as xdisplay
+from Xlib.protocol import event as xevent
 
 
-ROOT = Path(__file__).resolve().parent
-HELPER = ROOT / "bin" / "okam-amd64-connect"
+APPLICATION_NAME = "O-KAM Linux"
 WAKE_SOURCE = Path.home() / ".local/share/okam-linux/vendor/device_wakeup_server.dart"
+ICON_DIRECTORY = Path(__file__).resolve().parent / "assets/icons"
 MAX_ACCOUNT_RESPONSE_BYTES = 1024 * 1024
 SECRET_ATTRIBUTES = ("application", "okam-linux", "account")
-CAMERA_COMMANDS = {
-    "Left": (4, 1),
-    "Right": (6, 1),
-    "Up": (0, 1),
-    "Down": (2, 1),
-    "Preset 1": (31, 0),
-    "Preset 2": (33, 0),
-    "Preset 3": (35, 0),
-    "Preset 4": (37, 0),
-    "Preset 5": (39, 0),
-}
+MOTOR_COMMANDS = {"Left": (4, 5), "Right": (6, 7), "Up": (0, 1), "Down": (2, 3)}
+PRESET_COMMANDS = {f"Preset {index}": 29 + index * 2 for index in range(1, 6)}
 PTZ_RESPONSE_COMMAND = 0x6019
+MOTOR_PULSE_SECONDS = 0.12
+DRAG_PIXELS_PER_STEP = 90
+MAX_DRAG_STEPS = 4
+VIDEO_READ_TIMEOUT_SECONDS = 2
+VIDEO_STALL_SECONDS = 12
+AUDIO_RESPONSE_COMMAND = 0x6031
+RECONNECT_MAX_SECONDS = 30
+OVERLAY_TIMEOUT_MS = 5000
+MAX_ZOOM_LEVEL = 4
+MAX_MPV_RESPONSE_BYTES = 65536
+OVERLAY_COLOR = QColor(24, 24, 24, 170)
+OVERLAY_MAX_RADIUS = 32
+OVERLAY_MARGIN = 16
+VIDEO_ASPECT_WIDTH = 16
+VIDEO_ASPECT_HEIGHT = 9
+WM_NORMAL_HINTS_FIELDS = (
+    "flags",
+    "min_width",
+    "min_height",
+    "max_width",
+    "max_height",
+    "width_inc",
+    "height_inc",
+    "min_aspect",
+    "max_aspect",
+    "base_width",
+    "base_height",
+    "win_gravity",
+)
+NET_WM_STATE_ADD = 1
+NET_WM_SOURCE_APPLICATION = 1
+CAMERA_STATUS_PATH = "get_status.cgi?"
+TRANSPARENT_RESPONSE_COMMAND = 0x60D1
+CAMERA_CONTROL_RESPONSE_COMMAND = 0x6012
+WHITE_LIGHT_COMMAND = "2109"
+WHITE_LIGHT_SET_COMMAND = "0"
+WHITE_LIGHT_STATUS_COMMAND = "2"
+WHITE_LIGHT_OFF_STATUS = "0"
+WHITE_LIGHT_SET_PATH = "trans_cmd_string.cgi?cmd=2109&command=0&light={light}&"
+WHITE_LIGHT_STATUS_PATH = "trans_cmd_string.cgi?cmd=2109&command=2&"
+VIDEO_QUALITY_PATH = "camera_control.cgi?param=16&value={value}&"
+VIDEO_QUALITIES = {"Super HD": 100, "HD": 1, "SD": 2, "Low": 4}
+SUPER_HD_QUALITY = "Super HD"
+RESTART_REQUIRED_PIXELS = ("200", "300")
+DEFAULT_QUALITY_LABEL = "Auto"
+QUALITY_SETTING = "camera/quality"
+SETTING_LIGHT = "light"
+SETTING_QUALITY = "quality"
+SETTING_RESPONSE_SECONDS = 5
+RESPONSE_FIELD_PATTERN = re.compile(r'(?:var\s+)?(\w+)\s*=\s*"?([^";\r\n]*)"?\s*;')
+RAW_RECORDING_SUFFIX = ".h264"
+MIN_RECORDING_FRAMES = 2
+RECORDING_REMUX_TIMEOUT_SECONDS = 600
+RECORDING_TICK_MS = 1000
+RECORDING_DOT_COLOR = "#ff4d4d"
+
+
+def set_button_icon(button: QPushButton, name: str, label: str, size: int = 44) -> None:
+    button.setText("")
+    button.setIcon(QIcon(str(ICON_DIRECTORY / f"{name}.svg")))
+    button.setIconSize(QSize(28, 28))
+    button.setFixedSize(size, size)
+    button.setToolTip(label)
+    button.setAccessibleName(label)
+
+
+class X11WindowHints:
+    def __init__(self, window: QWidget, skip_taskbar: bool) -> None:
+        self.skip_taskbar = skip_taskbar
+        self.x_display = xdisplay.Display()
+        self.window = self.x_display.create_resource_object("window", int(window.winId()))
+        self.state_atom = self.x_display.intern_atom("_NET_WM_STATE")
+        self.skip_taskbar_atom = self.x_display.intern_atom("_NET_WM_STATE_SKIP_TASKBAR")
+        self.normal_hints_atom = self.x_display.intern_atom("WM_NORMAL_HINTS")
+        self.window.change_attributes(event_mask=X11.StructureNotifyMask | X11.PropertyChangeMask)
+        self.notifier = QSocketNotifier(self.x_display.fileno(), QSocketNotifier.Type.Read, window)
+        self.notifier.activated.connect(self.process_events)
+        self.apply_aspect_ratio()
+
+    def process_events(self) -> None:
+        while self.x_display.pending_events():
+            event = self.x_display.next_event()
+            if event.type == X11.MapNotify and self.skip_taskbar:
+                self.hide_taskbar_entry()
+            elif event.type == X11.PropertyNotify and event.atom == self.normal_hints_atom:
+                self.apply_aspect_ratio()
+
+    def hide_taskbar_entry(self) -> None:
+        self.x_display.screen().root.send_event(
+            xevent.ClientMessage(
+                window=self.window,
+                client_type=self.state_atom,
+                data=(32, [NET_WM_STATE_ADD, self.skip_taskbar_atom, 0, NET_WM_SOURCE_APPLICATION, 0]),
+            ),
+            event_mask=X11.SubstructureRedirectMask | X11.SubstructureNotifyMask,
+        )
+        self.x_display.flush()
+
+    def apply_aspect_ratio(self) -> None:
+        hints = self.window.get_wm_normal_hints()
+        aspect = {"num": VIDEO_ASPECT_WIDTH, "denum": VIDEO_ASPECT_HEIGHT}
+        if hints is None:
+            fields = {"flags": 0}
+        else:
+            fields = {field: getattr(hints, field) for field in WM_NORMAL_HINTS_FIELDS}
+            if (
+                hints.flags & Xutil.PAspect
+                and hints.min_aspect == aspect
+                and hints.max_aspect == aspect
+            ):
+                return
+        fields["flags"] |= Xutil.PAspect
+        fields["min_aspect"] = aspect
+        fields["max_aspect"] = aspect
+        self.window.set_wm_normal_hints(fields)
+        self.x_display.flush()
+
+    def close(self) -> None:
+        self.notifier.setEnabled(False)
+        self.x_display.close()
+
+
+def response_fields(payload: bytes) -> dict[str, str]:
+    return dict(RESPONSE_FIELD_PATTERN.findall(payload.decode("utf-8", "replace")))
+
+
+def read_response_fields(
+    session: CS2Session, command_id: int, expected: dict[str, str], timeout: float
+) -> dict[str, str] | None:
+    deadline = time.monotonic() + timeout
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            command, payload = read_command(session, timeout=remaining)
+        except CS2Timeout:
+            return None
+        if command != command_id:
+            continue
+        fields = response_fields(payload)
+        if parse_result(payload) == 0 and all(fields.get(key) == value for key, value in expected.items()):
+            return fields
+    return None
+
+
+def available_qualities(status: dict[str, str]) -> list[str]:
+    if not status or status.get("pixel") in RESTART_REQUIRED_PIXELS:
+        return []
+    qualities = list(VIDEO_QUALITIES)
+    if status.get("support_pixel_shift") != "1":
+        qualities.remove(SUPER_HD_QUALITY)
+    return qualities
+
+
+def white_light_path(enabled: bool) -> str:
+    return WHITE_LIGHT_SET_PATH.format(light=int(enabled))
+
+
+def video_quality_path(quality: str) -> str:
+    return VIDEO_QUALITY_PATH.format(value=VIDEO_QUALITIES[quality])
 
 
 def stored_secret(category: str, identifier: str) -> str | None:
@@ -156,9 +328,130 @@ class AccountWorker(QThread):
             self.password = ""
 
 
+class CameraFrameReader:
+    def __init__(self) -> None:
+        self.pending_frame: tuple[int, int] | None = None
+
+    def read(self, session: CS2Session) -> tuple[bytes, int]:
+        if self.pending_frame is None:
+            header = session.read_exact(1, 32, timeout=VIDEO_READ_TIMEOUT_SECONDS)
+            if header[:4] != b"\x55\xaa\x15\xa8":
+                raise CS2Error("camera video framing is invalid")
+            length = int.from_bytes(header[16:20], "little")
+            if not 0 < length <= MAX_FRAME_BYTES:
+                raise CS2Error("camera video frame is invalid")
+            self.pending_frame = (length, header[4])
+        frame = session.read_exact(1, self.pending_frame[0], timeout=VIDEO_READ_TIMEOUT_SECONDS)
+        frame_type = self.pending_frame[1]
+        self.pending_frame = None
+        return frame, frame_type
+
+
+class VideoRecorder:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.raw_path = path.with_name(path.name + RAW_RECORDING_SUFFIX)
+        self.raw_file: BinaryIO | None = None
+        self.frames = 0
+        self.first_frame_time = 0.0
+        self.last_frame_time = 0.0
+
+    @property
+    def started(self) -> bool:
+        return self.raw_file is not None
+
+    def write(self, frame: bytes, keyframe: bool, now: float) -> bool:
+        if self.raw_file is None:
+            if not keyframe:
+                return False
+            self.raw_file = self.raw_path.open("xb")
+            self.first_frame_time = now
+        self.raw_file.write(frame)
+        self.frames += 1
+        self.last_frame_time = now
+        return True
+
+    def frame_rate(self) -> float:
+        duration = self.last_frame_time - self.first_frame_time
+        return (self.frames - 1) / duration
+
+    def finish(self) -> Path:
+        if self.raw_file is None:
+            raise OSError("No video was recorded.")
+        self.raw_file.close()
+        try:
+            if self.frames < MIN_RECORDING_FRAMES or self.last_frame_time <= self.first_frame_time:
+                raise OSError("The recording is too short.")
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-loglevel",
+                    "error",
+                    "-fflags",
+                    "+genpts",
+                    "-framerate",
+                    f"{self.frame_rate():.3f}",
+                    "-f",
+                    "h264",
+                    "-i",
+                    str(self.raw_path),
+                    "-c:v",
+                    "copy",
+                    "-f",
+                    "matroska",
+                    str(self.path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=RECORDING_REMUX_TIMEOUT_SECONDS,
+                check=False,
+            )
+            if result.returncode != 0 or not self.path.is_file() or self.path.stat().st_size == 0:
+                self.path.unlink(missing_ok=True)
+                raise OSError(result.stderr.decode("utf-8", "replace").strip() or "ffmpeg failed.")
+        except subprocess.TimeoutExpired:
+            self.path.unlink(missing_ok=True)
+            raise OSError("ffmpeg did not finish the recording.") from None
+        finally:
+            self.raw_path.unlink(missing_ok=True)
+        return self.path
+
+
+class ControlsOverlay(QWidget):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(
+            parent,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+    def paintEvent(self, event: object) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(OVERLAY_COLOR)
+        radius = min(self.height() / 2, OVERLAY_MAX_RADIUS)
+        painter.drawRoundedRect(self.rect(), radius, radius)
+        painter.end()
+
+
 class StreamWorker(QThread):
     status_changed = pyqtSignal(str)
     failed = pyqtSignal(str)
+    control_completed = pyqtSignal(str)
+    control_failed = pyqtSignal(str)
+    sound_changed = pyqtSignal(bool)
+    sound_failed = pyqtSignal(str)
+    recording_started = pyqtSignal()
+    recording_saved = pyqtSignal(str)
+    recording_failed = pyqtSignal(str)
+    capabilities_found = pyqtSignal(list, object)
+    setting_completed = pyqtSignal(str, object)
+    setting_failed = pyqtSignal(str, str)
 
     def __init__(self, device: AccountDevice, camera_password: str, player_input: BinaryIO) -> None:
         super().__init__()
@@ -166,36 +459,57 @@ class StreamWorker(QThread):
         self.camera_password = camera_password
         self.player_input = player_input
         self.stop_requested = threading.Event()
-        self.helper: subprocess.Popen[bytes] | None = None
+        self.controls: queue.Queue[tuple[str, ...]] = queue.Queue(maxsize=1)
+        self.settings: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+        self.sound_requested = threading.Event()
+        self.sound_active = False
+        self.audio_player: subprocess.Popen[bytes] | None = None
+        self.recording_request: Path | None = None
+        self.recorder: VideoRecorder | None = None
+
+    def queue_setting(self, name: str, value: object) -> bool:
+        try:
+            self.settings.put_nowait((name, value))
+            return True
+        except queue.Full:
+            return False
+
+    def set_recording(self, path: Path | None) -> None:
+        self.recording_request = path
 
     def stop(self) -> None:
         self.stop_requested.set()
-        if self.helper is not None and self.helper.poll() is None:
-            self.helper.send_signal(signal.SIGINT)
 
-    def force_stop(self) -> None:
-        self.stop_requested.set()
-        if self.helper is not None and self.helper.poll() is None:
-            self.helper.kill()
+    def queue_control(self, commands: tuple[str, ...]) -> bool:
+        try:
+            self.controls.put_nowait(commands)
+            return True
+        except queue.Full:
+            return False
+
+    def set_sound(self, enabled: bool) -> None:
+        if enabled:
+            self.sound_requested.set()
+        else:
+            self.sound_requested.clear()
 
     def run(self) -> None:
         try:
             self._stream()
-        except (OSError, P2PError, WakeError) as ex:
+        except CameraLoginRejected:
             if not self.stop_requested.is_set():
-                self.failed.emit(str(ex))
-        except Exception:
+                self.failed.emit("The camera rejected the available credentials.")
+        except (OSError, CS2Error, P2PError, WakeError) as ex:
             if not self.stop_requested.is_set():
+                print(f"Camera stream error: {type(ex).__name__}: {ex}", file=sys.stderr, flush=True)
+                message = str(ex) if isinstance(ex, (CS2Error, P2PError, WakeError)) else "Camera connection failed."
+                self.failed.emit(message)
+        except Exception as ex:
+            if not self.stop_requested.is_set():
+                print(f"Camera stream error: {type(ex).__name__}: {ex}", file=sys.stderr, flush=True)
                 self.failed.emit("Unable to start the camera stream.")
         finally:
             self.camera_password = ""
-            if self.helper is not None and self.helper.poll() is None:
-                self.helper.terminate()
-                try:
-                    self.helper.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self.helper.kill()
-                    self.helper.wait(timeout=3)
 
     def _stream(self) -> None:
         credentials = load_wake_credentials(WAKE_SOURCE)
@@ -215,108 +529,479 @@ class StreamWorker(QThread):
             return
         self.status_changed.emit("Connecting to camera...")
         password = select_camera_password(self.device.device_password, self.camera_password)
-        environment = os.environ.copy()
-        environment["PATH"] = str(Path(sys.executable).parent) + os.pathsep + environment.get("PATH", "")
-        self.helper = open_stream_process(
-            str(HELPER),
-            "/dev/null",
-            client_id,
-            service_parameter,
-            password,
-            environment=environment,
-        )
-        assert self.helper.stdout is not None
-        assert self.helper.stderr is not None
-        received_video = False
+        session = CS2Session(client_id, service_parameter)
+        stream_started = False
         try:
+            session.connect(timeout=55)
+            if self.stop_requested.is_set():
+                return
+            login = authenticate_camera(session, password)
+            self._read_capabilities(session, login.user, login.password)
+            write_command(
+                session,
+                make_cgi_request(
+                    "livestream.cgi?streamid=10&substream=2&", login.user, login.password
+                ),
+            )
+            stream_started = True
+            response = read_command_result(session, LIVE_STREAM_RESPONSE_COMMANDS, timeout=10)
+            if response is not None and response[1] != 0:
+                raise P2PError("The camera rejected the live stream request.")
+            received_video = False
+            last_video = time.monotonic()
+            frame_reader = CameraFrameReader()
             while not self.stop_requested.is_set():
-                chunk = self.helper.stdout.read(32 * 1024)
-                if not chunk:
-                    break
+                self._process_control(session, login.user, login.password)
+                self._process_setting(session, login.user, login.password)
+                self._update_sound(session, login.user, login.password)
+                try:
+                    frame, frame_type = frame_reader.read(session)
+                except CS2Timeout:
+                    if time.monotonic() - last_video >= VIDEO_STALL_SECONDS:
+                        raise P2PError("The camera stopped sending video.") from None
+                    continue
+                if frame_type == 12:
+                    self._play_audio(frame)
+                    continue
+                if frame_type in (0x10, 0x11):
+                    continue
+                valid, keyframe = inspect_h264(frame)
+                if not valid:
+                    continue
+                last_video = time.monotonic()
+                self._record_frame(frame, keyframe, last_video)
                 if not received_video:
                     received_video = True
                     self.status_changed.emit("Live video")
-                self.player_input.write(chunk)
-        except BrokenPipeError:
-            if not self.stop_requested.is_set():
-                raise P2PError("The video player stopped unexpectedly.") from None
-        if self.stop_requested.is_set():
-            return
-        result = self.helper.wait(timeout=5)
-        summary = self.helper.stderr.read(64 * 1024)
-        try:
-            details = json.loads(summary.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError):
-            details = {}
-        if result == 5:
-            attempts = details.get("login_attempts")
-            if isinstance(attempts, list) and any(isinstance(item, int) for item in attempts):
-                raise P2PError("The camera rejected the available credentials.")
-            raise P2PError("The camera did not answer authentication. Retry after it wakes.")
-        if not received_video:
-            raise P2PError("The camera did not provide live video.")
-        if result != 0:
-            raise P2PError("The camera stream ended unexpectedly.")
-
-
-class ControlWorker(QThread):
-    completed = pyqtSignal(str)
-    failed = pyqtSignal(str)
-
-    def __init__(self, device: AccountDevice, command: str) -> None:
-        super().__init__()
-        self.device = device
-        self.command = command
-
-    def run(self) -> None:
-        session: CS2Session | None = None
-        try:
-            password = stored_camera_password(self.device.uid)
-            if not password:
-                raise CS2Error("The camera credential is unavailable.")
-            client_id = resolve_client_id(self.device.uid)
-            session = CS2Session(client_id, get_service_parameter(client_id))
-            session.connect(timeout=30)
-            value, one_step = CAMERA_COMMANDS[self.command]
-            path = f"decoder_control.cgi?command={value}&onestep={one_step}&"
-            write_command(session, make_cgi_request(path, "admin", password))
-            response = read_command_result(session, (PTZ_RESPONSE_COMMAND,), timeout=10)
-            if response is None or response[1] != 0:
-                raise CS2Error("The camera rejected the movement command.")
-            self.completed.emit(self.command)
-        except (CS2Error, P2PError, OSError):
-            self.failed.emit("Camera movement failed.")
+                try:
+                    self.player_input.write(frame)
+                except BrokenPipeError:
+                    raise P2PError("The video player stopped unexpectedly.") from None
         finally:
-            if session is not None:
-                session.close()
+            if self.sound_active:
+                try:
+                    self._send_sound_command(session, login.user, login.password, False)
+                except CS2Error:
+                    pass
+            self._close_audio_player()
+            self.recording_request = None
+            self._finish_recording()
+            if stream_started:
+                try:
+                    write_command(
+                        session,
+                        make_cgi_request(
+                            "livestream.cgi?streamid=16&substream=0&", login.user, login.password
+                        ),
+                    )
+                except CS2Error:
+                    pass
+            session.close()
+
+    def _read_capabilities(self, session: CS2Session, user: str, password: str) -> None:
+        write_command(session, make_cgi_request(CAMERA_STATUS_PATH, user, password))
+        status = read_response_fields(session, LOGIN_RESPONSE_COMMAND, {}, SETTING_RESPONSE_SECONDS) or {}
+        write_command(session, make_cgi_request(WHITE_LIGHT_STATUS_PATH, user, password))
+        light = read_response_fields(
+            session,
+            TRANSPARENT_RESPONSE_COMMAND,
+            {"cmd": WHITE_LIGHT_COMMAND, "command": WHITE_LIGHT_STATUS_COMMAND},
+            SETTING_RESPONSE_SECONDS,
+        )
+        light_on = None
+        if light is not None and "lightStatus" in light and status.get("support_manual_light", "1") == "1":
+            light_on = light["lightStatus"] != WHITE_LIGHT_OFF_STATUS
+        self.capabilities_found.emit(available_qualities(status), light_on)
+
+    def _process_setting(self, session: CS2Session, user: str, password: str) -> None:
+        try:
+            name, value = self.settings.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            if name == SETTING_LIGHT:
+                write_command(session, make_cgi_request(white_light_path(bool(value)), user, password))
+                accepted = (
+                    read_response_fields(
+                        session,
+                        TRANSPARENT_RESPONSE_COMMAND,
+                        {"cmd": WHITE_LIGHT_COMMAND, "command": WHITE_LIGHT_SET_COMMAND},
+                        SETTING_RESPONSE_SECONDS,
+                    )
+                    is not None
+                )
+            else:
+                write_command(session, make_cgi_request(video_quality_path(str(value)), user, password))
+                response = read_command_result(
+                    session, (CAMERA_CONTROL_RESPONSE_COMMAND,), timeout=SETTING_RESPONSE_SECONDS
+                )
+                accepted = response is not None and response[1] == 0
+        except (CS2Error, OSError):
+            accepted = False
+        if accepted:
+            self.setting_completed.emit(name, value)
+        elif not self.stop_requested.is_set():
+            self.setting_failed.emit(name, "The camera rejected the setting.")
+
+    def _record_frame(self, frame: bytes, keyframe: bool, now: float) -> None:
+        if self.recorder is not None and self.recorder.path != self.recording_request:
+            self._finish_recording()
+        if self.recorder is None and self.recording_request is not None:
+            self.recorder = VideoRecorder(self.recording_request)
+        if self.recorder is None:
+            return
+        was_started = self.recorder.started
+        try:
+            if self.recorder.write(frame, keyframe, now) and not was_started:
+                self.recording_started.emit()
+        except OSError:
+            self.recording_request = None
+            if self.recorder.started:
+                self._finish_recording()
+            else:
+                self.recorder = None
+                self.recording_failed.emit("Unable to write the recording.")
+
+    def _finish_recording(self) -> None:
+        recorder = self.recorder
+        self.recorder = None
+        if recorder is None:
+            return
+        if not recorder.started:
+            self.recording_failed.emit("Recording stopped before any video arrived.")
+            return
+        threading.Thread(target=self._save_recording, args=(recorder,)).start()
+
+    def _save_recording(self, recorder: VideoRecorder) -> None:
+        try:
+            self.recording_saved.emit(str(recorder.finish()))
+        except OSError as ex:
+            print(f"Recording error: {ex}", file=sys.stderr, flush=True)
+            self.recording_failed.emit("Unable to save the recording.")
+
+    def _send_sound_command(
+        self, session: CS2Session, user: str, password: str, enabled: bool
+    ) -> None:
+        stream_id = 7 if enabled else 16
+        path = f"audiostream.cgi?streamid={stream_id}&"
+        write_command(session, make_cgi_request(path, user, password))
+        response = read_command_result(session, (AUDIO_RESPONSE_COMMAND,), timeout=5)
+        if response is None or response[1] != 0:
+            raise CS2Error("The camera rejected the sound request.")
+
+    def _update_sound(self, session: CS2Session, user: str, password: str) -> None:
+        enabled = self.sound_requested.is_set()
+        if enabled == self.sound_active:
+            return
+        if enabled:
+            sound_started = False
+            try:
+                self._send_sound_command(session, user, password, True)
+                sound_started = True
+                self.audio_player = subprocess.Popen(
+                    [
+                        "ffplay",
+                        "-nodisp",
+                        "-loglevel",
+                        "error",
+                        "-f",
+                        "alaw",
+                        "-ar",
+                        "8000",
+                        "-ac",
+                        "1",
+                        "-i",
+                        "pipe:0",
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self.sound_active = True
+                self.sound_changed.emit(True)
+            except (CS2Error, OSError):
+                self.sound_requested.clear()
+                if sound_started:
+                    try:
+                        self._send_sound_command(session, user, password, False)
+                    except CS2Error:
+                        pass
+                self._close_audio_player()
+                self.sound_failed.emit("Camera sound is unavailable.")
+        else:
+            try:
+                self._send_sound_command(session, user, password, False)
+            except CS2Error:
+                self.sound_failed.emit("The camera did not acknowledge sound stop.")
+            self.sound_active = False
+            self._close_audio_player()
+            self.sound_changed.emit(False)
+
+    def _play_audio(self, frame: bytes) -> None:
+        if not self.sound_active or self.audio_player is None or self.audio_player.stdin is None:
+            return
+        try:
+            self.audio_player.stdin.write(frame)
+        except (BrokenPipeError, OSError):
+            self.sound_requested.clear()
+            self.sound_failed.emit("The audio player stopped unexpectedly.")
+
+    def _close_audio_player(self) -> None:
+        if self.audio_player is None:
+            return
+        if self.audio_player.stdin is not None:
+            try:
+                self.audio_player.stdin.close()
+            except OSError:
+                pass
+        if self.audio_player.poll() is None:
+            self.audio_player.terminate()
+            try:
+                self.audio_player.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.audio_player.kill()
+                self.audio_player.wait(timeout=2)
+        self.audio_player = None
+
+    def _process_control(self, session: CS2Session, user: str, password: str) -> None:
+        try:
+            commands = self.controls.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            for command in commands:
+                if self.stop_requested.is_set():
+                    break
+                if command in MOTOR_COMMANDS:
+                    self._move_one_step(session, user, password, command)
+                else:
+                    self._send_command(session, user, password, PRESET_COMMANDS[command])
+                    self._require_control_response(session)
+            if not self.stop_requested.is_set():
+                self.control_completed.emit(commands[0] if len(commands) == 1 else "Drag")
+        except (CS2Error, OSError):
+            if not self.stop_requested.is_set():
+                self.control_failed.emit("Camera movement failed.")
+
+    def _send_command(self, session: CS2Session, user: str, password: str, value: int) -> None:
+        path = f"decoder_control.cgi?command={value}&onestep=0&"
+        write_command(session, make_cgi_request(path, user, password))
+
+    def _require_control_response(self, session: CS2Session) -> None:
+        response = read_command_result(session, (PTZ_RESPONSE_COMMAND,), timeout=5)
+        if response is None or response[1] != 0:
+            raise CS2Error("The camera rejected the movement command.")
+
+    def _move_one_step(
+        self, session: CS2Session, user: str, password: str, direction: str
+    ) -> None:
+        start, stop = MOTOR_COMMANDS[direction]
+        self._send_command(session, user, password, start)
+        try:
+            time.sleep(MOTOR_PULSE_SECONDS)
+        finally:
+            self._send_command(session, user, password, stop)
+        self._require_control_response(session)
+        self._require_control_response(session)
+
+
+class VideoWidget(QWidget):
+    clicked = pyqtSignal()
+    dragged = pyqtSignal(int, int)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.drag_start: tuple[int, int] | None = None
+        self.controls_overlay: QWidget | None = None
+        self.recording_badge: QWidget | None = None
+        self.x_display = xdisplay.Display() if QApplication.platformName() == "xcb" else None
+        self.input_window = None
+        self.input_timer = QTimer(self)
+        self.input_timer.timeout.connect(self.read_mouse_events)
+        if self.x_display is not None:
+            self.input_timer.start(20)
+
+    def set_recording_badge(self, badge: QWidget) -> None:
+        self.recording_badge = badge
+
+    def set_controls_overlay(self, overlay: QWidget) -> None:
+        self.controls_overlay = overlay
+        if self.x_display is None:
+            self.place_overlay()
+            return
+        parent = self.x_display.create_resource_object("window", int(self.winId()))
+        parent.change_attributes(event_mask=X11.SubstructureNotifyMask)
+        self.input_window = parent.create_window(
+            0,
+            0,
+            self.width(),
+            self.height(),
+            0,
+            0,
+            X11.InputOnly,
+            X11.CopyFromParent,
+            event_mask=X11.ButtonPressMask | X11.ButtonReleaseMask | X11.PointerMotionMask,
+        )
+        self.input_window.map()
+        self.place_overlay()
+
+    def raise_interaction_layer(self) -> None:
+        if self.input_window is not None:
+            self.input_window.configure(stack_mode=X11.Above)
+        for overlay in (self.controls_overlay, self.recording_badge):
+            if overlay is not None and overlay.isVisible():
+                overlay.raise_()
+        if self.x_display is not None:
+            self.x_display.flush()
+
+    def place_overlay(self) -> None:
+        if self.recording_badge is not None:
+            badge_size = self.recording_badge.sizeHint()
+            self.recording_badge.setGeometry(
+                QRect(
+                    self.mapToGlobal(QPoint((self.width() - badge_size.width()) // 2, OVERLAY_MARGIN)),
+                    badge_size,
+                )
+            )
+        if self.controls_overlay is None:
+            return
+        height = self.controls_overlay.sizeHint().height()
+        width = min(max(0, self.width() - 2 * OVERLAY_MARGIN), self.controls_overlay.sizeHint().width())
+        position = self.mapToGlobal(
+            QPoint(
+                (self.width() - width) // 2,
+                max(OVERLAY_MARGIN, self.height() - height - OVERLAY_MARGIN),
+            )
+        )
+        self.controls_overlay.setGeometry(QRect(position, QSize(width, height)))
+        self.raise_interaction_layer()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if self.input_window is not None:
+            self.input_window.configure(width=self.width(), height=self.height())
+            self.x_display.flush()
+        self.place_overlay()
+
+    def _finish_drag(self, x: int, y: int) -> None:
+        if self.drag_start is None:
+            return
+        dx = x - self.drag_start[0]
+        dy = y - self.drag_start[1]
+        self.drag_start = None
+        if abs(dx) < DRAG_PIXELS_PER_STEP // 2 and abs(dy) < DRAG_PIXELS_PER_STEP // 2:
+            self.clicked.emit()
+        else:
+            self.dragged.emit(dx, dy)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_start = (round(event.position().x()), round(event.position().y()))
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._finish_drag(round(event.position().x()), round(event.position().y()))
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def read_mouse_events(self) -> None:
+        if self.x_display is None:
+            return
+        while self.x_display.pending_events():
+            event = self.x_display.next_event()
+            if self.input_window is None:
+                continue
+            if event.type == X11.MapNotify and event.window != self.input_window:
+                self.raise_interaction_layer()
+                continue
+            if event.type not in (X11.ButtonPress, X11.ButtonRelease):
+                continue
+            if event.type == X11.ButtonPress and event.detail == 1:
+                self.drag_start = (event.event_x, event.event_y)
+            elif event.type == X11.ButtonRelease and event.detail == 1 and self.drag_start is not None:
+                self._finish_drag(event.event_x, event.event_y)
+
+    def closeEvent(self, event: object) -> None:
+        self.input_timer.stop()
+        if self.x_display is not None:
+            self.x_display.close()
+        super().closeEvent(event)
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("O-KAM Linux")
-        self.resize(980, 750)
+        self.setWindowTitle(APPLICATION_NAME)
+        self.setWindowIcon(QIcon(str(ICON_DIRECTORY / "app.svg")))
+        self.resize(980, 590)
+        self.quit_requested = False
+        self.status_text = ""
+        self.aspect_fitted = False
+        self.tray: QSystemTrayIcon | None = None
+        self.tray_actions: list[tuple[QAction, QPushButton]] = []
+        self.window_hints: X11WindowHints | None = None
+        self.normal_geometry: QRect | None = None
         self.devices: list[AccountDevice] = []
         self.account_worker: AccountWorker | None = None
         self.stream_worker: StreamWorker | None = None
-        self.control_worker: ControlWorker | None = None
+        self.control_pending = False
         self.player: subprocess.Popen[bytes] | None = None
+        self.mpv_directory: tempfile.TemporaryDirectory[str] | None = None
+        self.mpv_socket: Path | None = None
+        self.recording_path: Path | None = None
+        self.light_on: bool | None = None
+        self.setting_pending = False
+        self.recording_started_at: float | None = None
+        self.recording_timer = QTimer(self)
+        self.recording_timer.timeout.connect(self.update_recording_badge)
+        self.zoom_level = 0
         self.close_pending = False
         self.stream_error = False
         self.stream_live = False
-        self.settings = QSettings("O-KAM Linux", "O-KAM Linux")
+        self.sound_enabled = False
+        self.retry_pending = False
+        self.reconnect_attempts = 0
+        self.reconnect_timer = QTimer(self)
+        self.reconnect_timer.setSingleShot(True)
+        self.reconnect_timer.timeout.connect(self.watch_live)
+        self.overlay_timer = QTimer(self)
+        self.overlay_timer.setSingleShot(True)
+        self.overlay_timer.timeout.connect(self.hide_overlay)
+        self.settings = QSettings(APPLICATION_NAME, APPLICATION_NAME)
         self.account_username = self.settings.value("account/username", "", str)
         self.account_secret = (
             stored_account_password(self.account_username) if self.account_username else None
         )
         body = QWidget()
         layout = QVBoxLayout(body)
-        self.video = QWidget()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.video = VideoWidget()
         self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
-        self.video.setMinimumSize(640, 400)
+        self.video.setMinimumSize(640, 360)
         self.video.setStyleSheet("background-color: #171717;")
+        self.video.clicked.connect(self.toggle_overlay)
+        self.video.dragged.connect(self.move_by_drag)
         layout.addWidget(self.video, 1)
+        self.overlay = ControlsOverlay(self.video)
+        self.overlay.setObjectName("cameraControls")
+        self.overlay.setStyleSheet(
+            "#cameraControls QPushButton { color: white; background-color: transparent;"
+            " border: none; border-radius: 6px; padding: 4px; }"
+            "#cameraControls QPushButton:hover { background-color: rgba(255, 255, 255, 35); }"
+            "#cameraControls #qualityButton { border: 2px solid white; border-radius: 8px;"
+            " font-weight: 600; margin: 6px 2px; }"
+            "#cameraControls QPushButton:disabled { color: rgba(255, 255, 255, 90);"
+            " border-color: rgba(255, 255, 255, 90); }"
+        )
+        overlay_layout = QVBoxLayout(self.overlay)
+        overlay_layout.setContentsMargins(24, 10, 24, 10)
         controls = QHBoxLayout()
+        controls.setSpacing(12)
+        controls.addStretch(1)
         self.find_button = QPushButton("Reconnect")
         self.watch_button = QPushButton("Watch live")
         self.stop_button = QPushButton("Stop")
@@ -325,40 +1010,209 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.watch_button)
         controls.addWidget(self.stop_button)
         controls.addWidget(self.find_button)
+        self.quality_menu = QMenu(self)
+        self.quality_group = QActionGroup(self)
+        self.quality_actions: dict[str, QAction] = {}
+        for quality in VIDEO_QUALITIES:
+            action = self.quality_menu.addAction(quality)
+            action.setCheckable(True)
+            action.setChecked(quality == self.settings.value(QUALITY_SETTING, "", str))
+            action.setVisible(False)
+            action.triggered.connect(lambda checked=False, value=quality: self.choose_quality(value))
+            self.quality_group.addAction(action)
+            self.quality_actions[quality] = action
+        self.quality_button = QPushButton(self.quality_label())
+        self.quality_button.setObjectName("qualityButton")
+        self.quality_button.setFixedSize(56, 44)
+        self.quality_button.setEnabled(False)
+        self.quality_button.hide()
+        self.quality_button.clicked.connect(self.show_quality_menu)
+        controls.addWidget(self.quality_button)
+        self.snapshot_button = QPushButton("Photo")
+        self.snapshot_button.setToolTip("Save a picture of the live video")
+        self.snapshot_button.setEnabled(False)
+        self.snapshot_button.clicked.connect(self.take_snapshot)
+        controls.addWidget(self.snapshot_button)
+        self.record_button = QPushButton("Record")
+        self.record_button.setToolTip("Record the live video locally")
+        self.record_button.setEnabled(False)
+        self.record_button.clicked.connect(self.toggle_recording)
+        controls.addWidget(self.record_button)
+        self.sound_button = QPushButton("Sound")
+        self.sound_button.setEnabled(False)
+        self.sound_button.clicked.connect(self.toggle_sound)
+        controls.addWidget(self.sound_button)
+        self.light_button = QPushButton("Light")
+        self.light_button.setEnabled(False)
+        self.light_button.hide()
+        self.light_button.clicked.connect(self.toggle_light)
+        controls.addWidget(self.light_button)
+        self.zoom_out_button = QPushButton("−")
+        self.zoom_out_button.setToolTip("Zoom out")
+        self.zoom_out_button.setEnabled(False)
+        self.zoom_out_button.clicked.connect(lambda: self.change_zoom(-1))
+        controls.addWidget(self.zoom_out_button)
+        self.zoom_in_button = QPushButton("+")
+        self.zoom_in_button.setToolTip("Zoom in")
+        self.zoom_in_button.setEnabled(False)
+        self.zoom_in_button.clicked.connect(lambda: self.change_zoom(1))
+        controls.addWidget(self.zoom_in_button)
+        self.ptz_button = QPushButton("PTZ")
+        self.ptz_button.clicked.connect(self.toggle_ptz_panel)
+        controls.addWidget(self.ptz_button)
         self.fullscreen_button = QPushButton("Full screen")
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         controls.addWidget(self.fullscreen_button)
-        layout.addLayout(controls)
+        controls.addStretch(1)
+        for button, icon_name, label in (
+            (self.watch_button, "play", "Watch live"),
+            (self.stop_button, "stop", "Stop video"),
+            (self.find_button, "reconnect", "Reconnect camera"),
+            (self.snapshot_button, "photo", "Save picture"),
+            (self.record_button, "record", "Record video"),
+            (self.sound_button, "sound", "Listen to camera"),
+            (self.light_button, "light", "Turn white light on"),
+            (self.zoom_out_button, "zoom_out", "Zoom out"),
+            (self.zoom_in_button, "zoom_in", "Zoom in"),
+            (self.ptz_button, "ptz", "Pan and tilt controls"),
+            (self.fullscreen_button, "fullscreen", "Full screen"),
+        ):
+            set_button_icon(button, icon_name, label)
+        overlay_layout.addLayout(controls)
+        self.ptz_panel = QWidget(self.overlay)
+        ptz_layout = QVBoxLayout(self.ptz_panel)
+        ptz_layout.setContentsMargins(0, 0, 0, 0)
         movement = QHBoxLayout()
         self.camera_buttons: list[QPushButton] = []
-        directions = (("Left", "←"), ("Right", "→"), ("Up", "↑"), ("Down", "↓"))
-        for direction, label in directions:
-            button = QPushButton(label)
-            button.setToolTip(f"Move camera {direction.lower()}")
+        directions = ("Left", "Right", "Up", "Down")
+        for direction in directions:
+            button = QPushButton()
+            set_button_icon(button, direction.lower(), f"Move camera {direction.lower()}", 40)
             button.setEnabled(False)
-            button.clicked.connect(lambda checked=False, value=direction: self.control_camera(value))
+            button.clicked.connect(lambda checked=False, value=direction: self.control_camera((value,)))
             movement.addWidget(button)
             self.camera_buttons.append(button)
-        layout.addLayout(movement)
+        ptz_layout.addLayout(movement)
         presets = QHBoxLayout()
         for index in range(1, 6):
             label = f"Preset {index}"
-            button = QPushButton(label)
+            button = QPushButton()
+            set_button_icon(button, f"preset_{index}", f"Go to {label.lower()}", 40)
             button.setEnabled(False)
-            button.clicked.connect(lambda checked=False, value=label: self.control_camera(value))
+            button.clicked.connect(lambda checked=False, value=label: self.control_camera((value,)))
             presets.addWidget(button)
             self.camera_buttons.append(button)
-        layout.addLayout(presets)
-        self.status = QLabel("Connecting to camera...")
-        layout.addWidget(self.status)
+        ptz_layout.addLayout(presets)
+        overlay_layout.addWidget(self.ptz_panel)
+        self.ptz_panel.hide()
+        self.recording_badge = ControlsOverlay(self.video)
+        badge_layout = QHBoxLayout(self.recording_badge)
+        badge_layout.setContentsMargins(16, 6, 16, 6)
+        self.recording_label = QLabel()
+        self.recording_label.setStyleSheet("color: white; font-weight: 600;")
+        self.recording_label.setAccessibleName("Recording duration")
+        badge_layout.addWidget(self.recording_label)
+        self.video.set_recording_badge(self.recording_badge)
+        self.video.set_controls_overlay(self.overlay)
+        for button in self.overlay.findChildren(QPushButton):
+            button.clicked.connect(self.show_overlay)
         self.setCentralWidget(body)
         self.find_button.clicked.connect(self.find_cameras)
         self.watch_button.clicked.connect(self.watch_live)
         self.stop_button.clicked.connect(self.stop_stream)
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.create_tray()
+        if QApplication.platformName() == "xcb":
+            self.window_hints = X11WindowHints(self, self.tray is not None)
+        self.set_status("Connecting to camera...")
         if self.account_username and self.account_secret:
             QTimer.singleShot(0, self.find_cameras)
         else:
             QTimer.singleShot(0, self.change_account)
+
+    def set_status(self, text: str) -> None:
+        self.status_text = text
+        self.setWindowTitle(f"{APPLICATION_NAME} \u00b7 {text}")
+        if self.tray is not None:
+            self.tray.setToolTip(f"{APPLICATION_NAME}\n{text}")
+
+    def create_tray(self) -> None:
+        QApplication.setQuitOnLastWindowClosed(False)
+        menu = QMenu(self)
+        self.window_action = menu.addAction("Hide window")
+        self.window_action.triggered.connect(self.toggle_window)
+        menu.addSeparator()
+        for button in (
+            self.watch_button,
+            self.stop_button,
+            self.find_button,
+            None,
+            self.snapshot_button,
+            self.record_button,
+            self.sound_button,
+            self.light_button,
+            self.zoom_in_button,
+            self.zoom_out_button,
+            self.fullscreen_button,
+        ):
+            if button is None:
+                menu.addSeparator()
+            else:
+                self.add_tray_action(menu, button)
+        self.quality_menu.setTitle("Video quality")
+        menu.addMenu(self.quality_menu)
+        self.quality_menu.menuAction().setVisible(False)
+        movement = menu.addMenu("Move camera")
+        for button in self.camera_buttons:
+            self.add_tray_action(movement, button)
+        menu.addSeparator()
+        quit_action = menu.addAction("Quit")
+        quit_action.triggered.connect(self.quit_application)
+        menu.aboutToShow.connect(self.update_tray_menu)
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip(f"{APPLICATION_NAME}\n{self.status_text}")
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self.on_tray_activated)
+        self.tray.show()
+
+    def add_tray_action(self, menu: QMenu, button: QPushButton) -> None:
+        action = menu.addAction(button.icon(), button.toolTip())
+        action.triggered.connect(button.click)
+        self.tray_actions.append((action, button))
+
+    def update_tray_menu(self) -> None:
+        self.window_action.setText("Hide window" if self.isVisible() else "Show window")
+        for action, button in self.tray_actions:
+            action.setIcon(button.icon())
+            action.setText(button.toolTip())
+            action.setEnabled(button.isEnabled() and self.isVisible())
+            action.setVisible(not button.isHidden())
+        self.quality_menu.setEnabled(self.quality_button.isEnabled() and self.isVisible())
+
+    def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.toggle_window()
+
+    def toggle_window(self) -> None:
+        if self.isVisible() and not self.isMinimized():
+            self.hide_to_tray()
+            return
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        if self.stream_worker is None and self.account_worker is None and self.devices:
+            self.watch_live()
+
+    def hide_to_tray(self) -> None:
+        self.stop_stream()
+        self.overlay_timer.stop()
+        self.hide_overlay()
+        self.hide()
+        self.update_recording_badge()
+
+    def quit_application(self) -> None:
+        self.quit_requested = True
+        self.close()
 
     def change_account(self) -> None:
         dialog = QDialog(self)
@@ -381,7 +1235,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         if not username.text().strip() or not password.text():
-            self.status.setText("Enter your O-KAM account and password.")
+            self.set_status("Enter your O-KAM account and password.")
             return
         self.account_username = username.text().strip()
         self.account_secret = password.text()
@@ -391,13 +1245,15 @@ class MainWindow(QMainWindow):
         if not self.account_username or not self.account_secret:
             self.change_account()
             return
+        self.reconnect_timer.stop()
+        self.retry_pending = False
         self.devices = []
         self.watch_button.setEnabled(False)
         self.find_button.setEnabled(False)
-        self.status.setText("Finding cameras...")
+        self.set_status("Finding cameras...")
         self.account_worker = AccountWorker(self.account_username, self.account_secret)
         self.account_worker.devices_found.connect(self.on_devices_found)
-        self.account_worker.failed.connect(self.status.setText)
+        self.account_worker.failed.connect(self.set_status)
         self.account_worker.finished.connect(self.on_account_finished)
         self.account_worker.start()
 
@@ -405,7 +1261,7 @@ class MainWindow(QMainWindow):
         self.devices = devices
         saved_username = self.settings.value("account/username", "", str)
         if not save_account_password(self.account_username, self.account_secret):
-            self.status.setText("The keyring could not save the account.")
+            self.set_status("The keyring could not save the account.")
         else:
             if saved_username and saved_username != self.account_username:
                 clear_account_password(saved_username)
@@ -414,27 +1270,31 @@ class MainWindow(QMainWindow):
         self.watch_button.setEnabled(bool(devices))
         if devices:
             self.selected_device = next((device for device in devices if device.name == "Jardin"), devices[0])
-            if not self.status.text().startswith("The keyring could not"):
+            if not self.status_text.startswith("The keyring could not"):
                 credential_status = (
                     "O-KAM supplied a camera credential."
                     if self.selected_device.device_password
                     else "O-KAM supplied no camera credential."
                 )
-                self.status.setText(f"Found {len(devices)} camera(s). {credential_status}")
+                self.set_status(f"Found {len(devices)} camera(s). {credential_status}")
         else:
-            self.status.setText("No cameras are visible to this account.")
+            self.set_status("No cameras are visible to this account.")
 
     def on_account_finished(self) -> None:
         self.find_button.setEnabled(True)
         self.account_worker = None
         if self.close_pending:
             self.close()
-        elif self.devices:
+        elif self.devices and self.isVisible():
             self.watch_live()
 
     def watch_live(self) -> None:
-        if not self.devices:
+        if not self.devices or self.stream_worker is not None:
             return
+        self.reconnect_timer.stop()
+        self.retry_pending = False
+        self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-mpv-")
+        self.mpv_socket = Path(self.mpv_directory.name) / "control.sock"
         try:
             self.player = subprocess.Popen(
                 [
@@ -443,13 +1303,19 @@ class MainWindow(QMainWindow):
                     "--no-terminal",
                     "--really-quiet",
                     "--vo=x11",
+                    "--osc=no",
+                    "--input-cursor=no",
+                    "--input-default-bindings=no",
+                    "--input-vo-keyboard=no",
                     "--force-window=yes",
                     "--profile=low-latency",
                     "--cache=no",
                     "--untimed",
+                    "--panscan=1.0",
                     "--no-audio",
                     "--demuxer=lavf",
                     "--demuxer-lavf-format=h264",
+                    f"--input-ipc-server={self.mpv_socket}",
                     f"--wid={int(self.video.winId())}",
                     "-",
                 ],
@@ -459,81 +1325,408 @@ class MainWindow(QMainWindow):
                 bufsize=0,
             )
         except OSError:
-            self.status.setText("The mpv video player is unavailable.")
+            self.mpv_socket = None
+            self.mpv_directory.cleanup()
+            self.mpv_directory = None
+            self.set_status("The mpv video player is unavailable.")
             return
         assert self.player.stdin is not None
         self.stream_error = False
         self.stream_live = False
+        self.control_pending = False
+        self.sound_enabled = False
+        self.reset_recording_state()
+        self.zoom_level = 0
+        set_button_icon(self.sound_button, "sound", "Listen to camera")
         self.stream_worker = StreamWorker(
             self.selected_device, stored_camera_password(self.selected_device.uid) or "", self.player.stdin
         )
         self.stream_worker.status_changed.connect(self.on_stream_status)
         self.stream_worker.failed.connect(self.on_stream_error)
+        self.stream_worker.control_completed.connect(self.on_control_completed)
+        self.stream_worker.control_failed.connect(self.on_control_failed)
+        self.stream_worker.sound_changed.connect(self.on_sound_changed)
+        self.stream_worker.sound_failed.connect(self.on_sound_failed)
+        self.stream_worker.recording_started.connect(self.on_recording_started)
+        self.stream_worker.recording_saved.connect(self.on_recording_saved)
+        self.stream_worker.recording_failed.connect(self.on_recording_failed)
+        self.stream_worker.capabilities_found.connect(self.on_capabilities_found)
+        self.stream_worker.setting_completed.connect(self.on_setting_completed)
+        self.stream_worker.setting_failed.connect(self.on_setting_failed)
         self.stream_worker.finished.connect(self.on_stream_finished)
         self.stream_worker.start()
         self.watch_button.setEnabled(False)
         self.find_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        QTimer.singleShot(200, self.show_overlay)
+        QTimer.singleShot(500, self.video.raise_interaction_layer)
 
     def on_stream_status(self, message: str) -> None:
-        self.status.setText(message)
+        self.set_status(message)
         if message == "Live video":
             self.stream_live = True
-            self.set_controls_enabled(self.control_worker is None)
+            self.reconnect_attempts = 0
+            self.set_controls_enabled(not self.control_pending)
+            self.sound_button.setEnabled(True)
+            self.snapshot_button.setEnabled(True)
+            self.record_button.setEnabled(True)
+            self.zoom_out_button.setEnabled(False)
+            self.zoom_in_button.setEnabled(True)
+            self.light_button.setEnabled(True)
+            self.quality_button.setEnabled(True)
+
+    def disable_live_controls(self) -> None:
+        self.set_controls_enabled(False)
+        self.sound_button.setEnabled(False)
+        set_button_icon(self.sound_button, "sound", "Listen to camera")
+        self.snapshot_button.setEnabled(False)
+        self.record_button.setEnabled(False)
+        self.zoom_out_button.setEnabled(False)
+        self.zoom_in_button.setEnabled(False)
+        self.light_button.setEnabled(False)
+        self.quality_button.setEnabled(False)
+        self.setting_pending = False
 
     def set_controls_enabled(self, enabled: bool) -> None:
         for button in self.camera_buttons:
             button.setEnabled(enabled)
 
+    def show_overlay(self) -> None:
+        if not self.isVisible() or self.isMinimized():
+            return
+        self.video.place_overlay()
+        self.overlay.show()
+        self.video.raise_interaction_layer()
+        self.overlay_timer.start(OVERLAY_TIMEOUT_MS)
+
+    def hide_overlay(self) -> None:
+        self.overlay.hide()
+
+    def toggle_overlay(self) -> None:
+        if self.overlay.isVisible():
+            self.overlay_timer.stop()
+            self.hide_overlay()
+        else:
+            self.show_overlay()
+
+    def toggle_ptz_panel(self) -> None:
+        self.ptz_panel.setVisible(not self.ptz_panel.isVisible())
+        self.ptz_button.setToolTip(
+            "Hide pan and tilt controls" if self.ptz_panel.isVisible() else "Pan and tilt controls"
+        )
+        self.video.place_overlay()
+        self.show_overlay()
+
+    def _mpv_command(self, command: list[object]) -> bool:
+        if self.mpv_socket is None:
+            return False
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(2)
+                connection.connect(str(self.mpv_socket))
+                connection.sendall(json.dumps({"command": command}).encode("utf-8") + b"\n")
+                response = bytearray()
+                while b"\n" not in response and len(response) < MAX_MPV_RESPONSE_BYTES:
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+            return json.loads(response.split(b"\n", 1)[0]).get("error") == "success"
+        except (OSError, ValueError, IndexError):
+            return False
+
+    def _media_directory(self) -> Path:
+        pictures = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.PicturesLocation)
+        directory = Path(pictures) if pictures else Path.home() / "Pictures"
+        directory = directory / APPLICATION_NAME
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def take_snapshot(self) -> None:
+        if not self.stream_live:
+            return
+        try:
+            path = self._media_directory() / f"Jardin_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
+        except OSError:
+            self.set_status("Unable to create the picture folder.")
+            return
+        if self._mpv_command(["screenshot-to-file", str(path), "video"]):
+            self.set_status(f"Picture saved: {path}")
+        else:
+            self.set_status("Unable to save a picture.")
+
+    def toggle_recording(self) -> None:
+        if not self.stream_live or self.stream_worker is None:
+            return
+        if self.recording_path is None:
+            try:
+                path = self._media_directory() / f"Jardin_{datetime.now():%Y%m%d_%H%M%S_%f}.mkv"
+            except OSError:
+                self.set_status("Unable to create the recording folder.")
+                return
+            self.stream_worker.set_recording(path)
+            self.recording_path = path
+            set_button_icon(self.record_button, "recording", "Stop recording")
+            self.set_status("Waiting for a key frame to start recording...")
+        else:
+            self.stream_worker.set_recording(None)
+            self.reset_recording_state()
+            self.set_status("Saving recording...")
+
+    def reset_recording_state(self) -> None:
+        self.recording_path = None
+        self.recording_started_at = None
+        self.recording_timer.stop()
+        self.recording_badge.hide()
+        set_button_icon(self.record_button, "record", "Record video")
+
+    def on_recording_started(self) -> None:
+        if self.recording_path is None:
+            return
+        self.recording_started_at = time.monotonic()
+        self.recording_timer.start(RECORDING_TICK_MS)
+        self.set_status("Recording video...")
+        self.update_recording_badge()
+
+    def update_recording_badge(self) -> None:
+        if self.recording_started_at is None or not self.isVisible() or self.isMinimized():
+            self.recording_badge.hide()
+            return
+        elapsed = int(time.monotonic() - self.recording_started_at)
+        hours, remainder = divmod(elapsed, 3600)
+        self.recording_label.setText(
+            f'<span style="color: {RECORDING_DOT_COLOR};">\u25cf</span>'
+            f" {hours:02d}:{remainder // 60:02d}:{remainder % 60:02d}"
+        )
+        self.video.place_overlay()
+        self.recording_badge.show()
+        self.video.raise_interaction_layer()
+
+    def on_recording_saved(self, path: str) -> None:
+        self.set_status(f"Recording saved: {path}")
+
+    def on_recording_failed(self, message: str) -> None:
+        if self.recording_path is not None:
+            self.reset_recording_state()
+        self.set_status(message)
+
+    def change_zoom(self, step: int) -> None:
+        if not self.stream_live:
+            return
+        level = min(MAX_ZOOM_LEVEL, max(0, self.zoom_level + step))
+        if level == self.zoom_level:
+            return
+        if not self._mpv_command(["set_property", "video-zoom", level / 2]):
+            self.set_status("Unable to change zoom.")
+            return
+        self.zoom_level = level
+        self.zoom_out_button.setEnabled(level > 0)
+        self.zoom_in_button.setEnabled(level < MAX_ZOOM_LEVEL)
+        self.set_status(f"Zoom {2 ** (level / 2):.1f}×.")
+
     def toggle_fullscreen(self) -> None:
         if self.isFullScreen():
             self.showNormal()
-            self.fullscreen_button.setText("Full screen")
+            if self.normal_geometry is not None:
+                self.setGeometry(self.normal_geometry)
+            set_button_icon(self.fullscreen_button, "fullscreen", "Full screen")
         else:
+            self.normal_geometry = self.geometry()
             self.showFullScreen()
-            self.fullscreen_button.setText("Exit full screen")
+            set_button_icon(self.fullscreen_button, "exit_fullscreen", "Exit full screen")
 
-    def control_camera(self, command: str) -> None:
-        if self.stream_worker is None or self.control_worker is not None:
+    def fit_video_aspect(self) -> None:
+        if self.isFullScreen() or self.video.width() <= 0 or self.video.height() <= 0:
             return
-        self.set_controls_enabled(False)
-        if command.startswith("Preset "):
-            self.status.setText(f"Moving camera to {command.lower()}...")
+        video_height = round(self.video.width() * VIDEO_ASPECT_HEIGHT / VIDEO_ASPECT_WIDTH)
+        self.resize(self.width(), self.height() - self.video.height() + video_height)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        if not self.aspect_fitted:
+            self.aspect_fitted = True
+            QTimer.singleShot(0, self.fit_video_aspect)
+        QTimer.singleShot(0, self.show_overlay)
+        QTimer.singleShot(0, self.update_recording_badge)
+
+    def moveEvent(self, event: QMoveEvent) -> None:
+        super().moveEvent(event)
+        self.video.place_overlay()
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized():
+                self.overlay_timer.stop()
+                self.hide_overlay()
+            self.update_recording_badge()
+
+    def quality_label(self) -> str:
+        quality = self.settings.value(QUALITY_SETTING, "", str)
+        return quality if quality in VIDEO_QUALITIES else DEFAULT_QUALITY_LABEL
+
+    def show_quality_menu(self) -> None:
+        self.quality_menu.popup(
+            self.quality_button.mapToGlobal(QPoint(0, -self.quality_menu.sizeHint().height()))
+        )
+
+    def on_capabilities_found(self, qualities: list[str], light_on: bool | None) -> None:
+        for quality, action in self.quality_actions.items():
+            action.setVisible(quality in qualities)
+        self.quality_button.setVisible(bool(qualities))
+        self.quality_menu.menuAction().setVisible(bool(qualities))
+        self.light_on = light_on
+        self.light_button.setVisible(light_on is not None)
+        self.update_light_button()
+        self.video.place_overlay()
+
+    def update_light_button(self) -> None:
+        set_button_icon(
+            self.light_button,
+            "light_on" if self.light_on else "light",
+            "Turn white light off" if self.light_on else "Turn white light on",
+        )
+
+    def queue_setting(self, name: str, value: object, message: str) -> bool:
+        if not self.stream_live or self.stream_worker is None or self.setting_pending:
+            return False
+        if not self.stream_worker.queue_setting(name, value):
+            return False
+        self.setting_pending = True
+        self.light_button.setEnabled(False)
+        self.quality_button.setEnabled(False)
+        self.set_status(message)
+        return True
+
+    def toggle_light(self) -> None:
+        if self.light_on is None:
+            return
+        self.queue_setting(
+            SETTING_LIGHT,
+            not self.light_on,
+            "Turning white light off..." if self.light_on else "Turning white light on...",
+        )
+
+    def choose_quality(self, quality: str) -> None:
+        if self.recording_path is not None:
+            self.sync_quality_actions()
+            self.set_status("Stop recording before changing video quality.")
+            return
+        if not self.queue_setting(SETTING_QUALITY, quality, f"Changing video quality to {quality}..."):
+            self.sync_quality_actions()
+
+    def sync_quality_actions(self) -> None:
+        current = self.settings.value(QUALITY_SETTING, "", str)
+        for quality, action in self.quality_actions.items():
+            action.setChecked(quality == current)
+        self.quality_button.setText(self.quality_label())
+
+    def on_setting_completed(self, name: str, value: object) -> None:
+        self.setting_pending = False
+        self.light_button.setEnabled(self.stream_live)
+        self.quality_button.setEnabled(self.stream_live)
+        if name == SETTING_LIGHT:
+            self.light_on = bool(value)
+            self.update_light_button()
+            self.set_status("White light on." if self.light_on else "White light off.")
         else:
-            self.status.setText(f"Moving camera {command.lower()}...")
-        self.control_worker = ControlWorker(self.selected_device, command)
-        self.control_worker.completed.connect(self.on_control_completed)
-        self.control_worker.failed.connect(self.status.setText)
-        self.control_worker.finished.connect(self.on_control_finished)
-        self.control_worker.start()
+            self.settings.setValue(QUALITY_SETTING, value)
+            self.settings.sync()
+            self.sync_quality_actions()
+            self.set_status(f"Video quality set to {value}.")
+
+    def on_setting_failed(self, name: str, message: str) -> None:
+        self.setting_pending = False
+        self.light_button.setEnabled(self.stream_live)
+        self.quality_button.setEnabled(self.stream_live)
+        if name == SETTING_QUALITY:
+            self.sync_quality_actions()
+        self.set_status(message)
+
+    def toggle_sound(self) -> None:
+        if self.stream_worker is None:
+            return
+        self.sound_button.setEnabled(False)
+        self.set_status("Changing camera sound...")
+        self.stream_worker.set_sound(not self.sound_enabled)
+
+    def on_sound_changed(self, enabled: bool) -> None:
+        self.sound_enabled = enabled
+        set_button_icon(
+            self.sound_button,
+            "sound_on" if enabled else "sound",
+            "Mute camera" if enabled else "Listen to camera",
+        )
+        self.sound_button.setEnabled(self.stream_live)
+        self.set_status("Camera sound on." if enabled else "Camera sound off.")
+
+    def on_sound_failed(self, message: str) -> None:
+        self.sound_button.setEnabled(self.stream_live)
+        self.set_status(message)
+
+    def move_by_drag(self, dx: int, dy: int) -> None:
+        if abs(dx) < DRAG_PIXELS_PER_STEP // 2 and abs(dy) < DRAG_PIXELS_PER_STEP // 2:
+            return
+        if abs(dx) >= abs(dy):
+            direction, distance = ("Left" if dx > 0 else "Right"), abs(dx)
+        else:
+            direction, distance = ("Up" if dy > 0 else "Down"), abs(dy)
+        count = min(MAX_DRAG_STEPS, max(1, round(distance / DRAG_PIXELS_PER_STEP)))
+        self.control_camera((direction,) * count)
+
+    def control_camera(self, commands: tuple[str, ...]) -> None:
+        if not self.stream_live or self.stream_worker is None or self.control_pending:
+            return
+        if not self.stream_worker.queue_control(commands):
+            return
+        self.control_pending = True
+        self.set_controls_enabled(False)
+        command = commands[0]
+        if command.startswith("Preset "):
+            self.set_status(f"Moving camera to {command.lower()}...")
+        else:
+            self.set_status(f"Moving camera {command.lower()}...")
 
     def on_control_completed(self, command: str) -> None:
-        if command.startswith("Preset "):
-            self.status.setText(f"Camera moved to {command.lower()}.")
-        else:
-            self.status.setText(f"Camera moved {command.lower()}.")
-
-    def on_control_finished(self) -> None:
-        self.control_worker = None
+        self.control_pending = False
         self.set_controls_enabled(self.stream_live)
-        if self.close_pending:
-            self.close()
+        if command == "Drag":
+            self.set_status("Camera moved with mouse.")
+        elif command.startswith("Preset "):
+            self.set_status(f"Camera moved to {command.lower()}.")
+        else:
+            self.set_status(f"Camera moved {command.lower()}.")
+
+    def on_control_failed(self, message: str) -> None:
+        self.control_pending = False
+        self.set_controls_enabled(self.stream_live)
+        self.set_status(message)
 
     def on_stream_error(self, message: str) -> None:
         self.stream_error = True
+        self.retry_pending = message != "The camera rejected the available credentials."
         self.stream_live = False
-        self.set_controls_enabled(False)
-        self.status.setText(message)
+        self.control_pending = False
+        self.sound_enabled = False
+        self.disable_live_controls()
+        self.set_status(message)
 
     def stop_stream(self) -> None:
+        self.reconnect_timer.stop()
+        self.retry_pending = False
         if self.stream_worker is not None:
-            self.status.setText("Stopping camera...")
+            self.set_status("Stopping camera...")
             self.stream_worker.stop()
             self.stop_button.setEnabled(False)
+        else:
+            self.stop_button.setEnabled(False)
+            self.set_status("Camera stopped.")
 
     def on_stream_finished(self) -> None:
         self.stream_worker = None
         self.stream_live = False
+        self.control_pending = False
+        self.sound_enabled = False
         if self.player is not None:
             if self.player.stdin is not None:
                 self.player.stdin.close()
@@ -545,31 +1738,53 @@ class MainWindow(QMainWindow):
                     self.player.kill()
                     self.player.wait(timeout=3)
             self.player = None
+        if self.mpv_directory is not None:
+            self.mpv_directory.cleanup()
+            self.mpv_directory = None
+            self.mpv_socket = None
+        self.reset_recording_state()
+        self.zoom_level = 0
         self.find_button.setEnabled(True)
         self.watch_button.setEnabled(bool(self.devices))
         self.stop_button.setEnabled(False)
-        self.set_controls_enabled(False)
-        if not self.stream_error:
-            self.status.setText("Camera stopped.")
+        self.disable_live_controls()
+        if self.retry_pending and not self.close_pending:
+            delay = min(RECONNECT_MAX_SECONDS, 2 ** (self.reconnect_attempts + 1))
+            self.reconnect_attempts += 1
+            self.reconnect_timer.start(delay * 1000)
+            self.stop_button.setEnabled(True)
+            self.set_status(f"Camera disconnected. Reconnecting in {delay}s.")
+        elif not self.stream_error:
+            self.set_status("Camera stopped.")
         if self.close_pending:
             self.close()
 
     def closeEvent(self, event: object) -> None:
+        if self.tray is not None and not self.quit_requested:
+            event.ignore()
+            self.hide_to_tray()
+            return
+        self.reconnect_timer.stop()
+        self.retry_pending = False
         if (
             self.account_worker is not None
             or self.stream_worker is not None
-            or self.control_worker is not None
         ):
             self.close_pending = True
             self.stop_stream()
             event.ignore()
             return
         event.accept()
+        if self.window_hints is not None:
+            self.window_hints.close()
+        if self.tray is not None:
+            self.tray.hide()
+            QApplication.quit()
 
 
 def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "--forget-account":
-        settings = QSettings("O-KAM Linux", "O-KAM Linux")
+        settings = QSettings(APPLICATION_NAME, APPLICATION_NAME)
         username = settings.value("account/username", "", str)
         if username and not clear_account_password(username):
             return 1
