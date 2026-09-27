@@ -190,6 +190,7 @@ REPLAY_SPEED_LABEL = "{speed}x"
 LIVE_BUTTON_LABEL = "LIVE"
 LOADING_STATUS = "Loading recording {percent}%"
 DETECTION_JUMP_MARGIN_SECONDS = 5
+DETECTION_RECENT_SECONDS = 30
 RECORDING_CHAIN_TOLERANCE_SECONDS = 5
 MAX_RECORDING_RELOADS = 2
 MAX_REPLAY_DAYS = 31
@@ -785,7 +786,10 @@ class CardClipWriter:
                 or self.video_frames < MIN_RECORDING_FRAMES
                 or self.last_video_time <= self.first_video_time
             ):
-                raise OSError("The camera sent no playable video.")
+                raise OSError(
+                    f"The camera sent no playable video ({self.video_frames} video frames,"
+                    f" first {self.first_video_time}, last {self.last_video_time})."
+                )
             frame_rate = (self.video_frames - 1) / (self.last_video_time - self.first_video_time)
             audio_path = self.audio_path if self.first_audio_time is not None else None
             audio_offset = (self.first_audio_time or 0.0) - self.first_video_time
@@ -1940,6 +1944,7 @@ class ReplayController(QObject):
         self.pending_jump = 0
         self.jump_origin = datetime.now()
         self.last_position: datetime | None = None
+        self.last_detection: CardRecording | None = None
         self.reloads = 0
         self.playing = False
         self.sound = True
@@ -1950,6 +1955,7 @@ class ReplayController(QObject):
         self.worker.progress.connect(self.on_progress)
         self.worker.downloaded.connect(self.on_downloaded)
         self.worker.failed.connect(self.status_changed.emit)
+        self.worker.failed.connect(self.cancel_jump)
         self.position_changed.connect(self.on_position)
         self.playback_finished.connect(self.on_finished)
         self.timeline.seek_requested.connect(self.seek)
@@ -2032,6 +2038,13 @@ class ReplayController(QObject):
                     (recording for recording in reversed(detections) if recording.start <= self.jump_origin < recording.end),
                     None,
                 )
+            recent = self.last_detection
+            if (
+                playing is None
+                and recent is not None
+                and recent.start <= self.jump_origin <= recent.end + timedelta(seconds=DETECTION_RECENT_SECONDS)
+            ):
+                playing = recent
             limit = playing.start if playing is not None else self.jump_origin
             found = next(
                 (
@@ -2053,22 +2066,25 @@ class ReplayController(QObject):
             return
         loaded = sorted(self.recordings)
         today = datetime.now().strftime(RECORD_DAY_FORMAT)
-        if direction < 0 and loaded:
-            earlier = (datetime.strptime(loaded[0], RECORD_DAY_FORMAT) - timedelta(days=1)).strftime(RECORD_DAY_FORMAT)
-            if earlier not in self.requested_days and len(self.requested_days) < MAX_REPLAY_DAYS:
-                self.requested_days.add(earlier)
-                self.worker.list_day(earlier)
-                self.status_changed.emit("Looking for an earlier detection...")
+        if loaded and (direction < 0 or loaded[-1] < today):
+            step = timedelta(days=-1 if direction < 0 else 1)
+            edge = loaded[0] if direction < 0 else loaded[-1]
+            neighbour = (datetime.strptime(edge, RECORD_DAY_FORMAT) + step).strftime(RECORD_DAY_FORMAT)
+            exhausted = direction < 0 and (not self.recordings[edge] or len(loaded) >= MAX_REPLAY_DAYS)
+            if not exhausted:
+                if neighbour not in self.requested_days:
+                    self.requested_days.add(neighbour)
+                    self.worker.list_day(neighbour)
+                self.status_changed.emit(
+                    "Looking for an earlier detection..." if direction < 0 else "Looking for a later detection..."
+                )
                 return
-        elif direction > 0 and loaded and loaded[-1] < today:
-            later = (datetime.strptime(loaded[-1], RECORD_DAY_FORMAT) + timedelta(days=1)).strftime(RECORD_DAY_FORMAT)
-            if later not in self.requested_days:
-                self.requested_days.add(later)
-                self.worker.list_day(later)
-                self.status_changed.emit("Looking for a later detection...")
-                return
+        LOG.info("No %s detection from %s with days %s", "earlier" if direction < 0 else "later", self.jump_origin, loaded)
         self.pending_jump = 0
         self.status_changed.emit("No earlier detection." if direction < 0 else "No later detection.")
+
+    def cancel_jump(self) -> None:
+        self.pending_jump = 0
 
     def recording_at(self, moment: datetime) -> CardRecording | None:
         recordings = self.all_recordings()
@@ -2079,6 +2095,8 @@ class ReplayController(QObject):
 
     def seek(self, moment: datetime, preferred: CardRecording | None = None) -> None:
         recording = preferred or self.recording_at(moment)
+        if recording is not None and recording.detection:
+            self.last_detection = recording
         LOG.info("Seek to %s in %s", moment, recording.name if recording is not None else "no recording")
         if recording is None:
             self.status_changed.emit("No recording at this time.")

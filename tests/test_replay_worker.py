@@ -163,5 +163,42 @@ class ReplayLoadingTest(unittest.TestCase):
             controller.stop()
 
 
+    def test_previous_detection_waits_for_a_day_already_requested(self) -> None:
+        controller = ReplayController(SimpleNamespace(), "", TimelineWidget())
+        try:
+            controller.worker.download = lambda buffer: None
+            listed: list[str] = []
+            controller.worker.list_day = listed.append
+            controller.recordings["20260926"] = [recording("20260926120000_100.mp4")]
+            controller.requested_days.update({"20260926", "20260925"})
+            messages: list[str] = []
+            controller.status_changed.connect(messages.append)
+            controller.timeline.center = datetime(2026, 9, 26, 12, 1, 0)
+            controller.jump_to_detection(-1)
+            self.assertEqual(messages[-1], "Looking for an earlier detection...")
+            self.assertEqual(listed, [])
+            controller.on_day_listed("20260925", [recording("20260925080000_011.mp4")])
+            self.assertEqual(controller.current.recording.name, "20260925080000_011.mp4")
+        finally:
+            controller.stop()
+
+
+    def test_previous_detection_skips_a_short_detection_that_just_ended(self) -> None:
+        controller = ReplayController(SimpleNamespace(), "", TimelineWidget())
+        try:
+            controller.worker.download = lambda buffer: None
+            earlier = recording("20260925010000_011.mp4")
+            short = CardRecording("20260925032041_011.mp4", datetime(2026, 9, 25, 3, 20, 41), 10, 100)
+            following = recording("20260925031904_100.mp4")
+            controller.recordings["20260925"] = [earlier, following, short]
+            controller.seek(short.start, short)
+            controller.seek(datetime(2026, 9, 25, 3, 20, 52), following)
+            controller.timeline.center = datetime(2026, 9, 25, 3, 20, 53)
+            controller.jump_to_detection(-1)
+            self.assertEqual(controller.current.recording, earlier)
+        finally:
+            controller.stop()
+
+
 if __name__ == "__main__":
     unittest.main()
