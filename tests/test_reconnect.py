@@ -5,7 +5,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PyQt6.QtWidgets import QApplication
 
-from app import MainWindow
+from app import ACCOUNT_REJECTED_MESSAGE, MainWindow
 
 
 class ReconnectTest(unittest.TestCase):
@@ -23,14 +23,25 @@ class ReconnectTest(unittest.TestCase):
         self.window.on_stream_error("camera closed the native P2P session")
         self.window.on_stream_finished()
         self.assertTrue(self.window.reconnect_timer.isActive())
-        self.assertTrue(self.window.stop_button.isEnabled())
         self.window.stop_stream()
         self.assertFalse(self.window.reconnect_timer.isActive())
-        self.assertFalse(self.window.stop_button.isEnabled())
 
     def test_rejected_camera_credentials_do_not_retry(self) -> None:
         self.window.on_stream_error("The camera rejected the available credentials.")
         self.window.on_stream_finished()
+        self.assertFalse(self.window.reconnect_timer.isActive())
+
+    def test_unreachable_account_service_schedules_retry(self) -> None:
+        self.window.show()
+        self.window.on_account_failed("O-KAM account lookup is unreachable.")
+        self.window.on_account_finished()
+        self.assertTrue(self.window.reconnect_timer.isActive())
+        self.assertIn("Reconnecting in 2s.", self.window.status_text)
+
+    def test_rejected_account_login_does_not_retry(self) -> None:
+        self.window.show()
+        self.window.on_account_failed(ACCOUNT_REJECTED_MESSAGE)
+        self.window.on_account_finished()
         self.assertFalse(self.window.reconnect_timer.isActive())
 
     def test_drag_moves_camera_opposite_to_image_motion(self) -> None:

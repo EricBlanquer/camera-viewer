@@ -16,6 +16,7 @@ cd okam-linux
 ```
 
 The installer creates a virtual environment, installs the pinned transport package, downloads and verifies the official wake configuration, and adds an **O-KAM Linux** application launcher.
+It also starts O-KAM Linux in the notification area when the desktop session opens, without waking the camera until the window is shown.
 It keeps the vendor wake configuration in `~/.local/share/okam-linux/vendor` with owner-only permissions.
 
 ## Use
@@ -29,8 +30,8 @@ Run `.venv/bin/python app.py --forget-account` to remove the saved account and s
 The window keeps the camera's 16:9 ratio while it is resized, and the video fills it without black bars.
 The current state appears in the window title.
 Click the video to show or hide the translucent control bar.
-Use **Watch live**, **Stop**, and **Reconnect** to manage the video connection, or **Full screen** to expand the viewer.
-The viewer reconnects automatically after a transport interruption; **Stop** cancels this retry.
+Live video starts automatically, and the viewer reconnects by itself after a network or transport interruption.
+Use **Full screen** to expand the viewer.
 **Photo** saves a picture and **Record** saves the live video as a Matroska file in `Pictures/O-KAM Linux`.
 A counter at the top of the video shows the recording duration.
 Use **Sound** to listen to or silence the camera microphone, and the bulb button to switch the camera's white light.
@@ -41,6 +42,7 @@ Drag the video horizontally or vertically with the left mouse button to move it 
 
 When the desktop provides a notification area, O-KAM Linux shows an icon there instead of a taskbar entry.
 Click the icon to show or hide the window, or open its menu to use the same controls or quit.
+Opening O-KAM Linux again from the application menu shows the running instance instead of starting a second one.
 Closing the window hides it and stops the video; showing it again restarts live video.
 
 The video quality selector appears only when the camera can switch quality and return to its full resolution without restarting.

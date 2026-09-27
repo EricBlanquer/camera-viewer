@@ -2,9 +2,6 @@ from pathlib import Path
 
 
 ICON_SHAPES = {
-    "play": '<path d="M8 5 19 12 8 19Z"/>',
-    "stop": '<rect x="6" y="6" width="12" height="12" rx="2"/>',
-    "reconnect": '<path d="M20 7v5h-5"/><path d="M20 12a8 8 0 1 0-2.4 5.7"/>',
     "photo": '<path d="M3 7h4l2-2h6l2 2h4v12H3Z"/><circle cx="12" cy="13" r="3.5"/>',
     "record": '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4" fill="#f55" stroke="none"/>',
     "recording": '<rect x="5" y="5" width="14" height="14" rx="2" fill="#f55" stroke="none"/>',
@@ -19,9 +16,28 @@ ICON_SHAPES = {
     "right": '<path d="m10 5 7 7-7 7m7-7H3"/>',
     "up": '<path d="m5 14 7-7 7 7M12 7v14"/>',
     "down": '<path d="m5 10 7 7 7-7m-7 7V3"/>',
-    "app": '<rect x="3" y="4" width="18" height="12" rx="3"/><circle cx="12" cy="10" r="3"/><path d="M9 20h6m-3-4v4"/>',
     "light": '<path d="M9 18h6m-5 3h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3Z"/>',
 }
+
+
+APP_ICON = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
+    '<defs>'
+    '<linearGradient id="shell" x1="0" y1="0" x2="0" y2="1">'
+    '<stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#c9d1d9"/></linearGradient>'
+    '<radialGradient id="lens" cx="0.4" cy="0.35" r="0.7">'
+    '<stop offset="0" stop-color="#3b82f6"/><stop offset="0.45" stop-color="#1e3a8a"/>'
+    '<stop offset="1" stop-color="#0b1020"/></radialGradient>'
+    '</defs>'
+    '<rect x="14" y="50" width="36" height="10" rx="5" fill="#9aa4ae"/>'
+    '<rect x="26" y="44" width="12" height="9" rx="2" fill="#b8c0c8"/>'
+    '<circle cx="32" cy="27" r="22" fill="url(#shell)" stroke="#8a949e" stroke-width="1.5"/>'
+    '<circle cx="32" cy="27" r="14" fill="#1f2328"/>'
+    '<circle cx="32" cy="27" r="10.5" fill="url(#lens)"/>'
+    '<circle cx="28" cy="23" r="3" fill="#ffffff" fill-opacity="0.85"/>'
+    '<circle cx="32" cy="10" r="1.8" fill="#22c55e"/>'
+    '</svg>\n'
+)
 
 
 def write_icon(name: str, shape: str, color: str = "#f5f5f5") -> None:
@@ -36,6 +52,7 @@ def write_icon(name: str, shape: str, color: str = "#f5f5f5") -> None:
 
 def main() -> None:
     (Path(__file__).parent / "icons").mkdir(parents=True, exist_ok=True)
+    (Path(__file__).parent / "icons" / "app.svg").write_text(APP_ICON, encoding="utf-8")
     for name, shape in ICON_SHAPES.items():
         write_icon(name, shape)
     write_icon("sound_on", ICON_SHAPES["sound"], "#38c7dc")

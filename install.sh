@@ -4,6 +4,7 @@ set -eu
 app_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 data_dir="$HOME/.local/share/okam-linux/vendor"
 desktop_dir="$HOME/.local/share/applications"
+autostart_dir="$HOME/.config/autostart"
 
 git -C "$app_dir" submodule update --init
 python3 -m venv --system-site-packages "$app_dir/.venv"
@@ -25,3 +26,9 @@ Terminal=false
 Categories=AudioVideo;Video;
 EOF
 chmod 644 "$desktop_dir/okam-linux.desktop"
+mkdir -p "$autostart_dir"
+sed -e "s|^Exec=.*|Exec=$app_dir/.venv/bin/python $app_dir/app.py --tray|" \
+    -e '$a X-GNOME-Autostart-enabled=true' \
+    -e '$a X-GNOME-Autostart-Delay=10' \
+    "$desktop_dir/okam-linux.desktop" > "$autostart_dir/okam-linux.desktop"
+chmod 644 "$autostart_dir/okam-linux.desktop"

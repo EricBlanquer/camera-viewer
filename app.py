@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import queue
 import re
 import socket
@@ -20,7 +21,19 @@ from typing import BinaryIO
 from datetime import datetime
 
 from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QActionGroup, QColor, QIcon, QMouseEvent, QMoveEvent, QPainter, QResizeEvent, QShowEvent
+from PyQt6.QtGui import (
+    QAction,
+    QActionGroup,
+    QColor,
+    QIcon,
+    QMouseEvent,
+    QMoveEvent,
+    QPainter,
+    QPalette,
+    QPixmap,
+    QResizeEvent,
+    QShowEvent,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -36,6 +49,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from okam_native.account import AccountDevice, AccountError, Eye4AccountClient
 from okam_native.cs2 import (
@@ -66,7 +80,14 @@ from Xlib.protocol import event as xevent
 
 
 APPLICATION_NAME = "O-KAM Linux"
+TRAY_ARGUMENT = "--tray"
+INSTANCE_SERVER_PREFIX = "okam-linux"
+INSTANCE_CONNECT_TIMEOUT_MS = 500
+SHOW_WINDOW_REQUEST = b"show"
+ACCOUNT_REJECTED_MESSAGE = "O-KAM account login was rejected."
 WAKE_SOURCE = Path.home() / ".local/share/okam-linux/vendor/device_wakeup_server.dart"
+ICON_COLOR = "#f5f5f5"
+ICON_NAME_PROPERTY = "iconName"
 ICON_DIRECTORY = Path(__file__).resolve().parent / "assets/icons"
 MAX_ACCOUNT_RESPONSE_BYTES = 1024 * 1024
 SECRET_ATTRIBUTES = ("application", "okam-linux", "account")
@@ -130,8 +151,19 @@ RECORDING_TICK_MS = 1000
 RECORDING_DOT_COLOR = "#ff4d4d"
 
 
+def menu_icon(name: str, color: QColor) -> QIcon:
+    try:
+        svg = (ICON_DIRECTORY / f"{name}.svg").read_text(encoding="utf-8")
+    except OSError:
+        return QIcon()
+    pixmap = QPixmap()
+    pixmap.loadFromData(svg.replace(ICON_COLOR, color.name()).encode("utf-8"), "SVG")
+    return QIcon(pixmap)
+
+
 def set_button_icon(button: QPushButton, name: str, label: str, size: int = 44) -> None:
     button.setText("")
+    button.setProperty(ICON_NAME_PROPERTY, name)
     button.setIcon(QIcon(str(ICON_DIRECTORY / f"{name}.svg")))
     button.setIconSize(QSize(28, 28))
     button.setFixedSize(size, size)
@@ -300,7 +332,7 @@ def account_request(request: urllib.request.Request, timeout: float) -> bytes:
             return payload
     except urllib.error.HTTPError as ex:
         if path == "/login/token" and ex.code in (401, 403):
-            raise AccountError("O-KAM account login was rejected.") from None
+            raise AccountError(ACCOUNT_REJECTED_MESSAGE) from None
         raise AccountError(f"O-KAM {stage} failed (HTTP {ex.code}).") from None
     except urllib.error.URLError:
         raise AccountError(f"O-KAM {stage} is unreachable.") from None
@@ -865,6 +897,10 @@ class VideoWidget(QWidget):
             )
         if self.controls_overlay is None:
             return
+        overlay_layout = self.controls_overlay.layout()
+        if overlay_layout is not None:
+            overlay_layout.invalidate()
+            overlay_layout.activate()
         height = self.controls_overlay.sizeHint().height()
         width = min(max(0, self.width() - 2 * OVERLAY_MARGIN), self.controls_overlay.sizeHint().width())
         position = self.mapToGlobal(
@@ -967,7 +1003,7 @@ class MainWindow(QMainWindow):
         self.reconnect_attempts = 0
         self.reconnect_timer = QTimer(self)
         self.reconnect_timer.setSingleShot(True)
-        self.reconnect_timer.timeout.connect(self.watch_live)
+        self.reconnect_timer.timeout.connect(self.reconnect)
         self.overlay_timer = QTimer(self)
         self.overlay_timer.setSingleShot(True)
         self.overlay_timer.timeout.connect(self.hide_overlay)
@@ -994,6 +1030,9 @@ class MainWindow(QMainWindow):
             "#cameraControls QPushButton:hover { background-color: rgba(255, 255, 255, 35); }"
             "#cameraControls #qualityButton { border: 2px solid white; border-radius: 8px;"
             " font-weight: 600; margin: 6px 2px; }"
+            "#ptzPanel { background: transparent; }"
+            "QToolTip { color: white; background-color: rgb(32, 32, 32);"
+            " border: 1px solid rgba(255, 255, 255, 60); border-radius: 6px; padding: 4px 8px; }"
             "#cameraControls QPushButton:disabled { color: rgba(255, 255, 255, 90);"
             " border-color: rgba(255, 255, 255, 90); }"
         )
@@ -1002,14 +1041,6 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         controls.setSpacing(12)
         controls.addStretch(1)
-        self.find_button = QPushButton("Reconnect")
-        self.watch_button = QPushButton("Watch live")
-        self.stop_button = QPushButton("Stop")
-        self.watch_button.setEnabled(False)
-        self.stop_button.setEnabled(False)
-        controls.addWidget(self.watch_button)
-        controls.addWidget(self.stop_button)
-        controls.addWidget(self.find_button)
         self.quality_menu = QMenu(self)
         self.quality_group = QActionGroup(self)
         self.quality_actions: dict[str, QAction] = {}
@@ -1065,9 +1096,6 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.fullscreen_button)
         controls.addStretch(1)
         for button, icon_name, label in (
-            (self.watch_button, "play", "Watch live"),
-            (self.stop_button, "stop", "Stop video"),
-            (self.find_button, "reconnect", "Reconnect camera"),
             (self.snapshot_button, "photo", "Save picture"),
             (self.record_button, "record", "Record video"),
             (self.sound_button, "sound", "Listen to camera"),
@@ -1080,6 +1108,7 @@ class MainWindow(QMainWindow):
             set_button_icon(button, icon_name, label)
         overlay_layout.addLayout(controls)
         self.ptz_panel = QWidget(self.overlay)
+        self.ptz_panel.setObjectName("ptzPanel")
         ptz_layout = QVBoxLayout(self.ptz_panel)
         ptz_layout.setContentsMargins(0, 0, 0, 0)
         movement = QHBoxLayout()
@@ -1117,9 +1146,6 @@ class MainWindow(QMainWindow):
         for button in self.overlay.findChildren(QPushButton):
             button.clicked.connect(self.show_overlay)
         self.setCentralWidget(body)
-        self.find_button.clicked.connect(self.find_cameras)
-        self.watch_button.clicked.connect(self.watch_live)
-        self.stop_button.clicked.connect(self.stop_stream)
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.create_tray()
         if QApplication.platformName() == "xcb":
@@ -1143,10 +1169,6 @@ class MainWindow(QMainWindow):
         self.window_action.triggered.connect(self.toggle_window)
         menu.addSeparator()
         for button in (
-            self.watch_button,
-            self.stop_button,
-            self.find_button,
-            None,
             self.snapshot_button,
             self.record_button,
             self.sound_button,
@@ -1176,14 +1198,15 @@ class MainWindow(QMainWindow):
         self.tray.show()
 
     def add_tray_action(self, menu: QMenu, button: QPushButton) -> None:
-        action = menu.addAction(button.icon(), button.toolTip())
+        action = menu.addAction(button.toolTip())
         action.triggered.connect(button.click)
         self.tray_actions.append((action, button))
 
     def update_tray_menu(self) -> None:
         self.window_action.setText("Hide window" if self.isVisible() else "Show window")
+        text_color = self.tray.contextMenu().palette().color(QPalette.ColorRole.WindowText)
         for action, button in self.tray_actions:
-            action.setIcon(button.icon())
+            action.setIcon(menu_icon(button.property(ICON_NAME_PROPERTY), text_color))
             action.setText(button.toolTip())
             action.setEnabled(button.isEnabled() and self.isVisible())
             action.setVisible(not button.isHidden())
@@ -1197,11 +1220,14 @@ class MainWindow(QMainWindow):
         if self.isVisible() and not self.isMinimized():
             self.hide_to_tray()
             return
+        self.show_window()
+
+    def show_window(self) -> None:
         self.showNormal()
         self.raise_()
         self.activateWindow()
-        if self.stream_worker is None and self.account_worker is None and self.devices:
-            self.watch_live()
+        if self.stream_worker is None and self.account_worker is None:
+            self.reconnect()
 
     def hide_to_tray(self) -> None:
         self.stop_stream()
@@ -1248,12 +1274,10 @@ class MainWindow(QMainWindow):
         self.reconnect_timer.stop()
         self.retry_pending = False
         self.devices = []
-        self.watch_button.setEnabled(False)
-        self.find_button.setEnabled(False)
         self.set_status("Finding cameras...")
         self.account_worker = AccountWorker(self.account_username, self.account_secret)
         self.account_worker.devices_found.connect(self.on_devices_found)
-        self.account_worker.failed.connect(self.set_status)
+        self.account_worker.failed.connect(self.on_account_failed)
         self.account_worker.finished.connect(self.on_account_finished)
         self.account_worker.start()
 
@@ -1267,7 +1291,6 @@ class MainWindow(QMainWindow):
                 clear_account_password(saved_username)
             self.settings.setValue("account/username", self.account_username)
             self.settings.sync()
-        self.watch_button.setEnabled(bool(devices))
         if devices:
             self.selected_device = next((device for device in devices if device.name == "Jardin"), devices[0])
             if not self.status_text.startswith("The keyring could not"):
@@ -1280,13 +1303,30 @@ class MainWindow(QMainWindow):
         else:
             self.set_status("No cameras are visible to this account.")
 
+    def on_account_failed(self, message: str) -> None:
+        self.retry_pending = message != ACCOUNT_REJECTED_MESSAGE
+        self.set_status(message)
+
     def on_account_finished(self) -> None:
-        self.find_button.setEnabled(True)
         self.account_worker = None
         if self.close_pending:
             self.close()
         elif self.devices and self.isVisible():
             self.watch_live()
+        elif self.retry_pending and self.isVisible():
+            self.schedule_reconnect(self.status_text)
+
+    def schedule_reconnect(self, reason: str) -> None:
+        delay = min(RECONNECT_MAX_SECONDS, 2 ** (self.reconnect_attempts + 1))
+        self.reconnect_attempts += 1
+        self.reconnect_timer.start(delay * 1000)
+        self.set_status(f"{reason} Reconnecting in {delay}s.")
+
+    def reconnect(self) -> None:
+        if self.devices:
+            self.watch_live()
+        else:
+            self.find_cameras()
 
     def watch_live(self) -> None:
         if not self.devices or self.stream_worker is not None:
@@ -1355,9 +1395,6 @@ class MainWindow(QMainWindow):
         self.stream_worker.setting_failed.connect(self.on_setting_failed)
         self.stream_worker.finished.connect(self.on_stream_finished)
         self.stream_worker.start()
-        self.watch_button.setEnabled(False)
-        self.find_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
         QTimer.singleShot(200, self.show_overlay)
         QTimer.singleShot(500, self.video.raise_interaction_layer)
 
@@ -1717,9 +1754,7 @@ class MainWindow(QMainWindow):
         if self.stream_worker is not None:
             self.set_status("Stopping camera...")
             self.stream_worker.stop()
-            self.stop_button.setEnabled(False)
         else:
-            self.stop_button.setEnabled(False)
             self.set_status("Camera stopped.")
 
     def on_stream_finished(self) -> None:
@@ -1744,16 +1779,9 @@ class MainWindow(QMainWindow):
             self.mpv_socket = None
         self.reset_recording_state()
         self.zoom_level = 0
-        self.find_button.setEnabled(True)
-        self.watch_button.setEnabled(bool(self.devices))
-        self.stop_button.setEnabled(False)
         self.disable_live_controls()
         if self.retry_pending and not self.close_pending:
-            delay = min(RECONNECT_MAX_SECONDS, 2 ** (self.reconnect_attempts + 1))
-            self.reconnect_attempts += 1
-            self.reconnect_timer.start(delay * 1000)
-            self.stop_button.setEnabled(True)
-            self.set_status(f"Camera disconnected. Reconnecting in {delay}s.")
+            self.schedule_reconnect("Camera disconnected.")
         elif not self.stream_error:
             self.set_status("Camera stopped.")
         if self.close_pending:
@@ -1791,12 +1819,41 @@ def main() -> int:
         settings.remove("account/username")
         settings.sync()
         return 0 if settings.status() == QSettings.Status.NoError else 1
-    if len(sys.argv) != 1:
+    start_in_tray = sys.argv[1:] == [TRAY_ARGUMENT]
+    if len(sys.argv) != 1 and not start_in_tray:
         return 2
     app = QApplication(sys.argv)
+    server_name = f"{INSTANCE_SERVER_PREFIX}-{os.getuid()}"
+    running_instance = QLocalSocket()
+    running_instance.connectToServer(server_name)
+    if running_instance.waitForConnected(INSTANCE_CONNECT_TIMEOUT_MS):
+        if not start_in_tray:
+            running_instance.write(SHOW_WINDOW_REQUEST)
+            running_instance.waitForBytesWritten(INSTANCE_CONNECT_TIMEOUT_MS)
+        running_instance.disconnectFromServer()
+        return 0
+    QLocalServer.removeServer(server_name)
+    instance_server = QLocalServer()
+    if not instance_server.listen(server_name):
+        return 1
     window = MainWindow()
-    window.show()
+    instance_server.newConnection.connect(lambda: accept_instance_request(instance_server, window))
+    if not start_in_tray or window.tray is None:
+        window.show()
     return app.exec()
+
+
+def accept_instance_request(server: QLocalServer, window: MainWindow) -> None:
+    connection = server.nextPendingConnection()
+    if connection is None:
+        return
+    connection.readyRead.connect(lambda: read_instance_request(connection, window))
+    connection.disconnected.connect(connection.deleteLater)
+
+
+def read_instance_request(connection: QLocalSocket, window: MainWindow) -> None:
+    if bytes(connection.readAll()) == SHOW_WINDOW_REQUEST:
+        window.show_window()
 
 
 if __name__ == "__main__":
