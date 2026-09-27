@@ -1507,7 +1507,10 @@ class ReplayWorker(QThread):
                         retry = (
                             attempt + 1 < REPLAY_ATTEMPTS
                             and not self.stop_requested.is_set()
-                            and not (isinstance(request[1], ReplayBuffer) and request[1].frames)
+                            and not (
+                                isinstance(request[1], ReplayBuffer)
+                                and (request[1].frames or self.cancel_download.is_set())
+                            )
                         )
                         if retry:
                             continue
@@ -1534,11 +1537,12 @@ class ReplayWorker(QThread):
         for request in downloads[:-1]:
             request[1].end()
         lists = [request for request in requests if request[0] == REPLAY_LIST_REQUEST]
-        for request in lists[1:]:
+        pending = lists[1:] + downloads[-1:] if lists else lists[1:]
+        for request in pending:
             self.requests.put(request)
-        for request in downloads[-1:]:
-            self.requests.put(request)
-        return lists[0] if lists else (downloads[-1] if downloads else None)
+        if lists:
+            return lists[0]
+        return downloads[-1] if downloads else None
 
     def _open_session(self) -> CS2Session:
         if self.session is not None:
