@@ -9,9 +9,9 @@ from unittest.mock import patch
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PyQt6.QtCore import QSettings
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QWidget
 
-from app import CameraPreview, MainWindow, RTSP_ACCOUNT, RtspCamera, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
+from app import AspectVideoFrame, CameraPreview, MainWindow, RTSP_ACCOUNT, RtspCamera, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
 
 
 class TrayTest(unittest.TestCase):
@@ -161,12 +161,30 @@ class TrayTest(unittest.TestCase):
             self.window.sync_previews()
             self.assertEqual(list(self.window.previews), [entrance.uid])
             self.assertIs(self.window.video_grid.itemAtPosition(0, 1).widget(), self.window.previews[entrance.uid])
+            self.window.primary_label.moved.emit(garden.uid, entrance.uid)
+            self.assertEqual([camera.uid for camera in self.window.ordered_devices()], [entrance.uid, garden.uid])
+            self.assertIs(self.window.video_grid.itemAtPosition(0, 0).widget(), self.window.previews[entrance.uid])
+            self.window.set_camera_layout("vertical")
+            self.assertIs(self.window.video_grid.itemAtPosition(0, 0).widget(), self.window.previews[entrance.uid])
+            self.assertIs(self.window.video_grid.itemAtPosition(1, 0).widget(), self.window.primary_pane)
+            self.assertEqual(self.window.settings.value("view/camera_layout"), "vertical")
             self.window.selected_device = entrance
             self.window.sync_previews()
             self.assertEqual(list(self.window.previews), [garden.uid])
             self.window.set_show_all_cameras(False)
             self.assertEqual(self.window.previews, {})
             self.assertFalse(self.window.settings.value("view/show_all_cameras", True, bool))
+
+    def test_video_frame_preserves_aspect_ratio_when_resized(self) -> None:
+        video = QWidget()
+        frame = AspectVideoFrame(video)
+        frame.show()
+        frame.resize(640, 500)
+        self.assertEqual((video.width(), video.height()), (640, 360))
+        self.assertEqual(video.y(), 70)
+        frame.resize(500, 500)
+        self.assertEqual((video.width(), video.height()), (500, 281))
+        frame.close()
 
     def test_removing_selected_rtsp_camera_switches_to_remaining_camera(self) -> None:
         with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:

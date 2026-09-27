@@ -27,12 +27,15 @@ from dataclasses import dataclass
 from typing import BinaryIO, Callable
 from datetime import datetime, timedelta, timezone
 
-from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QMimeData, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QDesktopServices,
     QActionGroup,
     QColor,
+    QDrag,
+    QDragEnterEvent,
+    QDropEvent,
     QIcon,
     QMouseEvent,
     QMoveEvent,
@@ -96,6 +99,10 @@ STORAGE_NAME = "O-KAM Linux"
 RTSP_ACCOUNT = "rtsp"
 RTSP_CAMERAS_SETTING = "cameras/rtsp"
 MULTIVIEW_SETTING = "view/show_all_cameras"
+MULTIVIEW_LAYOUT_SETTING = "view/camera_layout"
+CAMERA_ORDER_SETTING = "view/camera_order"
+CAMERA_DRAG_MIME = "application/x-camera-viewer-uid"
+CAMERA_LABEL_STYLE = "color: white; background-color: #242424; padding: 5px 10px;"
 LOG = logging.getLogger("okam-linux")
 LOG_DIRECTORY = Path.home() / ".cache/okam-linux"
 LOG_FILE_NAME = "okam-linux.log"
@@ -294,6 +301,8 @@ def set_button_icon(button: QPushButton, name: str, label: str, size: int = 44) 
 class X11WindowHints:
     def __init__(self, window: QWidget, skip_taskbar: bool) -> None:
         self.skip_taskbar = skip_taskbar
+        self.aspect_width = VIDEO_ASPECT_WIDTH
+        self.aspect_height = VIDEO_ASPECT_HEIGHT
         self.x_display = xdisplay.Display()
         self.window = self.x_display.create_resource_object("window", int(window.winId()))
         self.state_atom = self.x_display.intern_atom("_NET_WM_STATE")
@@ -325,7 +334,7 @@ class X11WindowHints:
 
     def apply_aspect_ratio(self) -> None:
         hints = self.window.get_wm_normal_hints()
-        aspect = {"num": VIDEO_ASPECT_WIDTH, "denum": VIDEO_ASPECT_HEIGHT}
+        aspect = {"num": self.aspect_width, "denum": self.aspect_height}
         if hints is None:
             fields = {"flags": 0}
         else:
@@ -341,6 +350,13 @@ class X11WindowHints:
         fields["max_aspect"] = aspect
         self.window.set_wm_normal_hints(fields)
         self.x_display.flush()
+
+    def set_aspect_ratio(self, width: int, height: int) -> None:
+        if width <= 0 or height <= 0:
+            return
+        self.aspect_width = width
+        self.aspect_height = height
+        self.apply_aspect_ratio()
 
     def close(self) -> None:
         self.notifier.setEnabled(False)
@@ -2110,6 +2126,65 @@ class VideoWidget(QWidget):
         super().closeEvent(event)
 
 
+class AspectVideoFrame(QWidget):
+    def __init__(self, video: QWidget) -> None:
+        super().__init__()
+        self.video = video
+        video.setParent(self)
+        video.setMinimumSize(1, 1)
+        self.setMinimumSize(320, 180)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        self.setStyleSheet("background-color: #171717;")
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        width = min(self.width(), round(self.height() * VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT))
+        height = min(self.height(), round(width * VIDEO_ASPECT_HEIGHT / VIDEO_ASPECT_WIDTH))
+        self.video.setGeometry((self.width() - width) // 2, (self.height() - height) // 2, width, height)
+
+
+class CameraTitle(QLabel):
+    moved = pyqtSignal(str, str)
+
+    def __init__(self, uid: str, text: str) -> None:
+        super().__init__(text)
+        self.uid = uid
+        self.drag_start: QPoint | None = None
+        self.setAcceptDrops(True)
+        self.setStyleSheet(CAMERA_LABEL_STYLE)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_start = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self.drag_start is None or not self.uid:
+            return
+        if (event.position().toPoint() - self.drag_start).manhattanLength() < QApplication.startDragDistance():
+            return
+        self.drag_start = None
+        data = QMimeData()
+        data.setData(CAMERA_DRAG_MIME, self.uid.encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(data)
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        self.drag_start = None
+        super().mouseReleaseEvent(event)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasFormat(CAMERA_DRAG_MIME) and bytes(event.mimeData().data(CAMERA_DRAG_MIME)).decode("utf-8") != self.uid:
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        source = bytes(event.mimeData().data(CAMERA_DRAG_MIME)).decode("utf-8")
+        if source != self.uid:
+            self.moved.emit(source, self.uid)
+            event.acceptProposedAction()
+
+
 class TimelineWidget(QWidget):
     seek_requested = pyqtSignal(object)
     range_changed = pyqtSignal(object, object)
@@ -2688,6 +2763,8 @@ class CameraPreview(QWidget):
 
     def __init__(self, camera: AccountDevice | RtspCamera) -> None:
         super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        self.setStyleSheet("background-color: #171717;")
         self.camera = camera
         self.player: subprocess.Popen[bytes] | None = None
         self.mpv_directory: tempfile.TemporaryDirectory[str] | None = None
@@ -2701,14 +2778,13 @@ class CameraPreview(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        self.label = QLabel(camera.name)
-        self.label.setStyleSheet("color: white; background-color: #242424; padding: 5px 10px;")
+        self.label = CameraTitle(camera.uid, camera.name)
         layout.addWidget(self.label)
         self.video = QWidget()
         self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
-        self.video.setMinimumSize(320, 180)
         self.video.setStyleSheet("background-color: #171717;")
-        layout.addWidget(self.video, 1)
+        self.frame = AspectVideoFrame(self.video)
+        layout.addWidget(self.frame, 1)
 
     def start(self) -> None:
         if self.closing or self.worker is not None:
@@ -2814,6 +2890,7 @@ class MainWindow(QMainWindow):
         self.device_accounts: dict[str, str] = {}
         self.previews: dict[str, CameraPreview] = {}
         self.retired_previews: list[CameraPreview] = []
+        self.preview_layout: str | None = None
         self.pending_camera: tuple[str, str] | None = None
         self.account_queue: list[tuple[str, str]] = []
         self.account_worker: AccountWorker | None = None
@@ -2860,11 +2937,12 @@ class MainWindow(QMainWindow):
         if self.account_username and self.account_username not in self.accounts:
             self.accounts.insert(0, self.account_username)
         body = QWidget()
+        body.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        body.setStyleSheet("background-color: #171717;")
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
         self.video = VideoWidget()
         self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
-        self.video.setMinimumSize(640, 360)
         self.video.setStyleSheet("background-color: #171717;")
         self.video.clicked.connect(self.toggle_overlay)
         self.video.dragged.connect(self.move_by_drag)
@@ -2874,7 +2952,16 @@ class MainWindow(QMainWindow):
         self.video_grid = QGridLayout()
         self.video_grid.setContentsMargins(0, 0, 0, 0)
         self.video_grid.setSpacing(2)
-        self.video_grid.addWidget(self.video, 0, 0)
+        self.primary_pane = QWidget()
+        primary_layout = QVBoxLayout(self.primary_pane)
+        primary_layout.setContentsMargins(0, 0, 0, 0)
+        primary_layout.setSpacing(0)
+        self.primary_label = CameraTitle("", "")
+        self.primary_label.moved.connect(self.swap_cameras)
+        primary_layout.addWidget(self.primary_label)
+        self.primary_frame = AspectVideoFrame(self.video)
+        primary_layout.addWidget(self.primary_frame, 1)
+        self.video_grid.addWidget(self.primary_pane, 0, 0)
         layout.addLayout(self.video_grid, 1)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
@@ -3118,6 +3205,14 @@ class MainWindow(QMainWindow):
         self.show_all_action.setCheckable(True)
         self.show_all_action.setChecked(self.settings.value(MULTIVIEW_SETTING, True, bool))
         self.show_all_action.toggled.connect(self.set_show_all_cameras)
+        self.camera_layout_menu = menu.addMenu("Camera layout")
+        layout_group = QActionGroup(self)
+        for value, label in (("horizontal", "Side by side"), ("vertical", "Stacked")):
+            action = self.camera_layout_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(value == self.camera_layout())
+            action.triggered.connect(lambda checked=False, orientation=value: self.set_camera_layout(orientation))
+            layout_group.addAction(action)
         add_camera_menu = menu.addMenu("Add camera")
         self.add_account_action = add_camera_menu.addAction("O-KAM account...")
         self.add_account_action.triggered.connect(self.change_account)
@@ -3170,6 +3265,7 @@ class MainWindow(QMainWindow):
 
     def update_tray_menu(self) -> None:
         self.window_action.setText("Hide window" if self.isVisible() else "Show window")
+        self.camera_layout_menu.setEnabled(len(self.devices) > 1)
         self.add_account_action.setEnabled(self.account_worker is None)
         text_color = self.tray.contextMenu().palette().color(QPalette.ColorRole.WindowText)
         for action, button in self.tray_actions:
@@ -3181,7 +3277,7 @@ class MainWindow(QMainWindow):
 
     def update_cameras_menu(self) -> None:
         self.cameras_menu.clear()
-        for device in self.devices:
+        for device in self.ordered_devices():
             username = self.device_accounts[device.uid]
             label = f"{device.name} · RTSP (local)" if isinstance(device, RtspCamera) else f"{device.name} · O-KAM ({username})"
             action = self.cameras_menu.addAction(label)
@@ -3331,6 +3427,36 @@ class MainWindow(QMainWindow):
         self.settings.sync()
         self.sync_previews()
 
+    def camera_layout(self) -> str:
+        value = self.settings.value(MULTIVIEW_LAYOUT_SETTING, "horizontal", str)
+        return value if value in ("horizontal", "vertical") else "horizontal"
+
+    def set_camera_layout(self, value: str) -> None:
+        if value not in ("horizontal", "vertical"):
+            return
+        self.settings.setValue(MULTIVIEW_LAYOUT_SETTING, value)
+        self.settings.sync()
+        self.sync_previews()
+
+    def ordered_devices(self) -> list[AccountDevice | RtspCamera]:
+        try:
+            saved = json.loads(self.settings.value(CAMERA_ORDER_SETTING, "[]", str))
+        except (ValueError, TypeError):
+            saved = []
+        order = {uid: index for index, uid in enumerate(saved) if isinstance(uid, str)} if isinstance(saved, list) else {}
+        return sorted(self.devices, key=lambda camera: order.get(camera.uid, len(order)))
+
+    def swap_cameras(self, source_uid: str, target_uid: str) -> None:
+        order = [camera.uid for camera in self.ordered_devices()]
+        if source_uid not in order or target_uid not in order or source_uid == target_uid:
+            return
+        source_index = order.index(source_uid)
+        target_index = order.index(target_uid)
+        order[source_index], order[target_index] = order[target_index], order[source_index]
+        self.settings.setValue(CAMERA_ORDER_SETTING, json.dumps(order))
+        self.settings.sync()
+        self.sync_previews()
+
     def _retire_preview(self, preview: CameraPreview) -> None:
         self.video_grid.removeWidget(preview)
         preview.hide()
@@ -3346,27 +3472,41 @@ class MainWindow(QMainWindow):
 
     def sync_previews(self) -> None:
         selected = getattr(self, "selected_device", None)
+        ordered = self.ordered_devices()
         cameras = (
-            [camera for camera in self.devices if camera.uid != selected.uid]
+            [camera for camera in ordered if camera.uid != selected.uid]
             if selected is not None and self.settings.value(MULTIVIEW_SETTING, True, bool) else []
         )
+        layout = self.camera_layout()
+        changed = len(cameras) != len(self.previews) or layout != self.preview_layout
         desired = {camera.uid for camera in cameras}
         for uid, preview in list(self.previews.items()):
             if uid not in desired:
                 del self.previews[uid]
                 self._retire_preview(preview)
-        for index, camera in enumerate(cameras, 1):
+        visible = ordered if cameras else ([selected] if selected is not None else [])
+        for index, camera in enumerate(visible):
+            row, column = (index, 0) if layout == "vertical" else (index // 2, index % 2)
+            if selected is not None and camera.uid == selected.uid:
+                self.video_grid.addWidget(self.primary_pane, row, column)
+                continue
             preview = self.previews.get(camera.uid)
             if preview is None:
                 preview = CameraPreview(camera)
+                preview.label.moved.connect(self.swap_cameras)
                 self.previews[camera.uid] = preview
-                self.video_grid.addWidget(preview, index // 2, index % 2)
+                self.video_grid.addWidget(preview, row, column)
                 preview.show()
                 preview.start()
             else:
-                self.video_grid.addWidget(preview, index // 2, index % 2)
-        if len(cameras) == 1 and self.width() < 1120:
+                self.video_grid.addWidget(preview, row, column)
+        self.preview_layout = layout
+        if len(cameras) == 1 and layout == "horizontal" and self.width() < 1120:
             self.resize(1120, self.height())
+        if changed:
+            self.aspect_fitted = False
+            if self.isVisible():
+                QTimer.singleShot(0, self.fit_video_aspect)
 
     def add_rtsp_camera(self) -> None:
         dialog = QDialog(self)
@@ -3549,6 +3689,8 @@ class MainWindow(QMainWindow):
         username, uid = self.pending_camera
         self.pending_camera = None
         self.selected_device = next(device for device in self.devices if device.uid == uid)
+        self.primary_label.uid = uid
+        self.primary_label.setText(self.selected_device.name)
         self.settings.setValue("camera/selected_uid", uid)
         self.settings.setValue("camera/selected_account", username)
         self.settings.sync()
@@ -3655,6 +3797,8 @@ class MainWindow(QMainWindow):
                 (device for device in self.devices if device.uid == saved_uid),
                 next((device for device in self.devices if device.name == "Jardin"), self.devices[0]),
             )
+            self.primary_label.uid = self.selected_device.uid
+            self.primary_label.setText(self.selected_device.name)
             self.replay_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
             self.ptz_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
             if isinstance(self.selected_device, RtspCamera):
@@ -3956,10 +4100,22 @@ class MainWindow(QMainWindow):
             set_button_icon(self.fullscreen_button, "exit_fullscreen", "Exit full screen")
 
     def fit_video_aspect(self) -> None:
-        if self.isFullScreen() or self.previews or self.video.width() <= 0 or self.video.height() <= 0:
+        if self.isFullScreen():
             return
-        video_height = round(self.video.width() * VIDEO_ASPECT_HEIGHT / VIDEO_ASPECT_WIDTH)
-        self.resize(self.width(), self.height() - self.video.height() + video_height)
+        count = 1 + len(self.previews)
+        columns = 1 if self.camera_layout() == "vertical" or count == 1 else 2
+        rows = (count + columns - 1) // columns
+        label_height = self.primary_label.sizeHint().height()
+        available_height = QApplication.primaryScreen().availableGeometry().height() - 80
+        width = self.width()
+        height = rows * (round(width / columns * VIDEO_ASPECT_HEIGHT / VIDEO_ASPECT_WIDTH) + label_height)
+        height += (rows - 1) * self.video_grid.spacing()
+        if height > available_height:
+            width = round((available_height / rows - label_height) * VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT * columns)
+            height = available_height
+        if self.window_hints is not None:
+            self.window_hints.set_aspect_ratio(width, height)
+        self.resize(width, height)
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
