@@ -85,6 +85,9 @@ If the account service is unavailable, the viewer tries the saved camera credent
 When the account token expires, import a renewed authenticated session; automatic iCam365 account sign-in is not implemented.
 After restarting the viewer, that camera uses its native transport for live view and local recordings; the phone is not needed.
 One native session supplies all local consumers, with ordered packets, acknowledgements, bounded retries, and explicit video/audio stop commands before disconnecting.
+Each missing packet has an eight-second recovery window; recovering a gap starts a fresh window for the next missing packet while duplicate packets keep the current deadline.
+Incoming datagrams are acknowledged immediately.
+Closing a native session waits up to five seconds for video/audio stop acknowledgements despite media gaps, and closes all punched endpoints even after an unsuccessful connection attempt.
 A loopback-only HTTP stream feeds the existing player and recording UI, preserving the original HEVC video while converting A-law audio to AAC for the local stream.
 The native connection supports the On/Automatic light control and short Up/Down motor pulses.
 Directory lookup and a direct native connection were verified locally; the relay path outside the home remains unverified.

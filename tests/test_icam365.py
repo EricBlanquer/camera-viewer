@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import struct
 import tempfile
 import time
@@ -21,13 +22,24 @@ class FakeTransport:
         self.packets = []
         self.sent = []
         self.closed = False
+        self.sock = self
+        self.received_ack_counts = []
+        self._via = "direct"
+        self.punch_targets = []
+        self.sent_addresses = []
+
+    def settimeout(self, timeout):
+        pass
+
+    def recvfrom(self, size):
+        if not self.packets:
+            raise socket.timeout()
+        self.received_ack_counts.append(len(self.sent))
+        return self.packets.pop(0)
 
     def _send(self, packet, peer):
         self.sent.append(packet)
-
-    def _recv(self, timeout):
-        packets, self.packets = self.packets, []
-        return packets
+        self.sent_addresses.append(peer)
 
     def _drw_packet(self, data, channel, idx):
         body = bytes([0xD1, channel]) + struct.pack(">H", idx) + data
@@ -67,6 +79,65 @@ class NativeTransportTest(unittest.TestCase):
         channel.gap_since = time.monotonic() - 9
         with self.assertRaises(OSError):
             channel.check_timeout()
+
+    def test_recovered_gap_starts_a_new_timeout_for_next_missing_packet(self):
+        channel = OrderedChannel()
+        with patch("icam365.time.monotonic", return_value=100):
+            channel.feed(1, b"one")
+        with patch("icam365.time.monotonic", return_value=107):
+            channel.feed(3, b"three")
+            self.assertEqual(channel.feed(0, b"zero"), b"zeroone")
+        with patch("icam365.time.monotonic", return_value=109):
+            channel.check_timeout()
+        with patch("icam365.time.monotonic", return_value=116):
+            with self.assertRaises(OSError):
+                channel.check_timeout()
+
+    def test_out_of_order_packets_and_duplicates_do_not_extend_a_stalled_gap(self):
+        channel = OrderedChannel()
+        with patch("icam365.time.monotonic", return_value=100):
+            channel.feed(1, b"one")
+        with patch("icam365.time.monotonic", return_value=107):
+            channel.feed(2, b"two")
+            channel.feed(1, b"one")
+        with patch("icam365.time.monotonic", return_value=109):
+            with self.assertRaises(OSError):
+                channel.check_timeout()
+
+    def test_gap_recovery_timeout_survives_sequence_wrap(self):
+        channel = OrderedChannel(65535)
+        with patch("icam365.time.monotonic", return_value=100):
+            channel.feed(0, b"zero")
+        with patch("icam365.time.monotonic", return_value=107):
+            channel.feed(2, b"two")
+            self.assertEqual(channel.feed(65535, b"last"), b"lastzero")
+            self.assertEqual(channel.expected, 1)
+        with patch("icam365.time.monotonic", return_value=109):
+            channel.check_timeout()
+            self.assertEqual(channel.feed(1, b"one"), b"onetwo")
+        self.assertIsNone(channel.gap_since)
+
+    def test_control_audio_and_video_keep_receiving_after_successive_gaps(self):
+        for channel in (0, 1, 2):
+            with self.subTest(channel=channel):
+                session, transport = self.session()
+                payload = struct.pack("<III", 0x8003, 4, 0) if channel == 0 else b"firstsecondthirdfourth"
+                chunks = [payload[index:index + 4] for index in range(0, 12, 4)] + [payload[12:]]
+                received, commands = [], []
+                for timestamp, indexes in ((100, (1,)), (107, (3, 0)), (109, ()), (110, (2,))):
+                    transport.packets = [
+                        (transport._drw_packet(chunks[index], channel, index), ("127.0.0.1", 32100))
+                        for index in indexes
+                    ]
+                    with patch("icam365.time.monotonic", return_value=timestamp):
+                        media, replies = session.receive()
+                    received.extend(data for _, data in media)
+                    commands.extend(replies)
+                if channel == 0:
+                    self.assertEqual(commands, [(0x8003, b"\0" * 4)])
+                else:
+                    self.assertEqual(b"".join(received), payload)
+                self.assertIsNone(session.channels[channel].gap_since)
 
     def test_video_handles_split_frame_and_clock_sync_header(self):
         parser = MediaFrames((80,))
@@ -109,12 +180,60 @@ class NativeTransportTest(unittest.TestCase):
         self.assertEqual(commands, [(0x8003, b"\0" * 4)])
         self.assertEqual(len(transport.sent), 4)
 
+    def test_each_datagram_is_acknowledged_before_receiving_the_next(self):
+        session, transport = self.session()
+        transport.packets = [
+            (transport._drw_packet(b"first", 2, 0), ("127.0.0.1", 32100)),
+            (transport._drw_packet(b"second", 2, 1), ("127.0.0.1", 32100)),
+        ]
+        media, commands = session.receive()
+        self.assertEqual(media, [(2, b"first"), (2, b"second")])
+        self.assertEqual(commands, [])
+        self.assertEqual(transport.received_ack_counts, [0, 1])
+
     def test_close_stops_media_before_closing_connection(self):
         session, transport = self.session()
         session.authenticated = True
-        session.receive = lambda: session.pending.clear()
+        session.receive = lambda control_only=False: session.pending.clear()
         session.close()
-        self.assertEqual([struct.unpack_from("<I", packet, 8)[0] for packet in transport.sent], [0x2FF, 0x301])
+        self.assertEqual([
+            struct.unpack_from("<I", packet, 8)[0] for packet in transport.sent if packet[:2] == b"\xf1\xd0"
+        ], [0x2FF, 0x301])
+        self.assertTrue(transport.closed)
+
+    def test_close_retries_lost_stop_command_after_media_timeout(self):
+        session, transport = self.session()
+        session.authenticated = True
+        session.channels[1].feed(1, b"pending audio")
+        session.channels[1].gap_since = time.monotonic() - 9
+        peer = ("127.0.0.1", 32100)
+        transport.packets = [(transport._drw_packet(b"later audio", 1, 2), peer)]
+        send = transport._send
+        video_stops = []
+        def acknowledge_retry(packet, destination):
+            send(packet, destination)
+            if packet[:2] != b"\xf1\xd0":
+                return
+            command = struct.unpack_from("<I", packet, 8)[0]
+            if command == 0x2FF:
+                video_stops.append(packet)
+                if len(video_stops) == 1:
+                    return
+            index = packet[6:8]
+            transport.packets.append((b"\xf1\xd1\0\x06\xd1\0\0\x01" + index, peer))
+        transport._send = acknowledge_retry
+        session.close()
+        self.assertEqual(len(video_stops), 2)
+        self.assertEqual(session.pending, {})
+        self.assertTrue(transport.closed)
+
+    def test_failed_rendezvous_closes_every_punched_port(self):
+        session, transport = self.session()
+        transport.peer = None
+        transport.punch_targets = [SimpleNamespace(ip="127.0.0.1", port=32100)]
+        session.close()
+        self.assertEqual(set(transport.sent_addresses), {("127.0.0.1", port) for port in range(32097, 32104)})
+        self.assertTrue(all(packet == b"\xf1\xf0\0\0" for packet in transport.sent))
         self.assertTrue(transport.closed)
 
     def test_config_rejects_public_credentials_and_invalid_types(self):

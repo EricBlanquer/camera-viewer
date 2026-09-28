@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +28,10 @@ CONFIG_PATH = Path.home() / ".config/camera-viewer/icam365.json"
 MAX_FRAME_SIZE = 1024 * 1024
 MAX_PENDING_PACKETS = 4096
 MAX_CHANNEL_BUFFER = 8 * 1024 * 1024
+PACKET_GAP_TIMEOUT = 8
+RECEIVE_POLL_SECONDS = 0.05
+STOP_ACK_TIMEOUT_SECONDS = 5
+CLOSE_NOTIFICATION_RETRIES = 2
 LOG = logging.getLogger("okam-linux.icam365")
 
 
@@ -100,11 +105,14 @@ class OrderedChannel:
             self.pending_bytes -= len(chunk)
             chunks.append(chunk)
             self.expected = (self.expected + 1) & 0xFFFF
-        self.gap_since = (self.gap_since or time.monotonic()) if self.pending else None
+        if not self.pending:
+            self.gap_since = None
+        elif chunks or self.gap_since is None:
+            self.gap_since = time.monotonic()
         return b"".join(chunks)
 
     def check_timeout(self) -> None:
-        if self.gap_since is not None and time.monotonic() - self.gap_since > 8:
+        if self.gap_since is not None and time.monotonic() - self.gap_since > PACKET_GAP_TIMEOUT:
             raise OSError("The iCam365 media channel lost packets.")
 
 
@@ -165,7 +173,19 @@ class NativeSession:
             raise OSError("The iCam365 native connection is closed.")
         self.session._send(packet, (peer.ip, peer.port))
 
-    def receive(self) -> tuple[list[tuple[int, bytes]], list[tuple[int, bytes]]]:
+    def _receive_packets(self) -> Iterator[tuple[bytes, tuple[str, int]]]:
+        sock = self.session.sock
+        if sock is None:
+            raise OSError("The iCam365 native connection is closed.")
+        deadline = time.monotonic() + RECEIVE_POLL_SECONDS
+        while (remaining := deadline - time.monotonic()) > 0:
+            sock.settimeout(remaining)
+            try:
+                yield sock.recvfrom(65535)
+            except (socket.timeout, BlockingIOError):
+                break
+
+    def receive(self, control_only: bool = False) -> tuple[list[tuple[int, bytes]], list[tuple[int, bytes]]]:
         media, commands = [], []
         now = time.monotonic()
         if now - self.last_alive > 1:
@@ -177,7 +197,7 @@ class NativeSession:
                     raise OSError("The iCam365 camera did not acknowledge a command.")
                 self._send(packet)
                 self.pending[index] = (packet, now, retries + 1)
-        for data, address in self.session._recv(0.05):
+        for data, address in self._receive_packets():
             peer = self.session.peer
             if peer is None or address != (peer.ip, peer.port) or len(data) < 4:
                 continue
@@ -197,13 +217,24 @@ class NativeSession:
                 if channel not in self.channels:
                     continue
                 self._send(header(0xD1, 6) + bytes([0xD1, channel, 0, 1]) + data[6:8])
+                if control_only:
+                    continue
                 ordered = self.channels[channel].feed(index, data[8:])
                 if channel == 0:
                     self.control_buffer.extend(ordered)
                 elif ordered:
                     media.append((channel, ordered))
-        for channel in self.channels.values():
-            channel.check_timeout()
+        if control_only:
+            return media, commands
+        for index, channel in self.channels.items():
+            try:
+                channel.check_timeout()
+            except OSError:
+                LOG.warning(
+                    "iCam365 packet gap: channel=%d expected=%d buffered=%d transport=%s",
+                    index, channel.expected, len(channel.pending), self.session._via,
+                )
+                raise
         while len(self.control_buffer) >= 8:
             command, size = struct.unpack_from("<II", self.control_buffer)
             if size > MAX_FRAME_SIZE:
@@ -227,13 +258,26 @@ class NativeSession:
             if self.authenticated and self.session.peer:
                 self.send(0x2FF, struct.pack("<II", 2, 0))
                 self.send(0x301, struct.pack("<II", 1, 0))
-                deadline = time.monotonic() + 0.5
+                deadline = time.monotonic() + STOP_ACK_TIMEOUT_SECONDS
                 while self.pending and time.monotonic() < deadline:
-                    self.receive()
+                    self.receive(control_only=True)
         except OSError:
             pass
         finally:
-            self.session.close()
+            try:
+                if self.session.sock is not None:
+                    targets = {
+                        (target.ip, target.port + offset)
+                        for target in self.session.punch_targets for offset in range(-3, 4)
+                        if 1 <= target.port + offset <= 65535
+                    }
+                    if self.session.peer is not None:
+                        targets.add((self.session.peer.ip, self.session.peer.port))
+                    for _ in range(CLOSE_NOTIFICATION_RETRIES):
+                        for target in targets:
+                            self.session._send(header(0xF0, 0), target)
+            finally:
+                self.session.close()
 
 
 class StreamHandler(BaseHTTPRequestHandler):
