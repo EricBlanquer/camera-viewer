@@ -137,6 +137,15 @@ class MediaFrames:
         return frames
 
 
+class NativePpppSession(PpppSession):
+    def _recv(self, timeout: float = 0.4) -> list[tuple[bytes, tuple[str, int]]]:
+        packets = super()._recv(timeout)
+        for data, address in packets:
+            if self._uid and data == header(0x42, 20) + self._uid:
+                self._send(header(0x43, 0), address)
+        return packets
+
+
 class NativeSession:
     def __init__(self, config: NativeConfig) -> None:
         decoded = decode_init_string(config.platform, lut=_DECODE_LOOKUP)
@@ -144,7 +153,7 @@ class NativeSession:
             raise OSError("Invalid iCam365 directory configuration.")
         configure_tables(prop_table=_SHUFFLE)
         self.config = config
-        self.session = PpppSession(real_did=config.did, servers=decoded.servers)
+        self.session = NativePpppSession(real_did=config.did, servers=decoded.servers)
         self.channels = {index: OrderedChannel() for index in range(3)}
         self.sequence = 0
         self.pending: dict[int, tuple[bytes, float, int]] = {}
@@ -205,6 +214,9 @@ class NativeSession:
                 continue
             if data[:2] == b"\xf1\xe0":
                 self._send(header(0xE1, 0))
+            elif data[:2] in (b"\xf1\x41", b"\xf1\x42") and data[4:] == self.session._uid:
+                reply = header(0x42, 20) + self.session._uid if data[1] == 0x41 else header(0x43, 0)
+                self._send(reply)
             elif data[:2] == b"\xf1\xf0":
                 raise OSError("The iCam365 camera closed its native connection.")
             elif data[:2] == b"\xf1\xd1" and len(data) >= 10 and data[5] == 0:

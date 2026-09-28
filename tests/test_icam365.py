@@ -12,6 +12,7 @@ from unittest.mock import patch
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PyQt6.QtWidgets import QApplication
+from cs2pppp import PpppSession
 from app import CameraPreview, RtspCamera, mpv_rtsp_command
 from icam365 import MAX_FRAME_SIZE, MediaFrames, NativeConfig, NativeSession, OrderedChannel, load_config
 
@@ -25,6 +26,7 @@ class FakeTransport:
         self.sock = self
         self.received_ack_counts = []
         self._via = "direct"
+        self._uid = b"test-camera".ljust(20, b"\0")
         self.punch_targets = []
         self.sent_addresses = []
 
@@ -56,7 +58,7 @@ class NativeTransportTest(unittest.TestCase):
     def session(self):
         transport = FakeTransport()
         decoded = SimpleNamespace(lib_ok=True, servers=("127.0.0.1",))
-        with patch("icam365.decode_init_string", return_value=decoded), patch("icam365.PpppSession", return_value=transport):
+        with patch("icam365.decode_init_string", return_value=decoded), patch("icam365.NativePpppSession", return_value=transport):
             session = NativeSession(NativeConfig("TEST-000001-ABCDE", "AA", "test-password"))
         session.last_alive = time.monotonic()
         return session, transport
@@ -190,6 +192,29 @@ class NativeTransportTest(unittest.TestCase):
         self.assertEqual(media, [(2, b"first"), (2, b"second")])
         self.assertEqual(commands, [])
         self.assertEqual(transport.received_ack_counts, [0, 1])
+
+    def test_camera_readiness_is_acknowledged_during_connection(self):
+        decoded = SimpleNamespace(lib_ok=True, servers=("127.0.0.1",))
+        with patch("icam365.decode_init_string", return_value=decoded):
+            session = NativeSession(NativeConfig("TEST-000001-ABCDE", "AA", "test-password"))
+        transport = session.session
+        transport._uid = b"test-camera".ljust(20, b"\0")
+        peer = ("127.0.0.1", 32100)
+        packets = [(b"\xf1\x42\0\x14" + transport._uid, peer)]
+        with patch.object(PpppSession, "_recv", return_value=packets), patch.object(transport, "_send") as send:
+            self.assertEqual(transport._recv(), packets)
+        send.assert_called_once_with(b"\xf1\x43\0\0", peer)
+
+    def test_repeated_punch_and_readiness_are_answered_during_stream(self):
+        session, transport = self.session()
+        peer = ("127.0.0.1", 32100)
+        transport.packets = [
+            (b"\xf1\x41\0\x14" + transport._uid, peer),
+            (b"\xf1\x42\0\x14" + transport._uid, peer),
+            (b"\xf1\x42\0\x14" + b"other-camera".ljust(20, b"\0"), peer),
+        ]
+        self.assertEqual(session.receive(), ([], []))
+        self.assertEqual(transport.sent, [b"\xf1\x42\0\x14" + transport._uid, b"\xf1\x43\0\0"])
 
     def test_close_stops_media_before_closing_connection(self):
         session, transport = self.session()

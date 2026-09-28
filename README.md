@@ -87,6 +87,7 @@ After restarting the viewer, that camera uses its native transport for live view
 One native session supplies all local consumers, with ordered packets, acknowledgements, bounded retries, and explicit video/audio stop commands before disconnecting.
 Each missing packet has an eight-second recovery window; recovering a gap starts a fresh window for the next missing packet while duplicate packets keep the current deadline.
 Incoming datagrams are acknowledged immediately.
+Camera readiness is acknowledged during connection setup and repeated readiness or punch messages are answered during streaming.
 Closing a native session waits up to five seconds for video/audio stop acknowledgements despite media gaps, and closes all punched endpoints even after an unsuccessful connection attempt.
 A loopback-only HTTP stream feeds the existing player and recording UI, preserving the original HEVC video while converting A-law audio to AAC for the local stream.
 The native connection supports the On/Automatic light control and short Up/Down motor pulses.
