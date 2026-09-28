@@ -94,6 +94,7 @@ from okam_native.p2p import (
     select_camera_password,
 )
 from okam_native.wakeup import WakeError, load_wake_credentials, wake_camera
+from icam365 import close_bridge, get_bridge
 from Xlib import X as X11, Xutil, display as xdisplay
 from Xlib.protocol import event as xevent
 
@@ -640,7 +641,8 @@ def mpv_rtsp_command(
             raise ValueError("A private Imou stream playlist is required.")
         command[-1] = f"--playlist=/proc/self/fd/{playlist_fd}"
     else:
-        command[-1] = camera.url
+        bridge = get_bridge(camera.uid)
+        command[-1] = bridge.url if bridge is not None else camera.url
     command.insert(-1, f"--rtsp-transport={camera.transport}")
     return command
 
@@ -2962,6 +2964,7 @@ class RtspStreamWorker(QThread):
         self.light_request: str | None = None
         self.ptz_lock = threading.Lock()
         self.ptz_request: str | None = None
+        self.native_bridge = None
 
     def set_continuous(self, enabled: bool) -> None:
         if enabled:
@@ -2998,7 +3001,8 @@ class RtspStreamWorker(QThread):
                 "-i", f"/proc/self/fd/{playlist_fd}",
             ]
         else:
-            command += ["-rtsp_transport", self.camera.transport, "-i", self.camera.url]
+            bridge = get_bridge(self.camera.uid)
+            command += (["-i", bridge.url] if bridge is not None else ["-rtsp_transport", self.camera.transport, "-i", self.camera.url])
         command += ["-map", "0:v:0", "-map", "0:a?", "-c", "copy"]
         if segmented:
             command += [
@@ -3044,10 +3048,13 @@ class RtspStreamWorker(QThread):
 
     def run(self) -> None:
         try:
-            deadline = time.monotonic() + 30
+            self.native_bridge = get_bridge(self.camera.uid)
+            deadline = time.monotonic() + (60 if self.native_bridge is not None else 30)
             while not self.stop_requested.is_set():
+                if self.native_bridge is not None and self.native_bridge.error:
+                    raise OSError(self.native_bridge.error)
                 if self.player.poll() is not None:
-                    raise OSError("The RTSP video player stopped.")
+                    raise OSError("The camera video player stopped.")
                 ready, configured = mpv_request(self.socket_path, ["get_property", "vo-configured"])
                 if ready and configured is True:
                     break
@@ -3062,23 +3069,34 @@ class RtspStreamWorker(QThread):
                 isinstance(track, dict) and track.get("type") == "audio" for track in tracks
             ):
                 self.audio_available.emit()
-            light_supported = icam365_light_request(self.camera)
+            light_supported = self.native_bridge.light_supported if self.native_bridge is not None else icam365_light_request(self.camera)
             if light_supported:
                 self.light_available.emit()
-            ptz_supported = icam365_ptz_request(self.camera)
+            if self.native_bridge is not None and self.native_bridge.light_mode is not None:
+                self.light_changed.emit(self.native_bridge.light_mode)
+            ptz_supported = self.native_bridge.ptz_supported if self.native_bridge is not None else icam365_ptz_request(self.camera)
             if ptz_supported:
                 self.ptz_available.emit()
             last_prune = 0.0
             last_position = None
             last_progress_at = time.monotonic()
+            pending_light = None
+            pending_ptz = None
             while not self.stop_requested.is_set():
+                if self.native_bridge is not None and self.native_bridge.error:
+                    raise OSError(self.native_bridge.error)
                 if self.player.poll() is not None:
-                    raise OSError("The RTSP video player stopped.")
+                    raise OSError("The camera video player stopped.")
                 with self.light_lock:
                     light_mode = self.light_request
                     self.light_request = None
                 if light_mode is not None:
-                    if light_supported and icam365_light_request(self.camera, light_mode):
+                    if self.native_bridge is not None:
+                        if self.native_bridge.control(0x8014, struct.pack("<III", 0, 1 if light_mode == ICAM365_LIGHT_ON else 2, 0)):
+                            pending_light = (light_mode, time.monotonic() + 8)
+                        else:
+                            self.light_failed.emit()
+                    elif light_supported and icam365_light_request(self.camera, light_mode):
                         self.light_changed.emit(light_mode)
                     else:
                         self.light_failed.emit()
@@ -3086,10 +3104,37 @@ class RtspStreamWorker(QThread):
                     direction = self.ptz_request
                     self.ptz_request = None
                 if direction is not None:
-                    if ptz_supported and icam365_ptz_request(self.camera, direction):
+                    if self.native_bridge is not None:
+                        control = 1 if direction == "Up" else 2
+                        if self.native_bridge.control(0x1001, bytes([control, 0, 0, 0, 0, 6, 0, 0])):
+                            pending_ptz = (direction, time.monotonic() + 8)
+                        else:
+                            self.control_failed.emit("Camera movement failed.")
+                    elif ptz_supported and icam365_ptz_request(self.camera, direction):
                         self.control_completed.emit(direction)
                     else:
                         self.control_failed.emit("Camera movement failed.")
+                if self.native_bridge is not None:
+                    while not self.native_bridge.control_results.empty():
+                        command, success = self.native_bridge.control_results.get_nowait()
+                        if command == 0x8014 and pending_light is not None:
+                            if success:
+                                self.light_changed.emit(pending_light[0])
+                            else:
+                                self.light_failed.emit()
+                            pending_light = None
+                        elif command == 0x1001 and pending_ptz is not None:
+                            if success:
+                                self.control_completed.emit(pending_ptz[0])
+                            else:
+                                self.control_failed.emit("Camera movement failed.")
+                            pending_ptz = None
+                    if pending_light is not None and time.monotonic() > pending_light[1]:
+                        self.light_failed.emit()
+                        pending_light = None
+                    if pending_ptz is not None and time.monotonic() > pending_ptz[1]:
+                        self.control_failed.emit("Camera movement failed.")
+                        pending_ptz = None
                 position_ready, position = mpv_request(self.socket_path, ["get_property", "time-pos"])
                 if position_ready and isinstance(position, (int, float)) and position != last_position:
                     last_position = position
@@ -3144,6 +3189,7 @@ class RtspStreamWorker(QThread):
             self._stop_recording()
             if self.continuous is not None:
                 self._finish(self.continuous)
+            close_bridge(self.camera.uid)
 
 
 class CameraPreview(QWidget):
@@ -3371,6 +3417,8 @@ class CameraPreview(QWidget):
                 pass_fds=(playlist_fd,) if playlist_fd is not None else (),
             )
         except OSError as ex:
+            if rtsp_camera is not None:
+                close_bridge(rtsp_camera.uid)
             message = str(ex) if isinstance(ex, CameraCredentialError) else "Player unavailable"
             self.label.setText(f"{self.camera.name} · {message}")
             self._cleanup_player()
@@ -5236,6 +5284,8 @@ class MainWindow(QMainWindow):
                 pass_fds=(playlist_fd,) if playlist_fd is not None else (),
             )
         except OSError as ex:
+            if rtsp_camera is not None:
+                close_bridge(rtsp_camera.uid)
             self.mpv_socket = None
             self.mpv_directory.cleanup()
             self.mpv_directory = None

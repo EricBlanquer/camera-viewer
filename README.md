@@ -1,7 +1,7 @@
 # Camera Viewer
 
 Camera Viewer is a native Linux desktop viewer for security cameras.
-O-KAM Pro account cameras, local RTSP cameras, and Imou Life cameras with local RTSP access are supported.
+O-KAM Pro account cameras, local RTSP cameras, Imou Life cameras with local RTSP access, and configured iCam365 native connections are supported.
 It uses Qt for the interface, mpv for H.264 and H.265 playback, and the MIT-licensed [O-KAM Native Bridge](https://github.com/oleandor/okam-ha-native) for O-KAM camera discovery, wake-up, and encrypted P2P transport.
 It does not require Home Assistant, Wine, Waydroid, or the phone while viewing.
 
@@ -50,7 +50,7 @@ Use **Refresh camera list** there after adding a camera to an existing O-KAM acc
 Later launches show the video with controls available on click.
 Run `.venv/bin/python app.py --forget-account` to remove all saved O-KAM accounts.
 
-The TERUHAL QW55 used with iCam365 provides video and sound at `rtsp://<camera-LAN-address>:8001/0/av0`.
+The tested TERUHAL QW55 can provide video and sound at `rtsp://<camera-LAN-address>:8001/0/av0`.
 Select TCP transport for this model.
 Give the camera a stable LAN address so the saved URL remains valid.
 For RTSP cameras, live view, photo, local video and audio recording, continuous recording, and playback of local recordings are available when the configured stream carries audio.
@@ -63,6 +63,23 @@ The tested TERUHAL QW55 accepts these movements on its local HTTP service at por
 On the tested camera, the local endpoint acknowledged horizontal commands without moving the image and exposed no verified saved-position command; the iCam365 mobile app uses its proprietary P2P protocol for these controls.
 iCam365 microSD playback, talkback microphone, and detection notifications are not available through this RTSP connection.
 An RTSP URL is reachable outside the home only when the computer has a secure route to the camera's LAN, such as a VPN; the iCam365 account relay is not integrated.
+
+For a TERUHAL QW55 whose RTSP service is unavailable, Camera Viewer can use its authenticated iCam365 CS2/PPCS connection.
+The native connection was verified with HEVC video at 2304 × 1296 and 8 frames per second, plus G.711 A-law audio at 8 kHz.
+Add the camera as an RTSP camera, then import a device-list detail response obtained from your authenticated iCam365 account:
+
+```sh
+.venv/bin/python icam365.py --device-response /path/to/device-response.json --camera-name Entrance
+```
+
+The response must contain exactly one device with `p2p_id`, `p2p_platform`, and `password` fields.
+Connection parameters are stored in `~/.config/camera-viewer/icam365.json` with owner-only permissions and associated with the saved camera ID.
+After restarting the viewer, that camera uses its native transport for live view and local recordings; the phone is not needed.
+One native session supplies all local consumers, with ordered packets, acknowledgements, bounded retries, and explicit video/audio stop commands before disconnecting.
+A loopback-only HTTP stream feeds the existing player and recording UI, preserving the original HEVC video while converting A-law audio to AAC for the local stream.
+The native connection supports the On/Automatic light control and short Up/Down motor pulses.
+Directory lookup and a direct native connection were verified locally; the relay path outside the home remains unverified.
+This connection does not provide camera microSD playback or talkback.
 
 The Imou form uses the [Dahua main-stream RTSP path](https://www.dahuasecurity.com/asset/upload/download/DS-PSD8802-A180_Operation_Manual__201709251.pdf) `/cam/realmonitor?channel=<channel>&subtype=0` and TCP port 554 by default.
 The camera must expose that RTSP stream on the local network; model support depends on the camera and its settings.
