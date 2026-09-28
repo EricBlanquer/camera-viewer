@@ -27,6 +27,7 @@ Open **Camera Viewer** from the application menu or run `.venv/bin/python app.py
 On first launch, the window opens automatically and offers a choice of O-KAM account, RTSP camera, or local Imou Life camera.
 The O-KAM sign-in form stays open while the account is checked and displays connection errors beside the fields so the password can be corrected immediately.
 If a saved O-KAM login is rejected while the viewer is hidden, the window opens automatically and displays the error.
+Camera setup and sign-in dialogs open on the video window's screen and stay within its usable area.
 For O-KAM, the application saves the password in the desktop keyring and remembers the account in Qt settings.
 Later launches start the last selected camera or Jardin automatically.
 Use **Add camera > O-KAM account...** in the tray menu to add another account.

@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PyQt6.QtCore import QObject, QSettings, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QRect, QSettings, QTimer, pyqtSignal
+from PyQt6.QtGui import QScreen
 from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox, QLabel, QLineEdit
 
 from app import ACCOUNT_REJECTED_MESSAGE, MainWindow, RtspCamera
@@ -162,6 +163,37 @@ class OnboardingTest(unittest.TestCase):
         with patch("app.AccountWorker", FakeAccountWorker):
             self.window.change_account()
         self.assertEqual(observed, [(True, ACCOUNT_REJECTED_MESSAGE, True)])
+
+    def test_login_dialog_is_centered_on_the_video_screen(self) -> None:
+        available = QRect(1920, 0, 1920, 1080)
+        parent_frame = QRect(2200, 200, 980, 590)
+
+        def inspect_dialog(dialog: QDialog) -> int:
+            self.assertEqual(dialog.frameGeometry().center(), parent_frame.center())
+            self.assertTrue(available.contains(dialog.frameGeometry()))
+            return QDialog.DialogCode.Rejected
+
+        with patch.object(self.window, "frameGeometry", return_value=parent_frame), patch.object(
+            QScreen, "availableGeometry", return_value=available
+        ), patch.object(QApplication, "screenAt", return_value=self.window.screen()), patch.object(
+            QDialog, "exec", inspect_dialog
+        ):
+            self.window.change_account()
+
+    def test_camera_choice_dialog_stays_inside_a_screen_left_of_primary(self) -> None:
+        available = QRect(-1920, 40, 1920, 1040)
+        parent_frame = QRect(-2000, -100, 980, 590)
+
+        def inspect_dialog(dialog: QDialog) -> int:
+            self.assertTrue(available.contains(dialog.frameGeometry()))
+            return QDialog.DialogCode.Rejected
+
+        with patch.object(self.window, "frameGeometry", return_value=parent_frame), patch.object(
+            QScreen, "availableGeometry", return_value=available
+        ), patch.object(QApplication, "screenAt", return_value=self.window.screen()), patch.object(
+            QDialog, "exec", inspect_dialog
+        ):
+            self.initial_action()
 
 
 if __name__ == "__main__":

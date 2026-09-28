@@ -4105,6 +4105,42 @@ class AccountDialog(QDialog):
         self.password.selectAll()
 
 
+class DialogPlacement(QObject):
+    def __init__(self, parent: QWidget, dialog: QDialog, reposition: Callable[[], None]) -> None:
+        super().__init__(dialog)
+        self.dialog = dialog
+        self.reposition = reposition
+        self.exposed = False
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.update_position)
+        dialog.winId()
+        self.watched = (parent, dialog, dialog.windowHandle())
+        for watched in self.watched:
+            watched.installEventFilter(self)
+        self.timer.start(0)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() in (QEvent.Type.Show, QEvent.Type.Resize) or (
+            watched is self.watched[0] and event.type() == QEvent.Type.Move
+        ):
+            self.timer.start(0)
+        elif event.type() == QEvent.Type.Expose and not self.exposed:
+            self.exposed = True
+            self.timer.start(0)
+        return super().eventFilter(watched, event)
+
+    def update_position(self) -> None:
+        if self.dialog.isVisible():
+            self.reposition()
+
+    def stop(self) -> None:
+        self.timer.stop()
+        for watched in self.watched:
+            watched.removeEventFilter(self)
+        self.deleteLater()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -4867,7 +4903,7 @@ class MainWindow(QMainWindow):
                 dialog.accept()
 
         buttons.accepted.connect(accept_camera)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if self.exec_camera_dialog(dialog) != QDialog.DialogCode.Accepted:
             return
         camera = RtspCamera(
             f"rtsp:{uuid.uuid4().hex}", name.text().strip(), url.text().strip(),
@@ -4929,7 +4965,7 @@ class MainWindow(QMainWindow):
             dialog.accept()
 
         buttons.accepted.connect(accept_camera)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if self.exec_camera_dialog(dialog) != QDialog.DialogCode.Accepted:
             return
         camera = RtspCamera(
             uid, name.text().strip(), imou_rtsp_url(address.text().strip(), port.value(), channel.value()),
@@ -4972,6 +5008,26 @@ class MainWindow(QMainWindow):
     def camera_source_actions(self) -> tuple[Callable[[], None], ...]:
         return self.change_account, self.add_rtsp_camera, self.add_imou_camera
 
+    def center_camera_dialog(self, dialog: QDialog) -> None:
+        parent_frame = self.frameGeometry()
+        screen = QApplication.screenAt(parent_frame.center()) or self.screen()
+        dialog.setScreen(screen)
+        dialog.adjustSize()
+        frame = dialog.frameGeometry()
+        frame.moveCenter(parent_frame.center())
+        available = screen.availableGeometry()
+        frame.moveLeft(max(available.left(), min(frame.left(), available.right() - frame.width() + 1)))
+        frame.moveTop(max(available.top(), min(frame.top(), available.bottom() - frame.height() + 1)))
+        dialog.move(frame.topLeft())
+
+    def exec_camera_dialog(self, dialog: QDialog) -> int:
+        self.center_camera_dialog(dialog)
+        placement = DialogPlacement(self, dialog, lambda: self.center_camera_dialog(dialog))
+        try:
+            return dialog.exec()
+        finally:
+            placement.stop()
+
     def setup_cameras(self) -> None:
         self.show_window_without_stream()
         dialog = QDialog(self)
@@ -4986,7 +5042,7 @@ class MainWindow(QMainWindow):
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if self.exec_camera_dialog(dialog) == QDialog.DialogCode.Accepted:
             self.camera_source_actions()[sources.currentIndex()]()
         dialog.deleteLater()
 
@@ -5003,7 +5059,7 @@ class MainWindow(QMainWindow):
         self.account_dialog = dialog
         dialog.credentials_submitted.connect(self.start_account_lookup)
         try:
-            dialog.exec()
+            self.exec_camera_dialog(dialog)
         finally:
             self.account_dialog = None
             dialog.deleteLater()
