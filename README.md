@@ -24,7 +24,9 @@ It keeps the vendor wake configuration in `~/.local/share/okam-linux/vendor` wit
 ## Use
 
 Open **Camera Viewer** from the application menu or run `.venv/bin/python app.py` from this directory.
-On first launch, enter an O-KAM account email and password in the sign-in dialog, or close that dialog and add an RTSP camera from the tray menu.
+On first launch, the window opens automatically and offers a choice of O-KAM account, RTSP camera, or local Imou Life camera.
+The O-KAM sign-in form stays open while the account is checked and displays connection errors beside the fields so the password can be corrected immediately.
+If a saved O-KAM login is rejected while the viewer is hidden, the window opens automatically and displays the error.
 For O-KAM, the application saves the password in the desktop keyring and remembers the account in Qt settings.
 Later launches start the last selected camera or Jardin automatically.
 Use **Add camera > O-KAM account...** in the tray menu to add another account.

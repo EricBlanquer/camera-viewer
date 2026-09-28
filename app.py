@@ -124,6 +124,11 @@ INSTANCE_SERVER_PREFIX = "okam-linux"
 INSTANCE_CONNECT_TIMEOUT_MS = 500
 SHOW_WINDOW_REQUEST = b"show"
 ACCOUNT_REJECTED_MESSAGE = "O-KAM account login was rejected."
+ACCOUNT_INPUT_MESSAGE = "Enter your O-KAM account and password."
+ACCOUNT_LOADING_MESSAGE = "An account is already loading."
+CAMERA_SOURCE_LABELS = ("O-KAM account", "RTSP camera", "Imou Life camera (local)")
+FORM_ERROR_STYLE = "color: #bd4242;"
+ACCOUNT_ERROR_STYLE = "color: #ffb4ab; background-color: #3d2020; padding: 8px;"
 WAKE_SOURCE = Path.home() / ".local/share/okam-linux/vendor/device_wakeup_server.dart"
 ICON_COLOR = "#f5f5f5"
 ICON_NAME_PROPERTY = "iconName"
@@ -4052,6 +4057,54 @@ class LocalReplayPane(QWidget):
         self.stop_player()
 
 
+class AccountDialog(QDialog):
+    credentials_submitted = pyqtSignal(str, str)
+
+    def __init__(self, parent: QWidget, username: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add O-KAM account")
+        self.setMinimumWidth(360)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.username = QLineEdit(username)
+        self.username.setPlaceholderText("O-KAM account email")
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Account", self.username)
+        form.addRow("Password", self.password)
+        layout.addLayout(form)
+        self.error = QLabel()
+        self.error.setWordWrap(True)
+        self.error.setStyleSheet(FORM_ERROR_STYLE)
+        layout.addWidget(self.error)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.submit)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def submit(self) -> None:
+        if not self.username.text().strip() or not self.password.text():
+            self.show_error(ACCOUNT_INPUT_MESSAGE)
+            (self.username if not self.username.text().strip() else self.password).setFocus()
+            return
+        self.error.clear()
+        self.set_loading(True)
+        self.credentials_submitted.emit(self.username.text().strip(), self.password.text())
+
+    def set_loading(self, loading: bool) -> None:
+        self.username.setEnabled(not loading)
+        self.password.setEnabled(not loading)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not loading)
+
+    def show_error(self, message: str) -> None:
+        self.set_loading(False)
+        self.error.setText(message)
+        self.raise_()
+        self.activateWindow()
+        self.password.setFocus()
+        self.password.selectAll()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -4083,6 +4136,7 @@ class MainWindow(QMainWindow):
         self.pending_selection_start: tuple[str, bool] | None = None
         self.account_queue: list[tuple[str, str]] = []
         self.account_worker: AccountWorker | None = None
+        self.account_dialog: AccountDialog | None = None
         self.stream_worker: StreamWorker | RtspStreamWorker | None = None
         self.control_pending = False
         self.player: subprocess.Popen[bytes] | None = None
@@ -4131,6 +4185,11 @@ class MainWindow(QMainWindow):
         body.setStyleSheet("background-color: #171717;")
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
+        self.account_error = QLabel()
+        self.account_error.setWordWrap(True)
+        self.account_error.setStyleSheet(ACCOUNT_ERROR_STYLE)
+        self.account_error.hide()
+        layout.addWidget(self.account_error)
         self.video = VideoWidget()
         self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.video.setStyleSheet("background-color: #171717;")
@@ -4335,7 +4394,7 @@ class MainWindow(QMainWindow):
         if self.accounts or self.rtsp_cameras:
             QTimer.singleShot(0, self.find_cameras)
         else:
-            QTimer.singleShot(0, self.change_account)
+            QTimer.singleShot(0, self.setup_cameras)
 
     def set_status(self, text: str) -> None:
         self.base_status = text
@@ -4375,10 +4434,11 @@ class MainWindow(QMainWindow):
             action.triggered.connect(lambda checked=False, orientation=value: self.set_camera_layout(orientation))
             layout_group.addAction(action)
         add_camera_menu = menu.addMenu("Add camera")
-        self.add_account_action = add_camera_menu.addAction("O-KAM account...")
-        self.add_account_action.triggered.connect(self.change_account)
-        add_camera_menu.addAction("RTSP camera...").triggered.connect(self.add_rtsp_camera)
-        add_camera_menu.addAction("Imou Life camera (local)...").triggered.connect(self.add_imou_camera)
+        for index, (label, callback) in enumerate(zip(CAMERA_SOURCE_LABELS, self.camera_source_actions())):
+            action = add_camera_menu.addAction(f"{label}...")
+            action.triggered.connect(callback)
+            if index == 0:
+                self.add_account_action = action
         menu.addSeparator()
         self.add_tray_action(menu, self.replay_button)
         controls_menu = menu.addMenu("Camera controls")
@@ -4909,33 +4969,44 @@ class MainWindow(QMainWindow):
             self.sync_previews()
             self.set_status("No cameras available.")
 
-    def change_account(self) -> None:
+    def camera_source_actions(self) -> tuple[Callable[[], None], ...]:
+        return self.change_account, self.add_rtsp_camera, self.add_imou_camera
+
+    def setup_cameras(self) -> None:
+        self.show_window_without_stream()
         dialog = QDialog(self)
-        dialog.setWindowTitle("Add O-KAM account")
+        dialog.setWindowTitle("Add camera")
         layout = QVBoxLayout(dialog)
+        sources = QComboBox()
+        sources.addItems(CAMERA_SOURCE_LABELS)
         form = QFormLayout()
-        username = QLineEdit(self.account_username)
-        username.setPlaceholderText("O-KAM account email")
-        password = QLineEdit()
-        password.setEchoMode(QLineEdit.EchoMode.Password)
-        form.addRow("Account", username)
-        form.addRow("Password", password)
+        form.addRow("Camera source", sources)
         layout.addLayout(form)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        if not username.text().strip() or not password.text():
-            self.set_status("Enter your O-KAM account and password.")
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.camera_source_actions()[sources.currentIndex()]()
+        dialog.deleteLater()
+
+    def change_account(self) -> None:
+        if self.account_dialog is not None:
+            self.account_dialog.raise_()
+            self.account_dialog.activateWindow()
             return
         if self.account_worker is not None:
-            self.show_notice("An account is already loading.")
+            self.show_notice(ACCOUNT_LOADING_MESSAGE)
             return
-        self.start_account_lookup(username.text().strip(), password.text())
+        self.show_window_without_stream()
+        dialog = AccountDialog(self, self.account_username)
+        self.account_dialog = dialog
+        dialog.credentials_submitted.connect(self.start_account_lookup)
+        try:
+            dialog.exec()
+        finally:
+            self.account_dialog = None
+            dialog.deleteLater()
 
     def find_cameras(self) -> None:
         if self.account_worker is not None:
@@ -4955,8 +5026,10 @@ class MainWindow(QMainWindow):
         if not self.account_queue:
             if self.devices:
                 self.on_account_finished()
-            else:
+            elif self.accounts:
                 self.change_account()
+            else:
+                self.setup_cameras()
             return
         self.reconnect_timer.stop()
         self.retry_pending = False
@@ -4968,6 +5041,11 @@ class MainWindow(QMainWindow):
         self.start_account_lookup(username, password)
 
     def start_account_lookup(self, username: str, password: str) -> None:
+        if self.account_worker is not None:
+            if self.account_dialog is not None:
+                self.account_dialog.show_error(ACCOUNT_LOADING_MESSAGE)
+            return
+        self.account_error.hide()
         self.account_username = username
         self.account_secret = password
         self.set_status("Finding cameras...")
@@ -4978,6 +5056,8 @@ class MainWindow(QMainWindow):
         self.account_worker.start()
 
     def on_devices_found(self, devices: list[AccountDevice]) -> None:
+        if self.account_dialog is not None:
+            self.account_dialog.accept()
         if not save_account_password(self.account_username, self.account_secret):
             self.set_status("The keyring could not save the account.")
         else:
@@ -5056,8 +5136,14 @@ class MainWindow(QMainWindow):
             self._finish_selected_camera()
 
     def on_account_failed(self, message: str) -> None:
-        self.retry_pending = message != ACCOUNT_REJECTED_MESSAGE
+        self.retry_pending = message != ACCOUNT_REJECTED_MESSAGE and self.account_dialog is None
         self.set_status(message)
+        self.account_error.setText(message)
+        self.account_error.show()
+        if self.account_dialog is not None:
+            self.account_dialog.show_error(message)
+        elif message == ACCOUNT_REJECTED_MESSAGE:
+            self.show_window_without_stream()
 
     def enter_replay(self, start: datetime | None) -> None:
         if not self.devices or self.close_pending or isinstance(getattr(self, "selected_device", None), RtspCamera):
