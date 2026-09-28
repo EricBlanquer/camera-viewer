@@ -20,6 +20,8 @@ from cs2pppp import PpppSession, configure_tables, decode_init_string
 from cs2pppp._protocol import header
 from okam_native.cs2 import _DECODE_LOOKUP, _SHUFFLE
 
+from icam365_cloud import CloudSession
+
 
 CONFIG_PATH = Path.home() / ".config/camera-viewer/icam365.json"
 MAX_FRAME_SIZE = 1024 * 1024
@@ -33,6 +35,7 @@ class NativeConfig:
     did: str
     platform: str
     password: str
+    cloud_session: CloudSession | None = None
 
     @classmethod
     def from_record(cls, record: dict) -> NativeConfig:
@@ -50,7 +53,17 @@ class NativeConfig:
             or not isinstance(password, str) or not 1 <= len(password.encode()) <= 48
         ):
             raise OSError("Invalid iCam365 native connection configuration.")
-        return cls(did, platform[5:], password)
+        cloud = record.get("cloud_session")
+        return cls(did, platform[5:], password, CloudSession.from_record(cloud) if cloud is not None else None)
+
+    def refreshed(self) -> NativeConfig:
+        if self.cloud_session is None:
+            return self
+        record = self.cloud_session.device_record()
+        config = NativeConfig.from_record(record)
+        if config.did != self.did:
+            raise OSError("The iCam365 account returned a different camera.")
+        return NativeConfig(config.did, config.platform, config.password, self.cloud_session)
 
 
 def load_config(uid: str) -> NativeConfig | None:
@@ -373,7 +386,13 @@ class NativeBridge:
         last_video = time.monotonic()
         ptz_stop_at = None
         ptz_stop_index = None
+        refresh_error = None
         try:
+            try:
+                self.config = self.config.refreshed()
+            except OSError as ex:
+                refresh_error = str(ex)
+                LOG.warning("iCam365 credential refresh failed: %s", refresh_error)
             session = NativeSession(self.config)
             session.open()
             auth_deadline = time.monotonic() + 15
@@ -382,7 +401,7 @@ class NativeBridge:
                 for command, payload in commands:
                     if command == 0x8003:
                         if len(payload) < 4 or struct.unpack_from("<i", payload)[0] != 0:
-                            raise OSError("The iCam365 camera rejected authentication.")
+                            raise OSError(refresh_error or "The iCam365 camera rejected authentication.")
                         if not session.authenticated:
                             session.start_media()
                             threads = self._start_muxer()
@@ -484,7 +503,7 @@ def close_bridge(uid: str) -> None:
         bridge.close()
 
 
-def import_device_response(response_path: Path, camera_name: str) -> None:
+def import_device_response(response_path: Path, camera_name: str, session_path: Path | None = None) -> None:
     from PyQt6.QtCore import QSettings
     settings = QSettings("O-KAM Linux", "O-KAM Linux")
     cameras = json.loads(settings.value("cameras/rtsp", "[]", str))
@@ -498,12 +517,25 @@ def import_device_response(response_path: Path, camera_name: str) -> None:
     if len(items) != 1:
         raise OSError("Import a response containing exactly one iCam365 device.")
     record = {key: items[0][key] for key in ("p2p_id", "p2p_platform", "password")}
+    if session_path is not None:
+        if session_path.stat().st_size > MAX_FRAME_SIZE:
+            raise OSError("The iCam365 account session is too large.")
+        session_record = json.loads(session_path.read_text())
+        cloud_session = CloudSession.from_record(session_record)
+        if cloud_session.uuid != items[0].get("uuid"):
+            raise OSError("The iCam365 session identifies a different camera.")
+        record["cloud_session"] = session_record
     config = NativeConfig.from_record(record)
     if not decode_init_string(config.platform, lut=_DECODE_LOOKUP).lib_ok:
         raise OSError("Invalid iCam365 directory configuration.")
     records = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
     if not isinstance(records, dict):
         raise OSError("Invalid iCam365 native connection configuration.")
+    previous = records.get(matches[0]["uid"], {})
+    if session_path is None and isinstance(previous, dict) and previous.get("cloud_session") is not None:
+        cloud_session = CloudSession.from_record(previous["cloud_session"])
+        if cloud_session.uuid == items[0].get("uuid"):
+            record["cloud_session"] = previous["cloud_session"]
     records[matches[0]["uid"]] = record
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary_path = None
@@ -523,9 +555,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Import private iCam365 native connection parameters.")
     parser.add_argument("--device-response", type=Path, required=True)
     parser.add_argument("--camera-name", required=True)
+    parser.add_argument("--cloud-session", type=Path)
     arguments = parser.parse_args()
     try:
-        import_device_response(arguments.device_response, arguments.camera_name)
+        import_device_response(arguments.device_response, arguments.camera_name, arguments.cloud_session)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         parser.exit(1, "Unable to import the iCam365 connection parameters.\n")
     print("Private iCam365 connection parameters saved.")

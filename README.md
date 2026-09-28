@@ -77,6 +77,12 @@ Add the camera as an RTSP camera, then import a device-list detail response obta
 
 The response must contain exactly one device with `p2p_id`, `p2p_platform`, and `password` fields.
 Connection parameters are stored in `~/.config/camera-viewer/icam365.json` with owner-only permissions and associated with the saved camera ID.
+The camera credential can change: importing only a device response retains a static credential.
+To fetch its current value before each native connection, also pass `--cloud-session /path/to/session.json` when importing.
+The private session JSON contains `origin` (`https://api-we01.tange365.com`), `token`, `appid`, `uuid`, and the Android request metadata in `query`.
+The session must identify the imported device and is saved in the same owner-only configuration file.
+If the account service is unavailable, the viewer tries the saved camera credential; a rejected credential then displays the account-session error.
+When the account token expires, import a renewed authenticated session; automatic iCam365 account sign-in is not implemented.
 After restarting the viewer, that camera uses its native transport for live view and local recordings; the phone is not needed.
 One native session supplies all local consumers, with ordered packets, acknowledgements, bounded retries, and explicit video/audio stop commands before disconnecting.
 A loopback-only HTTP stream feeds the existing player and recording UI, preserving the original HEVC video while converting A-law audio to AAC for the local stream.
