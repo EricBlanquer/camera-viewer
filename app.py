@@ -8,6 +8,7 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import math
 import os
 import queue
 import re
@@ -144,6 +145,8 @@ MAX_DRAG_STEPS = 4
 VIDEO_READ_TIMEOUT_SECONDS = 2
 VIDEO_STALL_SECONDS = 12
 RTSP_STALL_SECONDS = 10
+RTSP_MAX_ACCUMULATED_DELAY_SECONDS = 6
+RTSP_DELAY_CONFIRM_SECONDS = 3
 RTSP_AUDIO_FILTER = "--af=lavfi=[volume=25dB,alimiter=limit=0.95]"
 AUDIO_RESPONSE_COMMAND = 0x6031
 RECONNECT_MAX_SECONDS = 30
@@ -3009,6 +3012,26 @@ class ReplayController(QObject):
         return target
 
 
+class LiveLatencyGuard:
+    def __init__(self) -> None:
+        self.minimum_offset: float | None = None
+        self.delayed_since: float | None = None
+
+    def observe(self, position: object, now: float) -> None:
+        if not isinstance(position, (int, float)) or isinstance(position, bool) or not math.isfinite(position):
+            self.delayed_since = None
+            return
+        offset = now - position
+        self.minimum_offset = offset if self.minimum_offset is None else min(self.minimum_offset, offset)
+        delay = offset - self.minimum_offset
+        if delay < RTSP_MAX_ACCUMULATED_DELAY_SECONDS:
+            self.delayed_since = None
+        elif self.delayed_since is None:
+            self.delayed_since = now
+        elif now - self.delayed_since >= RTSP_DELAY_CONFIRM_SECONDS:
+            raise OSError(f"Live playback delay increased by {delay:.1f}s. Reconnecting to live video.")
+
+
 class RtspStreamWorker(QThread):
     status_changed = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -3166,6 +3189,7 @@ class RtspStreamWorker(QThread):
             last_prune = 0.0
             last_position = None
             last_progress_at = time.monotonic()
+            latency_guard = LiveLatencyGuard()
             pending_light = None
             pending_ptz = None
             while not self.stop_requested.is_set():
@@ -3227,6 +3251,7 @@ class RtspStreamWorker(QThread):
                         self.control_failed.emit("Camera movement failed.")
                         pending_ptz = None
                 position_ready, position = mpv_request(self.socket_path, ["get_property", "time-pos"])
+                latency_guard.observe(position if position_ready else None, time.monotonic())
                 if position_ready and isinstance(position, (int, float)) and position != last_position:
                     last_position = position
                     last_progress_at = time.monotonic()

@@ -110,6 +110,9 @@ Each camera keeps its 16:9 ratio in single-camera and multi-camera views, includ
 The selected camera's live state appears next to its name; playback loading and errors appear over the affected video.
 Click the video to show or hide the translucent control bar.
 Live video starts automatically, and the viewer reconnects by itself after a network or transport interruption.
+RTSP and native iCam365 live views also reconnect when playback accumulates at least six seconds of additional delay for three seconds.
+The delay is measured against monotonic elapsed time and the fastest observed playback position, independently of the camera's displayed clock and initial connection delay.
+Reconnecting closes the current recording segment and starts a fresh transport, player, and continuous recording segment.
 Use **Full screen** to expand the viewer.
 **Photo** saves a picture and **Record** saves the live video as a Matroska file in `Pictures/O-KAM Linux`.
 The existing media and settings paths retain their O-KAM Linux names so earlier recordings and account settings remain available.
