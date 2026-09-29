@@ -4745,7 +4745,7 @@ class MainWindow(QMainWindow):
         QApplication.setQuitOnLastWindowClosed(False)
         menu = QMenu(self)
         self.window_action = menu.addAction("Hide window")
-        self.window_action.triggered.connect(self.toggle_window)
+        self.window_action.triggered.connect(self.on_window_action_triggered)
         self.cameras_menu = menu.addMenu("Cameras")
         self.cameras_menu.aboutToShow.connect(self.update_cameras_menu)
         self.show_all_action = menu.addAction("Show all cameras")
@@ -4952,8 +4952,14 @@ class MainWindow(QMainWindow):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.toggle_window()
 
+    def on_window_action_triggered(self) -> None:
+        if self.isVisible():
+            self.hide_to_tray()
+            return
+        self.show_window()
+
     def toggle_window(self) -> None:
-        if self.isVisible() and not self.isMinimized():
+        if self.isVisible() and not self.isMinimized() and self.isActiveWindow():
             self.hide_to_tray()
             return
         self.show_window()

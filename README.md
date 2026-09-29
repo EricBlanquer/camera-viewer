@@ -128,9 +128,11 @@ When the desktop provides a notification area, Camera Viewer shows an icon there
 Click the icon to show or hide the window, or open its menu for camera selection, playback, and the **Camera controls** submenu.
 Opening Camera Viewer again from the application menu shows the running instance instead of starting a second one.
 Closing the window hides it; live video keeps running in the background so continuous recording and detection checks continue.
+Clicking the tray icon brings a window behind other applications to the front; clicking it while Camera Viewer is active hides it.
 The tray menu enables local detection of people, cats, dogs, and birds while continuous recording is on.
 It analyzes one 640 × 360 frame per second with the SHA-256-verified OpenCV Zoo YOLOX-s model and confirms an event when the same object appears twice within two seconds.
 Nearby detections of the same animal retain a cat classification when the model briefly calls that animal a dog or bird; spatially separate animals retain their own types.
+Before saving a dog-only detection, Camera Viewer checks sampled frames from its recorded clip at a lower recognition threshold and classifies it as a cat when multiple frames show the same animal as a cat.
 Event excerpts include up to five seconds before and after the detected passage and are stored without audio in `Videos/O-KAM Linux/Detections`, using the system's configured Videos folder.
 The `Detections` folder groups excerpts in `cat`, `dog`, `bird`, and `person` folders; clips with multiple types use a combined folder such as `cat_person`, and each clip name starts with its type and camera name.
 Local detections appear in red on the local playback timeline, and its Previous and Next buttons jump between detected passages.

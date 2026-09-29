@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PyQt6.QtCore import QObject, QSettings, Qt, pyqtSignal
-from PyQt6.QtWidgets import QApplication, QPushButton, QWidget
+from PyQt6.QtWidgets import QApplication, QPushButton, QSystemTrayIcon, QWidget
 
 from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
 from icam365 import NativePreset
@@ -74,6 +74,34 @@ class TrayTest(unittest.TestCase):
         self.window.reconnect = lambda: None
         self.window.toggle_window()
         self.assertTrue(self.window.isVisible())
+
+    def test_tray_click_raises_a_visible_window_behind_another_window(self) -> None:
+        self.window.show()
+        with patch.object(MainWindow, "isActiveWindow", return_value=False), \
+                patch.object(self.window, "show_window") as show_window, \
+                patch.object(self.window, "hide_to_tray") as hide_to_tray:
+            self.window.update_tray_menu()
+            self.assertEqual(self.window.window_action.text(), "Hide window")
+            self.window.on_tray_activated(QSystemTrayIcon.ActivationReason.Trigger)
+            show_window.assert_called_once_with()
+            hide_to_tray.assert_not_called()
+
+    def test_tray_click_hides_the_active_window(self) -> None:
+        self.window.show()
+        with patch.object(MainWindow, "isActiveWindow", return_value=True), \
+                patch.object(self.window, "show_window") as show_window, \
+                patch.object(self.window, "hide_to_tray") as hide_to_tray:
+            self.window.update_tray_menu()
+            self.assertEqual(self.window.window_action.text(), "Hide window")
+            self.window.on_tray_activated(QSystemTrayIcon.ActivationReason.Trigger)
+            hide_to_tray.assert_called_once_with()
+            show_window.assert_not_called()
+
+    def test_tray_menu_hide_action_hides_a_visible_window(self) -> None:
+        self.window.show()
+        with patch.object(self.window, "hide_to_tray") as hide_to_tray:
+            self.window.window_action.trigger()
+            hide_to_tray.assert_called_once_with()
 
     def test_detections_notify_only_after_the_first_check(self) -> None:
         with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:

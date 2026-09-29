@@ -17,8 +17,8 @@ from PyQt6.QtWidgets import QApplication, QWidget
 
 from app import LocalReplayPane, MainWindow, RtspCamera, measured_video_rate, update_local_detector
 from local_detection import (
-    DetectionEvent, DetectionHit, DetectionPipeline, EventTracker, export_event, install_model, load_events,
-    organize_events, prune_events, save_event,
+    DetectionEvent, DetectionHit, DetectionPipeline, DogEventReviewer, EventTracker, _animal_tracks_are_cats,
+    export_event, install_model, load_events, organize_events, prune_events, save_event,
 )
 
 
@@ -118,6 +118,82 @@ class ModelInstallationTest(unittest.TestCase):
                     patch("local_detection.urllib.request.urlopen", return_value=io.BytesIO(b"good")):
                 self.assertEqual(install_model(destination), destination)
             self.assertEqual(destination.read_bytes(), b"good")
+
+
+class DogEventReviewerTest(unittest.TestCase):
+    def test_cat_evidence_in_recorded_frames_corrects_the_event_and_clip_folder(self):
+        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
+            root = Path(directory)
+            dog_folder = root / "dog"
+            dog_folder.mkdir()
+            clip = dog_folder / "dog_Garden_20260929_205453_12345678.mkv"
+            clip.write_bytes(b"cat video")
+            first = datetime(2026, 9, 29, 20, 54, 58)
+            event = DetectionEvent("camera", "Garden", first, first + timedelta(seconds=6),
+                                   ("dog",), .7, clip, first - timedelta(seconds=5))
+            box = (93, 107, 45, 39)
+            samples = [
+                (first, [DetectionHit("dog", .7, box), DetectionHit("cat", .4, box)]),
+                (first + timedelta(seconds=5), [DetectionHit("dog", .6, box), DetectionHit("cat", .35, box)]),
+            ]
+            reviewer = DogEventReviewer()
+            reviewer.primary = SimpleNamespace(infer=lambda frame: [])
+            with patch("local_detection._review_samples", return_value=samples), \
+                    patch("local_detection.event_directory", return_value=root):
+                reviewed = reviewer.review(event)
+            self.assertEqual(reviewed.classes, ("cat",))
+            self.assertEqual(reviewed.clip.parent, root / "cat")
+            self.assertEqual(reviewed.clip.read_bytes(), b"cat video")
+            self.assertFalse(clip.exists())
+
+    def test_primary_model_cat_evidence_corrects_later_dog_frames(self):
+        first = datetime(2026, 9, 29, 21, 19, 58)
+        box = (434, 259, 56, 37)
+        samples = [
+            (first, [DetectionHit("dog", .6, box)]),
+            (first + timedelta(seconds=10), [DetectionHit("dog", .6, box)]),
+            (first + timedelta(seconds=30), [DetectionHit("cat", .6, box)]),
+            (first + timedelta(seconds=31), [DetectionHit("cat", .6, box)]),
+        ]
+        self.assertTrue(_animal_tracks_are_cats(samples))
+
+    def test_one_weak_cat_frame_does_not_override_a_dog_event(self):
+        first = datetime(2026, 9, 29, 21, 19, 58)
+        box = (434, 259, 56, 37)
+        samples = [
+            (first, [DetectionHit("dog", .6, box)]),
+            (first + timedelta(seconds=1), [DetectionHit("cat", .2, box)]),
+            (first + timedelta(seconds=2), [DetectionHit("dog", .6, box)]),
+        ]
+        self.assertFalse(_animal_tracks_are_cats(samples))
+
+    def test_repeated_weak_cat_scores_do_not_override_stronger_dog_scores(self):
+        first = datetime(2026, 9, 29, 21, 19, 58)
+        box = (434, 259, 56, 37)
+        samples = [
+            (first, [DetectionHit("dog", .7, box), DetectionHit("cat", .2, box)]),
+            (first + timedelta(seconds=1), [DetectionHit("dog", .7, box), DetectionHit("cat", .2, box)]),
+        ]
+        self.assertFalse(_animal_tracks_are_cats(samples))
+
+    def test_unrelated_cat_without_a_recorded_dog_is_not_enough(self):
+        first = datetime(2026, 9, 29, 21, 19, 58)
+        box = (434, 259, 56, 37)
+        samples = [
+            (first, [DetectionHit("cat", .7, box)]),
+            (first + timedelta(seconds=1), [DetectionHit("cat", .7, box)]),
+        ]
+        self.assertFalse(_animal_tracks_are_cats(samples))
+
+    def test_spatially_separate_dog_is_preserved(self):
+        first = datetime(2026, 9, 29, 21, 19, 58)
+        samples = [
+            (first, [DetectionHit("dog", .7, (10, 10, 40, 40)),
+                     DetectionHit("cat", .8, (200, 10, 40, 40))]),
+            (first + timedelta(seconds=5), [DetectionHit("dog", .7, (10, 10, 40, 40)),
+                                                DetectionHit("cat", .8, (200, 10, 40, 40))]),
+        ]
+        self.assertFalse(_animal_tracks_are_cats(samples))
 
 
 class RecordingExcerptTest(unittest.TestCase):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -13,7 +14,7 @@ import time
 import urllib.request
 import uuid
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -25,9 +26,11 @@ MODEL_SHA256 = "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063
 MODEL_SIZE = 35858002
 PERSON_CLASS = "person"
 CAT_CLASS = "cat"
+DOG_CLASS = "dog"
 ANIMAL_KIND = "animal"
-CLASS_NAMES = {0: PERSON_CLASS, 14: "bird", 15: CAT_CLASS, 16: "dog"}
+CLASS_NAMES = {0: PERSON_CLASS, 14: "bird", 15: CAT_CLASS, 16: DOG_CLASS}
 SCORE_THRESHOLD = 0.55
+REVIEW_SCORE_THRESHOLD = 0.15
 SAMPLE_WIDTH = 640
 SAMPLE_HEIGHT = 360
 SAMPLE_BYTES = SAMPLE_WIDTH * SAMPLE_HEIGHT * 3
@@ -41,6 +44,10 @@ TRACK_OVERLAP_THRESHOLD = 0.25
 TRACK_DISTANCE_FACTOR = 1.1
 TRACK_AREA_RATIO_LIMIT = 2.5
 MODEL_DOWNLOAD_LIMIT = MODEL_SIZE + 1
+REVIEW_MAX_SAMPLES = 12
+REVIEW_INTERVAL_SECONDS = 1
+REVIEW_MARGIN_SECONDS = 2
+REVIEW_CAT_DOG_RATIO = 0.5
 RETENTION = timedelta(hours=24)
 
 
@@ -75,13 +82,14 @@ def install_model(path: Path | None = None) -> Path:
 
 
 class YoloXDetector:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, threshold: float = SCORE_THRESHOLD) -> None:
         import cv2
         import numpy as np
         cv2.setNumThreads(2)
         self.cv2 = cv2
         self.np = np
         self.net = cv2.dnn.readNet(str(path))
+        self.threshold = threshold
         grids = []
         strides = []
         for stride in (8, 16, 32):
@@ -103,13 +111,13 @@ class YoloXDetector:
         classes = np.argmax(scores, axis=1)
         found = []
         for index, name in CLASS_NAMES.items():
-            matches = np.where((classes == index) & (scores[:, index] >= SCORE_THRESHOLD))[0]
+            matches = np.where((classes == index) & (scores[:, index] >= self.threshold))[0]
             if not len(matches):
                 continue
             centers = (output[matches, :2] + self.grids[matches]) * self.strides[matches]
             sizes = np.exp(output[matches, 2:4]) * self.strides[matches]
             boxes = np.concatenate((centers - sizes / 2, sizes), axis=1)
-            kept = cv2.dnn.NMSBoxes(boxes.tolist(), scores[matches, index].tolist(), SCORE_THRESHOLD, 0.5)
+            kept = cv2.dnn.NMSBoxes(boxes.tolist(), scores[matches, index].tolist(), self.threshold, 0.5)
             if len(kept):
                 for row in np.asarray(kept).flatten():
                     position = int(row)
@@ -258,6 +266,83 @@ class EventTracker:
         self.score = 0.0
         self.candidate.clear()
         return event
+
+
+def _review_samples(event: DetectionEvent, detector: YoloXDetector) -> list[tuple[datetime, list[DetectionHit]]]:
+    import cv2
+    if event.clip is None or event.clip_start is None:
+        return []
+    capture = cv2.VideoCapture(str(event.clip))
+    try:
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        if fps <= 0 or frames <= 0:
+            raise OSError("The detection excerpt cannot be inspected.")
+        duration = frames / fps
+        first = max(0.0, (event.first - event.clip_start).total_seconds() - REVIEW_MARGIN_SECONDS)
+        last = min(duration, (event.last - event.clip_start).total_seconds() + REVIEW_MARGIN_SECONDS)
+        if first >= last:
+            return []
+        interval = max(REVIEW_INTERVAL_SECONDS, math.ceil((last - first) / (REVIEW_MAX_SAMPLES - 1)))
+        samples = []
+        offset = first
+        while offset < last:
+            if not capture.set(cv2.CAP_PROP_POS_MSEC, offset * 1000):
+                raise OSError("The detection excerpt cannot be positioned.")
+            valid, frame = capture.read()
+            if valid:
+                image = cv2.resize(frame, (SAMPLE_WIDTH, SAMPLE_HEIGHT))
+                samples.append((event.clip_start + timedelta(seconds=offset), detector.infer(image.tobytes())))
+            offset += interval
+        return samples
+    finally:
+        capture.release()
+
+
+def _animal_tracks_are_cats(samples: list[tuple[datetime, list[DetectionHit]]]) -> bool:
+    tracker = EventTracker("review", "review")
+    tracks = {}
+    cat_frames = 0
+    dog_frames = 0
+    for when, detected in samples:
+        dogs = [hit for hit in detected if hit.name == DOG_CLASS]
+        if dogs:
+            dog_frames += 1
+        cats = []
+        for hit in detected:
+            if hit.name != CAT_CLASS:
+                continue
+            competing = [dog.score for dog in dogs if box_overlap(dog.box, hit.box) >= TRACK_OVERLAP_THRESHOLD]
+            if not competing or hit.score >= max(competing) * REVIEW_CAT_DOG_RATIO:
+                cats.append(hit)
+        hits = dogs + cats
+        if cats:
+            cat_frames += 1
+        tracker._match(when, hits)
+        tracks.update(tracker.tracks)
+    return dog_frames > 0 and cat_frames >= 2 and {track.label for track in tracks.values()} == {CAT_CLASS}
+
+
+class DogEventReviewer:
+    def __init__(self) -> None:
+        self.primary: YoloXDetector | None = None
+
+    def review(self, event: DetectionEvent) -> DetectionEvent:
+        if event.classes != (DOG_CLASS,) or event.clip is None:
+            return event
+        if self.primary is None:
+            self.primary = YoloXDetector(model_path(), REVIEW_SCORE_THRESHOLD)
+        samples = _review_samples(event, self.primary)
+        if not _animal_tracks_are_cats(samples):
+            return event
+        folder = event_directory() / CAT_CLASS
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        folder.chmod(0o700)
+        destination = folder / f"{CAT_CLASS}_{event.clip.name.removeprefix(f'{DOG_CLASS}_')}"
+        if destination.exists():
+            raise FileExistsError(destination)
+        event.clip.replace(destination)
+        return replace(event, classes=(CAT_CLASS,), clip=destination)
 
 
 def event_directory() -> Path:
@@ -561,6 +646,7 @@ class DetectionEngine:
         self.processed: dict[str, int] = {}
         self.exports: queue.Queue[tuple[Path, DetectionEvent, str, Callable[[DetectionEvent], None]]] = queue.Queue(maxsize=32)
         self.scheduled_paths: set[Path] = set()
+        self.dog_reviewer = DogEventReviewer()
         self.stopped = threading.Event()
         self.inference = threading.Thread(target=self._infer, daemon=True)
         self.exporter = threading.Thread(target=self._export, daemon=True)
@@ -664,8 +750,18 @@ class DetectionEngine:
                     if self.stopped.is_set():
                         break
                     try:
-                        finished = export_event(event, self.recordings, prefix, self.stopped)
-                        save_event(path, finished, "ready")
+                        exported = export_event(event, self.recordings, prefix, self.stopped)
+                        finished = exported
+                        try:
+                            finished = self.dog_reviewer.review(finished)
+                        except Exception as ex:
+                            LOG.warning("Could not review local detection %s: %s", finished.clip, ex)
+                        try:
+                            save_event(path, finished, "ready")
+                        except OSError:
+                            if finished.clip != exported.clip:
+                                finished.clip.replace(exported.clip)
+                            raise
                         prune_events()
                         LOG.info("Saved local detection %s", finished.clip.name)
                         try:
