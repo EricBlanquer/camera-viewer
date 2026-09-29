@@ -90,6 +90,7 @@ Incoming datagrams are acknowledged immediately.
 Camera readiness is acknowledged during connection setup and repeated readiness or punch messages are answered during streaming.
 Closing a native session waits up to five seconds for video/audio stop acknowledgements despite media gaps, and closes all punched endpoints even after an unsuccessful connection attempt.
 A loopback-only HTTP stream feeds the existing player and recording UI, preserving the original HEVC video while converting A-law audio to AAC for the local stream.
+Audio is resampled against the live timestamps so differences in the camera's audio clock do not accumulate playback delay.
 The native connection supports the On/Automatic light control and short Up/Down motor pulses.
 Directory lookup and a direct native connection were verified locally; the relay path outside the home remains unverified.
 This connection does not provide camera microSD playback or talkback.

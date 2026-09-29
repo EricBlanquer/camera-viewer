@@ -32,6 +32,7 @@ PACKET_GAP_TIMEOUT = 8
 RECEIVE_POLL_SECONDS = 0.05
 STOP_ACK_TIMEOUT_SECONDS = 5
 CLOSE_NOTIFICATION_RETRIES = 2
+LIVE_AUDIO_CLOCK_FILTER = "aresample=async=1000"
 LOG = logging.getLogger("okam-linux.icam365")
 
 
@@ -413,7 +414,8 @@ class NativeBridge:
                 "-use_wallclock_as_timestamps", "1", "-r", "8", "-f", "hevc", "-i", f"/proc/self/fd/{video_read}",
                 "-thread_queue_size", "512", "-use_wallclock_as_timestamps", "1",
                 "-f", "alaw", "-ar", "8000", "-ac", "1", "-i", f"/proc/self/fd/{audio_read}",
-                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "32k",
+                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                "-af", LIVE_AUDIO_CLOCK_FILTER, "-c:a", "aac", "-b:a", "32k",
                 "-max_interleave_delta", "100000", "-muxdelay", "0", "-muxpreload", "0",
                 "-mpegts_flags", "resend_headers", "-flush_packets", "1", "-f", "mpegts", "pipe:1",
             ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
