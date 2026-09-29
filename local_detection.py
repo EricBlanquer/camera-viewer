@@ -336,15 +336,17 @@ def export_event(
             command = ["ffmpeg", "-nostdin", "-v", "error", "-y"]
             if path.name.endswith(".mkv.h264"):
                 fps = max(1.0, min(60.0, _frame_count(path, cancel) / max(duration, 1)))
-                command += ["-framerate", str(fps), "-f", "h264"]
+                command += ["-framerate", str(fps), "-f", "h264", "-i", str(path),
+                            "-ss", str((left - start).total_seconds())]
+            else:
+                command += ["-ss", str((left - start).total_seconds()), "-i", str(path)]
             command += [
-                "-ss", str((left - start).total_seconds()), "-i", str(path),
                 "-t", str((right - left).total_seconds()), "-an", "-vf", "scale=1280:-2",
                 "-r", "15", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "25",
                 "-threads", "2", str(part),
             ]
             _run(command, timeout=90, cancel=cancel)
-            if not part.is_file() or part.stat().st_size == 0:
+            if not _has_video_packets(part, cancel):
                 raise OSError("The local detection excerpt is empty.")
             parts.append(part)
             available_end = right
@@ -358,7 +360,7 @@ def export_event(
             playlist.write_text("".join(f"file '{part}'\n" for part in parts))
             _run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "0",
                   "-i", str(playlist), "-c", "copy", str(target)], timeout=30, cancel=cancel)
-        if target.stat().st_size == 0:
+        if not _has_video_packets(target, cancel):
             raise OSError("The local detection excerpt is empty.")
         shutil.move(target, clip)
         clip.chmod(0o600)
@@ -371,6 +373,19 @@ def _frame_count(path: Path, cancel: threading.Event | None = None) -> int:
         "-of", "csv=p=0", "-f", "h264", str(path),
     ], timeout=30, cancel=cancel)
     return int(result.stdout.strip().split(",")[0])
+
+
+def _has_video_packets(path: Path, cancel: threading.Event | None = None) -> bool:
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    try:
+        result = _run([
+            "ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0",
+            "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path),
+        ], timeout=30, cancel=cancel)
+        return int(result.stdout.strip().split(",")[0]) > 0
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return False
 
 
 class DetectionEngine:

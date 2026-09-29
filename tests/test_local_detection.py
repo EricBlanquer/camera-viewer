@@ -140,6 +140,30 @@ class RecordingExcerptTest(unittest.TestCase):
                 ], check=True, capture_output=True, text=True, timeout=10)
                 self.assertAlmostEqual(float(duration.stdout), 12, delta=1)
 
+    def test_excerpt_from_open_raw_segment_contains_decodable_video(self):
+        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
+            root = Path(directory)
+            recordings = root / "Continuous"
+            recordings.mkdir()
+            start = datetime.now().replace(microsecond=0) - timedelta(minutes=1)
+            source = recordings / f"Garden_{start:%Y%m%d_%H%M%S}.mkv.h264"
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=8",
+                "-t", "30", "-c:v", "libx264", "-preset", "ultrafast", "-g", "8",
+                "-threads", "1", "-f", "h264", str(source),
+            ], check=True, capture_output=True, timeout=15)
+            os.utime(source, (start.timestamp() + 30, start.timestamp() + 30))
+            event = DetectionEvent("camera", "Garden", start + timedelta(seconds=20),
+                                   start + timedelta(seconds=22), ("cat",), .8)
+            with patch("local_detection.event_directory", return_value=root / "Detections"):
+                finished = export_event(event, recordings, "Garden")
+                self.assertEqual(finished.clip_start, start + timedelta(seconds=15))
+                packets = subprocess.run([
+                    "ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0",
+                    "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(finished.clip),
+                ], check=True, capture_output=True, text=True, timeout=10)
+                self.assertGreater(int(packets.stdout.strip()), 0)
+
     def test_disabled_continuous_recording_does_not_start_decoder(self):
         worker = SimpleNamespace(
             local_detection_enabled=True, local_detector=None, continuous=None,
