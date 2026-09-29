@@ -25,6 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
 from pathlib import Path
 from dataclasses import dataclass
 from typing import BinaryIO, Callable
@@ -96,6 +97,7 @@ from okam_native.p2p import (
 )
 from okam_native.wakeup import WakeError, load_wake_credentials, wake_camera
 from icam365 import PTZ_COMMAND, PTZ_POSITION_COMMAND, close_bridge, get_bridge
+from local_detection import DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, prune_events
 from Xlib import X as X11, Xutil, display as xdisplay
 from Xlib.protocol import event as xevent
 
@@ -306,6 +308,7 @@ CONTINUOUS_RETENTION = timedelta(hours=24)
 REPLAY_FILE_IDLE_SECONDS = 5
 CONTINUOUS_SETTING = "recording/continuous"
 DETECTION_SETTING = "detections/last_seen"
+LOCAL_DETECTION_SETTING = "detections/local_enabled"
 DETECTION_MESSAGE_MS = 15000
 RAW_RECORDING_SUFFIX = ".h264"
 MIN_RECORDING_FRAMES = 2
@@ -955,6 +958,66 @@ def continuous_directory() -> Path:
     return directory
 
 
+_LOCAL_DETECTION_ENGINE: DetectionEngine | None = None
+_LOCAL_DETECTION_LOCK = threading.Lock()
+
+
+def local_detection_engine() -> DetectionEngine:
+    global _LOCAL_DETECTION_ENGINE
+    with _LOCAL_DETECTION_LOCK:
+        if _LOCAL_DETECTION_ENGINE is None or _LOCAL_DETECTION_ENGINE.stopped.is_set():
+            _LOCAL_DETECTION_ENGINE = DetectionEngine(continuous_directory())
+        return _LOCAL_DETECTION_ENGINE
+
+
+def measured_video_rate(times: deque[float]) -> float | None:
+    if len(times) < 4 or times[-1] - times[0] < 2:
+        return None
+    rate = (len(times) - 1) / (times[-1] - times[0])
+    return round(rate, 3) if 1 <= rate <= 60 else None
+
+
+def update_local_detector(
+    worker: StreamWorker | RtspStreamWorker, camera: AccountDevice | RtspCamera,
+    source: Callable[[], tuple[list[str], int | None, bool]],
+) -> DetectionPipeline | None:
+    enabled = worker.local_detection_enabled and worker.continuous_enabled.is_set()
+    if isinstance(worker, StreamWorker):
+        enabled = enabled and worker.continuous is not None
+    elif worker.continuous is None or worker.continuous.poll() is not None:
+        enabled = False
+    if not enabled:
+        if worker.local_detector is not None:
+            worker.local_detector.close()
+            worker.local_detector = None
+        return None
+    if worker.local_detector is not None:
+        if worker.local_detector.process.poll() is None and not worker.local_detector.engine.stopped.is_set():
+            return worker.local_detector
+        worker.local_detection_retry_at = time.monotonic() + 10
+        worker.local_error_callback(f"Local detection decoder stopped for {camera.name}.")
+        worker.local_detector.close()
+        worker.local_detector = None
+        return None
+    if worker.local_event_callback is None or time.monotonic() < worker.local_detection_retry_at:
+        return None
+    try:
+        if not model_path().is_file():
+            raise OSError("The local detection model is missing; run ./install.sh.")
+        input_args, descriptor, raw_input = source()
+        worker.local_detector = DetectionPipeline(
+            local_detection_engine(), camera.uid, camera.name, continuous_prefix(camera),
+            input_args, worker.local_event_callback, worker.local_error_callback, descriptor, raw_input,
+        )
+        LOG.info("Local detection started for %s", camera.name)
+        return worker.local_detector
+    except (OSError, ValueError, ImportError) as ex:
+        worker.local_detection_retry_at = time.monotonic() + 60
+        LOG.warning("Local detection unavailable for %s: %s", camera.name, ex)
+        worker.local_error_callback(f"Local detection unavailable for {camera.name}.")
+        return None
+
+
 def continuous_prefix(camera: AccountDevice | RtspCamera) -> str:
     name = safe_camera_name(camera.name)
     return f"{name}_{camera.uid[5:13]}" if isinstance(camera, RtspCamera) else name
@@ -1506,6 +1569,13 @@ class StreamWorker(QThread):
         self.recorder: VideoRecorder | None = None
         self.continuous = continuous
         self.continuous_enabled = threading.Event()
+        self.local_detection_enabled = False
+        self.local_detection_retry_at = 0.0
+        self.local_detector: DetectionPipeline | None = None
+        self.local_frame_times: deque[float] = deque(maxlen=90)
+        self.local_input_rate: float | None = None
+        self.local_event_callback: Callable[[DetectionEvent], None] | None = None
+        self.local_error_callback: Callable[[str], None] = lambda message: LOG.warning("%s", message)
         self.detection_days: list[str] | None = None
         self.display_enabled = threading.Event()
         self.display_enabled.set()
@@ -1616,12 +1686,21 @@ class StreamWorker(QThread):
                 if not valid:
                     continue
                 last_video = time.monotonic()
+                self.local_frame_times.append(last_video)
                 self._record_frame(frame, keyframe, last_video)
                 if self.continuous is not None:
                     if self.continuous_enabled.is_set():
                         self.continuous.write(frame, keyframe, last_video)
                     else:
                         self.continuous.close()
+                if self.local_input_rate is None:
+                    self.local_input_rate = measured_video_rate(self.local_frame_times)
+                detector = update_local_detector(
+                    self, self.device,
+                    lambda: (["-r", str(self.local_input_rate), "-f", "h264", "-i", "pipe:0"], None, True),
+                ) if self.local_input_rate is not None else None
+                if detector is not None:
+                    detector.feed(frame, keyframe)
                 if not received_video:
                     received_video = True
                     self.status_changed.emit("Live video")
@@ -1646,6 +1725,9 @@ class StreamWorker(QThread):
             self._finish_recording()
             if self.continuous is not None:
                 self.continuous.close()
+            if self.local_detector is not None:
+                self.local_detector.close()
+                self.local_detector = None
             if stream_started:
                 try:
                     write_command(
@@ -3054,6 +3136,11 @@ class RtspStreamWorker(QThread):
         self.socket_path = socket_path
         self.stop_requested = threading.Event()
         self.continuous_enabled = threading.Event()
+        self.local_detection_enabled = False
+        self.local_detection_retry_at = 0.0
+        self.local_detector: DetectionPipeline | None = None
+        self.local_event_callback: Callable[[DetectionEvent], None] | None = None
+        self.local_error_callback: Callable[[str], None] = lambda message: LOG.warning("%s", message)
         self.recording_request: Path | None = None
         self.recording: subprocess.Popen[bytes] | None = None
         self.recording_path: Path | None = None
@@ -3098,6 +3185,17 @@ class RtspStreamWorker(QThread):
 
     def stop(self) -> None:
         self.stop_requested.set()
+
+    def _local_detection_source(self) -> tuple[list[str], int | None, bool]:
+        if self.native_bridge is not None:
+            return ["-i", self.native_bridge.url], None, False
+        if self.camera.provider == IMOU_PROVIDER:
+            descriptor = imou_ffmpeg_playlist(self.camera)
+            return [
+                "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe,rtsp,tcp,udp,rtp",
+                "-i", f"/proc/self/fd/{descriptor}",
+            ], descriptor, False
+        return ["-rtsp_transport", self.camera.transport, "-i", self.camera.url], None, False
 
     def _ffmpeg(self, output: Path, segmented: bool) -> subprocess.Popen[bytes]:
         playlist_fd = None
@@ -3273,6 +3371,7 @@ class RtspStreamWorker(QThread):
                     self.continuous = None
                     self.continuous_enabled.clear()
                     self.continuous_failed.emit("Continuous RTSP recording stopped.")
+                update_local_detector(self, self.camera, self._local_detection_source)
                 if self.recording_request != self.recording_path:
                     self._stop_recording()
                     if self.recording_request is not None:
@@ -3305,6 +3404,9 @@ class RtspStreamWorker(QThread):
             self._stop_recording()
             if self.continuous is not None:
                 self._finish(self.continuous)
+            if self.local_detector is not None:
+                self.local_detector.close()
+                self.local_detector = None
             close_bridge(self.camera.uid)
 
 
@@ -3317,11 +3419,17 @@ class CameraPreview(QWidget):
     def __init__(
         self, camera: AccountDevice | RtspCamera, continuous_enabled: bool = False,
         settings: QSettings | None = None,
+        local_detection_enabled: bool = False,
+        on_local_event: Callable[[DetectionEvent], None] | None = None,
+        on_local_error: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.setStyleSheet("background-color: #171717;")
         self.camera = camera
+        self.local_detection_enabled = local_detection_enabled
+        self.on_local_event = on_local_event
+        self.on_local_error = on_local_error
         self.continuous_enabled = continuous_enabled
         self.settings = settings
         self.player: subprocess.Popen[bytes] | None = None
@@ -3574,6 +3682,10 @@ class CameraPreview(QWidget):
             )
             self.worker.set_display(self.isVisible())
         self.worker.set_continuous(self.continuous_enabled)
+        self.worker.local_detection_enabled = self.local_detection_enabled
+        self.worker.local_event_callback = self.on_local_event
+        if self.on_local_error is not None:
+            self.worker.local_error_callback = self.on_local_error
         self.worker.status_changed.connect(self._on_status)
         self.worker.failed.connect(self._on_failed)
         self.worker.recording_started.connect(self._on_recording_started)
@@ -3902,6 +4014,11 @@ class CameraPreview(QWidget):
         if isinstance(self.worker, StreamWorker):
             self.worker.set_display(enabled)
 
+    def set_local_detection(self, enabled: bool) -> None:
+        self.local_detection_enabled = enabled
+        if self.worker is not None:
+            self.worker.local_detection_enabled = enabled
+
     def stop(self) -> None:
         self.closing = True
         self.retry_timer.stop()
@@ -3921,6 +4038,7 @@ class LocalReplayPane(QWidget):
     def __init__(
         self, camera: AccountDevice | RtspCamera, parent: QWidget,
         worker: StreamWorker | RtspStreamWorker | None = None,
+        initial_detection: DetectionEvent | None = None,
     ) -> None:
         super().__init__(parent)
         self.camera = camera
@@ -3931,6 +4049,8 @@ class LocalReplayPane(QWidget):
         self.mpv_directory: tempfile.TemporaryDirectory[str] | None = None
         self.socket_path: Path | None = None
         self.recordings: list[Path] = []
+        self.detected_events: dict[Path, DetectionEvent] = {}
+        self.initial_detection = initial_detection
         self.current_path: Path | None = None
         self.segment_durations: dict[Path, int] = {}
         self.pending_seek: float | None = None
@@ -3965,9 +4085,9 @@ class LocalReplayPane(QWidget):
         controls_layout.addWidget(self.controls)
         controls_layout.addWidget(self.timeline)
         self.controls.live_button.clicked.connect(self.live_requested.emit)
-        self.controls.previous_button.clicked.connect(lambda: self.select_relative(-1))
+        self.controls.previous_button.clicked.connect(lambda: self.jump_detection(-1))
         self.controls.play_button.clicked.connect(self.toggle_playing)
-        self.controls.next_button.clicked.connect(lambda: self.select_relative(1))
+        self.controls.next_button.clicked.connect(lambda: self.jump_detection(1))
         self.controls.sound_button.clicked.connect(self.toggle_sound)
         self.controls.speed_button.clicked.connect(self.change_speed)
         self.controls.snapshot_button.clicked.connect(self.take_snapshot)
@@ -4007,23 +4127,65 @@ class LocalReplayPane(QWidget):
 
     def refresh_recordings(self) -> None:
         try:
-            self.recordings = camera_recordings(self.camera, self.active_recordings())
+            continuous = camera_recordings(self.camera, self.active_recordings())
+            self.detected_events = {event.clip: event for event in load_events(self.camera.uid) if event.clip is not None}
+            self.recordings = sorted(
+                [*continuous, *self.detected_events], key=lambda path: self.recording_start(path) or datetime.min,
+            )
         except OSError:
             self.status_overlay.display("Unable to read local recordings")
             return
         timeline_recordings = []
         for path in self.recordings:
-            started = segment_time(path)
-            if started is not None:
+            event = self.detected_events.get(path)
+            if event is not None:
+                timeline_recordings.append(CardRecording(
+                    f"{event.first:%Y%m%d%H%M%S}_001.mp4", event.first,
+                    max(1, math.ceil((event.last - event.first).total_seconds())), 0,
+                ))
+            elif (started := segment_time(path)) is not None:
                 timeline_recordings.append(CardRecording(
                     path.name, started, self.segment_durations.get(path, CONTINUOUS_SEGMENT_SECONDS), 0,
                 ))
         self.timeline.set_recordings(timeline_recordings)
+        if self.initial_detection is not None:
+            event = self.initial_detection
+            self.initial_detection = None
+            self.play_detection(event)
+            return
         if not self.recordings:
             self.stop_player()
             self.status_overlay.display("No local recordings from the last 24 hours")
         elif self.current_path not in self.recordings:
-            self.play_selected(len(self.recordings) - 1, rewind=True)
+            latest = continuous[-1] if continuous else self.recordings[-1]
+            self.play_selected(self.recordings.index(latest), rewind=True)
+
+    def recording_start(self, path: Path) -> datetime | None:
+        event = self.detected_events.get(path)
+        return event.clip_start if event is not None else segment_time(path)
+
+    def play_detection(self, event: DetectionEvent) -> None:
+        if event.clip not in self.recordings or event.clip_start is None:
+            self.status_overlay.display("Detection excerpt unavailable")
+            return
+        self.play_selected(self.recordings.index(event.clip), max(0.0, (event.first - event.clip_start).total_seconds()))
+
+    def jump_detection(self, direction: int) -> None:
+        events = sorted(self.detected_events.values(), key=lambda event: event.first)
+        if not events:
+            self.status_overlay.display("No local detection")
+            return
+        current = self.recording_start(self.current_path) if self.current_path is not None else None
+        position_ready, position = mpv_request(self.socket_path, ["get_property", "time-pos"])
+        moment = current + timedelta(seconds=position) if current is not None and position_ready and isinstance(position, (int, float)) else datetime.now()
+        candidates = (event for event in events if event.first < moment - timedelta(seconds=1)) if direction < 0 else (
+            event for event in events if event.first > moment + timedelta(seconds=1)
+        )
+        selected = list(candidates)
+        if selected:
+            self.play_detection(selected[-1] if direction < 0 else selected[0])
+        else:
+            self.status_overlay.display("No earlier detection" if direction < 0 else "No later detection")
 
     def select_relative(self, step: int) -> None:
         if self.current_path not in self.recordings:
@@ -4059,7 +4221,7 @@ class LocalReplayPane(QWidget):
         self.current_path = path
         self.pending_seek = offset
         self.rewind_after_load = rewind
-        started = segment_time(path)
+        started = self.recording_start(path)
         if started is not None:
             self.timeline.set_center(started + timedelta(seconds=offset))
         self.status_overlay.display("Loading recording...")
@@ -4089,8 +4251,15 @@ class LocalReplayPane(QWidget):
         self.progress_timer.start(500)
 
     def seek_time(self, moment: datetime) -> None:
+        for event in self.detected_events.values():
+            if event.first <= moment <= event.last:
+                self.play_selected(
+                    self.recordings.index(event.clip),
+                    max(0.0, (moment - event.clip_start).total_seconds()),
+                )
+                return
         for row, path in enumerate(self.recordings):
-            started = segment_time(path)
+            started = self.recording_start(path)
             if started is None:
                 continue
             end = started + timedelta(seconds=self.segment_durations.get(path, CONTINUOUS_SEGMENT_SECONDS))
@@ -4129,7 +4298,7 @@ class LocalReplayPane(QWidget):
                 self.refresh_recordings()
                 if self.current_path != path:
                     return
-            started = segment_time(path)
+            started = self.recording_start(path)
             if started is not None:
                 self.timeline.set_center(started + timedelta(seconds=current))
         self.status_overlay.hide()
@@ -4285,6 +4454,9 @@ class DialogPlacement(QObject):
 
 
 class MainWindow(QMainWindow):
+    local_detection_ready = pyqtSignal(object)
+    local_detection_failed = pyqtSignal(str)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APPLICATION_NAME)
@@ -4340,6 +4512,14 @@ class MainWindow(QMainWindow):
         self.pending_replay: tuple[datetime | None] | None = None
         self.keep_player = False
         self.latest_detection: datetime | None = None
+        self.latest_local_detection: DetectionEvent | None = None
+        self.pending_local_detection: DetectionEvent | None = None
+        self.local_detection_ready.connect(self.on_local_detection_ready)
+        self.local_detection_failed.connect(self.on_local_detection_failed)
+        self.local_detection_prune_timer = QTimer(self)
+        self.local_detection_prune_timer.timeout.connect(prune_events)
+        self.local_detection_prune_timer.start(60 * 60 * 1000)
+        QTimer.singleShot(0, prune_events)
         self.detection_timer = QTimer(self)
         self.detection_timer.timeout.connect(self.check_detections)
         self.detection_timer.start(DETECTION_POLL_MS)
@@ -4610,6 +4790,10 @@ class MainWindow(QMainWindow):
         self.continuous_action.setCheckable(True)
         self.continuous_action.setChecked(self.continuous_recording_enabled())
         self.continuous_action.toggled.connect(self.set_continuous_recording)
+        self.local_detection_action = menu.addAction("Detect people and animals locally")
+        self.local_detection_action.setCheckable(True)
+        self.local_detection_action.setChecked(self.local_detection_enabled())
+        self.local_detection_action.toggled.connect(self.set_local_detection)
         open_recordings = menu.addAction("Open recordings folder")
         open_recordings.triggered.connect(self.open_recordings_folder)
         menu.addSeparator()
@@ -4620,7 +4804,7 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip(f"{APPLICATION_NAME}\n{self.status_text}")
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self.on_tray_activated)
-        self.tray.messageClicked.connect(lambda: self.enter_replay(self.latest_detection))
+        self.tray.messageClicked.connect(self.open_detection_notification)
         self.tray.show()
 
     def add_tray_action(self, menu: QMenu, button: QPushButton) -> None:
@@ -4715,6 +4899,7 @@ class MainWindow(QMainWindow):
             return
         latest = recording_time(new_names[-1])
         self.latest_detection = latest
+        self.latest_local_detection = None
         message = f"{self.selected_device.name} \u00b7 {latest:%d/%m %H:%M:%S}"
         if len(new_names) > 1:
             message += f" ({len(new_names)} new detections)"
@@ -4726,6 +4911,40 @@ class MainWindow(QMainWindow):
 
     def on_detections_failed(self, message: str) -> None:
         print(message, file=sys.stderr, flush=True)
+
+    def on_local_detection_ready(self, event: DetectionEvent) -> None:
+        if self.close_pending:
+            return
+        replay = self.local_replays.get(event.uid)
+        if replay is not None:
+            replay.refresh_recordings()
+        if not self.local_detection_enabled():
+            return
+        self.latest_local_detection = event
+        description = ", ".join(event.classes)
+        message = f"{event.camera} · {description} · {event.first:%d/%m %H:%M:%S}"
+        if self.tray is not None:
+            self.tray.showMessage("Local camera detection", message, self.windowIcon(), DETECTION_MESSAGE_MS)
+        self.show_notice(message)
+
+    def on_local_detection_failed(self, message: str) -> None:
+        if not self.close_pending:
+            self.show_notice(message)
+
+    def open_detection_notification(self) -> None:
+        event = self.latest_local_detection
+        if event is None:
+            self.enter_replay(self.latest_detection)
+            return
+        camera = next((camera for camera in self.devices if camera.uid == event.uid), None)
+        if camera is None:
+            return
+        self.show_window()
+        if camera.uid == getattr(getattr(self, "selected_device", None), "uid", None) or camera.uid in self.previews:
+            self.open_local_replay(camera, event)
+        else:
+            self.pending_local_detection = event
+            self.select_camera(self.device_accounts[camera.uid], camera.uid)
 
     def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -4764,6 +4983,18 @@ class MainWindow(QMainWindow):
     def continuous_recording_enabled(self) -> bool:
         return self.settings.value(CONTINUOUS_SETTING, True, bool)
 
+    def local_detection_enabled(self) -> bool:
+        return self.settings.value(LOCAL_DETECTION_SETTING, True, bool)
+
+    def set_local_detection(self, enabled: bool) -> None:
+        self.settings.setValue(LOCAL_DETECTION_SETTING, enabled)
+        self.settings.sync()
+        if self.stream_worker is not None:
+            self.stream_worker.local_detection_enabled = enabled
+        for preview in self.previews.values():
+            preview.set_local_detection(enabled)
+        self.show_notice("Local detection on." if enabled else "Local detection off.")
+
     def set_continuous_recording(self, enabled: bool) -> None:
         self.settings.setValue(CONTINUOUS_SETTING, enabled)
         self.settings.sync()
@@ -4780,8 +5011,10 @@ class MainWindow(QMainWindow):
         elif camera is not None:
             self.enter_replay(None)
 
-    def open_local_replay(self, camera: AccountDevice | RtspCamera) -> None:
+    def open_local_replay(self, camera: AccountDevice | RtspCamera, event: DetectionEvent | None = None) -> None:
         if camera.uid in self.local_replays:
+            if event is not None:
+                self.local_replays[camera.uid].play_detection(event)
             self.local_replays[camera.uid].show_overlay()
             return
         selected = camera.uid == getattr(getattr(self, "selected_device", None), "uid", None)
@@ -4791,7 +5024,7 @@ class MainWindow(QMainWindow):
         stack = self.primary_video_stack if selected else preview.video_stack
         worker = self.stream_worker if selected else preview.worker
         try:
-            replay = LocalReplayPane(camera, self.primary_pane if selected else preview, worker)
+            replay = LocalReplayPane(camera, self.primary_pane if selected else preview, worker, event)
         except OSError:
             self.show_notice("Unable to open local recordings.")
             return
@@ -4960,7 +5193,11 @@ class MainWindow(QMainWindow):
                 continue
             preview = self.previews.get(camera.uid)
             if preview is None:
-                preview = CameraPreview(camera, self.continuous_recording_enabled(), self.settings)
+                preview = CameraPreview(
+                    camera, self.continuous_recording_enabled(), self.settings,
+                    self.local_detection_enabled(), self.local_detection_ready.emit,
+                    self.local_detection_failed.emit,
+                )
                 preview.label.moved.connect(self.swap_cameras)
                 preview.replay_requested.connect(self.open_local_replay)
                 preview.camera_replay_requested.connect(self.open_camera_sd_replay)
@@ -5480,6 +5717,9 @@ class MainWindow(QMainWindow):
                 continuous,
             )
         self.stream_worker.set_continuous(self.continuous_recording_enabled())
+        self.stream_worker.local_detection_enabled = self.local_detection_enabled()
+        self.stream_worker.local_event_callback = self.local_detection_ready.emit
+        self.stream_worker.local_error_callback = self.local_detection_failed.emit
         if isinstance(self.stream_worker, StreamWorker):
             self.stream_worker.set_display(self.isVisible() and not self.isMinimized())
         self.stream_worker.status_changed.connect(self.on_stream_status)
@@ -5563,6 +5803,10 @@ class MainWindow(QMainWindow):
         if message == "Live video":
             self.stream_live = True
             self.reconnect_attempts = 0
+            if self.pending_local_detection is not None and self.pending_local_detection.uid == self.selected_device.uid:
+                event = self.pending_local_detection
+                self.pending_local_detection = None
+                QTimer.singleShot(0, lambda: self.open_local_replay(self.selected_device, event))
             rtsp = isinstance(self.selected_device, RtspCamera)
             self.set_controls_enabled(not self.control_pending)
             self.sound_button.setEnabled(not rtsp)
@@ -6075,6 +6319,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         event.accept()
+        if _LOCAL_DETECTION_ENGINE is not None:
+            _LOCAL_DETECTION_ENGINE.close()
         if self.window_hints is not None:
             self.window_hints.close()
         if self.tray is not None:

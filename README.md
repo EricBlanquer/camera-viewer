@@ -7,7 +7,7 @@ It does not require Home Assistant, Wine, Waydroid, or the phone while viewing.
 
 ## Install
 
-Requirements: Python 3.11 or newer, PyQt6, python3-xlib, mpv, ffmpeg with ffplay, and Git.
+Requirements: Python 3.11 or newer, PyQt6, python3-xlib, mpv, ffmpeg with ffplay, Git, OpenCV, and NumPy.
 O-KAM accounts also require `secret-tool` with an unlocked desktop keyring and network access to O-KAM's services.
 On this computer these programs are already installed.
 
@@ -17,7 +17,7 @@ cd camera-viewer
 ./install.sh
 ```
 
-The installer creates a virtual environment, installs the pinned transport package, downloads and verifies the official wake configuration, and adds a **Camera Viewer** application launcher.
+The installer creates a virtual environment, installs the pinned transport package, downloads and verifies the official wake configuration and [OpenCV Zoo YOLOX-s model](https://huggingface.co/opencv/opencv_zoo/tree/main/models/object_detection_yolox), and adds a **Camera Viewer** application launcher.
 It also starts Camera Viewer in the notification area when the desktop session opens, without waking the camera until the window is shown.
 It keeps the vendor wake configuration in `~/.local/share/okam-linux/vendor` with owner-only permissions.
 
@@ -66,7 +66,7 @@ When the camera exposes the TAS-Tech local white light endpoint, the bulb button
 When the camera exposes the TAS-Tech local tilt endpoint, the PTZ control appears after the live stream starts and offers short Up and Down movements; a vertical mouse drag also moves the camera.
 The tested TERUHAL QW55 accepts these movements on its local HTTP service at port 8001.
 On the tested camera, the local endpoint acknowledged horizontal commands without moving the image and exposed no verified saved-position command; the iCam365 mobile app uses its proprietary P2P protocol for these controls.
-iCam365 microSD playback, talkback microphone, and detection notifications are not available through this RTSP connection.
+iCam365 microSD playback and talkback microphone are unavailable through this RTSP connection; local people and animal detection uses the continuous recording.
 An RTSP URL is reachable outside the home only when the computer has a secure route to the camera's LAN, such as a VPN; the iCam365 account relay is not integrated.
 
 For a TERUHAL QW55 whose RTSP service is unavailable, Camera Viewer can use its authenticated iCam365 CS2/PPCS connection.
@@ -96,7 +96,7 @@ Audio is resampled against the live timestamps so differences in the camera's au
 The native muxer keeps AAC priming timestamps within the current stream timeline.
 The native connection supports the On/Automatic light control, short directional motor pulses, and horizontal or vertical mouse dragging.
 The camera's saved positions are retrieved over its native connection, displayed with their saved names in tooltips, and recalled with their original position coordinates and identifiers.
-Detection notifications are not integrated for native iCam365 connections.
+Local people and animal detection is available with the native iCam365 connection and continuous recording.
 Directory lookup and a direct native connection were verified locally; the relay path outside the home remains unverified.
 This connection does not provide camera microSD playback or talkback.
 
@@ -128,6 +128,12 @@ When the desktop provides a notification area, Camera Viewer shows an icon there
 Click the icon to show or hide the window, or open its menu for camera selection, playback, and the **Camera controls** submenu.
 Opening Camera Viewer again from the application menu shows the running instance instead of starting a second one.
 Closing the window hides it; live video keeps running in the background so continuous recording and detection checks continue.
+The tray menu enables local detection of people, cats, dogs, and birds while continuous recording is on.
+It analyzes one 640 × 360 frame per second with the SHA-256-verified OpenCV Zoo YOLOX-s model and confirms an event with two matching detections within two seconds.
+Event excerpts include up to five seconds before and after the detected passage and are stored without audio in `Videos/O-KAM Linux/Detections`, using the system's configured Videos folder.
+Local detections appear in red on the local playback timeline, and its Previous and Next buttons jump between detected passages.
+The notification opens the excerpt for the affected camera, including when the viewer was hidden in the notification area.
+Local detection clips and metadata are retained for 24 hours; turning off continuous recording pauses local analysis.
 
 For O-KAM cameras, the playback button switches the window to the recordings stored on the camera's microSD card, and **LIVE** returns to live video.
 In playback, the control bar shows a timeline with continuous recording in blue and detections in red; drag it or click a time to play from there, and use the wheel or the magnifier buttons to show a shorter or longer period.
