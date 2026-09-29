@@ -131,6 +131,7 @@ Closing the window hides it; live video keeps running in the background so conti
 The tray menu enables local detection of people, cats, dogs, and birds while continuous recording is on.
 It analyzes one 640 × 360 frame per second with the SHA-256-verified OpenCV Zoo YOLOX-s model and confirms an event with two matching detections within two seconds.
 Event excerpts include up to five seconds before and after the detected passage and are stored without audio in `Videos/O-KAM Linux/Detections`, using the system's configured Videos folder.
+The `Detections` folder groups excerpts in `cat`, `dog`, `bird`, and `person` folders; clips with multiple types use a combined folder such as `cat_person`, and each clip name starts with its type and camera name.
 Local detections appear in red on the local playback timeline, and its Previous and Next buttons jump between detected passages.
 The notification opens the excerpt for the affected camera, including when the viewer was hidden in the notification area.
 Local detection clips and metadata are retained for 24 hours; turning off continuous recording pauses local analysis.

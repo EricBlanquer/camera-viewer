@@ -176,20 +176,30 @@ def event_directory() -> Path:
 
 
 def _event_folder(uid: str) -> Path:
-    directory = event_directory() / hashlib.sha256(uid.encode("utf-8")).hexdigest()[:16]
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = event_directory() / ".metadata"
+    metadata.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata.chmod(0o700)
+    directory = metadata / hashlib.sha256(uid.encode("utf-8")).hexdigest()[:16]
+    directory.mkdir(exist_ok=True, mode=0o700)
     directory.chmod(0o700)
     return directory
 
 
-def save_event(path: Path, event: DetectionEvent, status: str) -> None:
-    document = {
-        "uid": event.uid, "camera": event.camera, "first": event.first.isoformat(),
-        "last": event.last.isoformat(), "classes": event.classes, "score": event.score,
-        "clip": event.clip.name if event.clip is not None else None,
-        "clip_start": event.clip_start.isoformat() if event.clip_start is not None else None,
-        "status": status,
-    }
+def _event_type(classes: tuple[str, ...]) -> str:
+    names = set(classes)
+    if not names or not names.issubset(CLASS_NAMES.values()):
+        raise ValueError("Unknown local detection type.")
+    return "_".join(sorted(names))
+
+
+def _clip_path(directory: Path, name: str) -> Path:
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("Invalid local detection clip path.")
+    return directory / relative
+
+
+def _write_event_document(path: Path, document: dict) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix="intraswitch_camera_event_", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
@@ -199,8 +209,61 @@ def save_event(path: Path, event: DetectionEvent, status: str) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def save_event(path: Path, event: DetectionEvent, status: str) -> None:
+    document = {
+        "uid": event.uid, "camera": event.camera, "first": event.first.isoformat(),
+        "last": event.last.isoformat(), "classes": event.classes, "score": event.score,
+        "clip": event.clip.relative_to(event_directory()).as_posix() if event.clip is not None else None,
+        "clip_start": event.clip_start.isoformat() if event.clip_start is not None else None,
+        "status": status,
+    }
+    _write_event_document(path, document)
+
+
+def organize_events() -> None:
+    root = event_directory()
+    for directory in root.iterdir():
+        if not directory.is_dir():
+            continue
+        for metadata in directory.glob("*.json"):
+            try:
+                document = json.loads(metadata.read_text(encoding="utf-8"))
+                name = document.get("clip")
+                if directory.name != hashlib.sha256(document["uid"].encode("utf-8")).hexdigest()[:16]:
+                    raise ValueError("Invalid local detection camera folder.")
+                if document["status"] == "ready" and name:
+                    if Path(name).parent == Path("."):
+                        source = _clip_path(directory, name)
+                        category = _event_type(tuple(document["classes"]))
+                        folder = root / category
+                        folder.mkdir(mode=0o700, exist_ok=True)
+                        folder.chmod(0o700)
+                        destination = folder / f"{category}_{source.name}"
+                        if source.is_file():
+                            if destination.exists():
+                                raise FileExistsError(destination)
+                            source.replace(destination)
+                        elif not destination.is_file():
+                            raise FileNotFoundError(source)
+                        document["clip"] = destination.relative_to(root).as_posix()
+                        _write_event_document(metadata, document)
+                    elif not _clip_path(root, name).is_file():
+                        raise FileNotFoundError(_clip_path(root, name))
+                destination = _event_folder(document["uid"]) / metadata.name
+                if destination.exists():
+                    raise FileExistsError(destination)
+                metadata.replace(destination)
+            except (OSError, ValueError, KeyError, TypeError) as ex:
+                LOG.warning("Could not organize local detection %s: %s", metadata, ex)
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
 def load_events(uid: str, now: datetime | None = None) -> list[DetectionEvent]:
     directory = _event_folder(uid)
+    root = event_directory()
     cutoff = (now or datetime.now()) - RETENTION
     if not directory.is_dir():
         return []
@@ -209,7 +272,7 @@ def load_events(uid: str, now: datetime | None = None) -> list[DetectionEvent]:
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
             first = datetime.fromisoformat(document["first"])
-            clip = directory / document["clip"] if document["clip"] else None
+            clip = _clip_path(root, document["clip"]) if document["clip"] else None
             if document["uid"] == uid and first >= cutoff and document["status"] == "ready" and clip is not None and clip.is_file():
                 events.append(DetectionEvent(
                     uid, document["camera"], first, datetime.fromisoformat(document["last"]),
@@ -223,7 +286,11 @@ def load_events(uid: str, now: datetime | None = None) -> list[DetectionEvent]:
 
 def prune_events(now: datetime | None = None) -> None:
     cutoff = (now or datetime.now()) - RETENTION
-    for directory in event_directory().iterdir():
+    root = event_directory()
+    metadata_root = root / ".metadata"
+    if not metadata_root.is_dir():
+        return
+    for directory in metadata_root.iterdir():
         if not directory.is_dir():
             continue
         for metadata in directory.glob("*.json"):
@@ -232,7 +299,7 @@ def prune_events(now: datetime | None = None) -> None:
                 if datetime.fromisoformat(document["first"]) >= cutoff:
                     continue
                 if document.get("clip"):
-                    (directory / document["clip"]).unlink(missing_ok=True)
+                    _clip_path(root, document["clip"]).unlink(missing_ok=True)
                 metadata.unlink(missing_ok=True)
             except (OSError, ValueError, KeyError):
                 LOG.warning("Could not prune local detection %s", metadata)
@@ -321,9 +388,12 @@ def export_event(
     segments = _source_segments(recordings, prefix, first, last, cancel)
     if not segments:
         raise OSError("No continuous recording covers the local detection.")
-    folder = _event_folder(event.uid)
+    category = _event_type(event.classes)
+    folder = event_directory() / category
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    folder.chmod(0o700)
     clip_start = max(first, segments[0][1])
-    clip = folder / f"{prefix}_{clip_start:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.mkv"
+    clip = folder / f"{category}_{prefix}_{clip_start:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.mkv"
     with tempfile.TemporaryDirectory(prefix="intraswitch_camera_event_") as temporary:
         parts = []
         available_end = clip_start

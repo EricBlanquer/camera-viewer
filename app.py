@@ -97,7 +97,9 @@ from okam_native.p2p import (
 )
 from okam_native.wakeup import WakeError, load_wake_credentials, wake_camera
 from icam365 import PTZ_COMMAND, PTZ_POSITION_COMMAND, close_bridge, get_bridge
-from local_detection import DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, prune_events
+from local_detection import (
+    DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, organize_events, prune_events,
+)
 from Xlib import X as X11, Xutil, display as xdisplay
 from Xlib.protocol import event as xevent
 
@@ -6361,6 +6363,10 @@ def main() -> int:
     instance_server = QLocalServer()
     if not instance_server.listen(server_name):
         return 1
+    try:
+        organize_events()
+    except OSError as ex:
+        LOG.warning("Could not organize local detections: %s", ex)
     try:
         directory = continuous_directory()
     except OSError:

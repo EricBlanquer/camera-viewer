@@ -17,7 +17,8 @@ from PyQt6.QtWidgets import QApplication, QWidget
 
 from app import LocalReplayPane, MainWindow, RtspCamera, measured_video_rate, update_local_detector
 from local_detection import (
-    DetectionEvent, DetectionPipeline, EventTracker, export_event, install_model, load_events, save_event,
+    DetectionEvent, DetectionPipeline, EventTracker, export_event, install_model, load_events,
+    organize_events, prune_events, save_event,
 )
 
 
@@ -131,7 +132,10 @@ class RecordingExcerptTest(unittest.TestCase):
                 finished = export_event(event, recordings, "Garden")
                 self.assertIsNotNone(finished.clip)
                 self.assertEqual(finished.clip_start, start + timedelta(seconds=4))
-                metadata = finished.clip.with_suffix(".json")
+                self.assertEqual(finished.clip.parent.name, "person")
+                self.assertTrue(finished.clip.name.startswith("person_Garden_"))
+                metadata = root / "Detections" / ".metadata" / hashlib.sha256(b"camera").hexdigest()[:16] / "event.json"
+                metadata.parent.mkdir(parents=True)
                 save_event(metadata, finished, "ready")
                 self.assertEqual(load_events("camera", start + timedelta(seconds=20)), [finished])
                 duration = subprocess.run([
@@ -163,6 +167,42 @@ class RecordingExcerptTest(unittest.TestCase):
                     "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(finished.clip),
                 ], check=True, capture_output=True, text=True, timeout=10)
                 self.assertGreater(int(packets.stdout.strip()), 0)
+
+    def test_existing_excerpts_are_sorted_by_type_and_remain_playable(self):
+        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
+            root = Path(directory) / "Detections"
+            camera_folder = root / hashlib.sha256(b"camera").hexdigest()[:16]
+            camera_folder.mkdir(parents=True)
+            clip = camera_folder / "Garden_20260929_173226_12345678.mkv"
+            clip.write_bytes(b"existing video")
+            first = datetime.now().replace(microsecond=0)
+            event = DetectionEvent("camera", "Garden", first, first + timedelta(seconds=4),
+                                   ("cat", "person"), .9, clip, first - timedelta(seconds=5))
+            metadata = camera_folder / "event.json"
+            with patch("local_detection.event_directory", return_value=root):
+                save_event(metadata, event, "ready")
+                document = json.loads(metadata.read_text(encoding="utf-8"))
+                document["clip"] = clip.name
+                metadata.write_text(json.dumps(document), encoding="utf-8")
+                pending = camera_folder / "pending.json"
+                save_event(pending, DetectionEvent("camera", "Garden", first, first,
+                                                   ("dog",), .7), "pending")
+                organize_events()
+                organize_events()
+                relocated = root / "cat_person" / f"cat_person_{clip.name}"
+                relocated_metadata = root / ".metadata" / camera_folder.name / metadata.name
+                relocated_pending = relocated_metadata.with_name(pending.name)
+                self.assertEqual(relocated.read_bytes(), b"existing video")
+                self.assertFalse(clip.exists())
+                self.assertFalse(metadata.exists())
+                self.assertEqual(json.loads(relocated_pending.read_text(encoding="utf-8"))["status"], "pending")
+                self.assertEqual(json.loads(relocated_metadata.read_text(encoding="utf-8"))["clip"],
+                                 f"cat_person/{relocated.name}")
+                self.assertEqual(load_events("camera", first + timedelta(hours=1))[0].clip, relocated)
+                prune_events(first + timedelta(hours=25))
+                self.assertFalse(relocated.exists())
+                self.assertFalse(relocated_metadata.exists())
+                self.assertFalse(relocated_pending.exists())
 
     def test_disabled_continuous_recording_does_not_start_decoder(self):
         worker = SimpleNamespace(
