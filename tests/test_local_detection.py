@@ -17,21 +17,25 @@ from PyQt6.QtWidgets import QApplication, QWidget
 
 from app import LocalReplayPane, MainWindow, RtspCamera, measured_video_rate, update_local_detector
 from local_detection import (
-    DetectionEvent, DetectionPipeline, EventTracker, export_event, install_model, load_events,
+    DetectionEvent, DetectionHit, DetectionPipeline, EventTracker, export_event, install_model, load_events,
     organize_events, prune_events, save_event,
 )
 
 
 class EventTrackerTest(unittest.TestCase):
+    @staticmethod
+    def hit(name, score, box=(10, 10, 20, 20)):
+        return DetectionHit(name, score, box)
+
     def test_two_nearby_hits_confirm_one_event_and_ignored_frames_close_it(self):
         start = datetime(2026, 9, 29, 17, 32, 30)
         tracker = EventTracker("camera", "Garden")
-        self.assertEqual(tracker.observe(start, {"person": .7}), [])
-        self.assertEqual(tracker.observe(start + timedelta(seconds=1), {}), [])
-        self.assertEqual(tracker.observe(start + timedelta(seconds=2), {"person": .8}), [])
-        self.assertEqual(tracker.observe(start + timedelta(seconds=4), {}), [])
-        self.assertEqual(tracker.observe(start + timedelta(seconds=5), {"person": .9}), [])
-        completed = tracker.observe(start + timedelta(seconds=9), {})
+        self.assertEqual(tracker.observe(start, [self.hit("person", .7)]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=1), []), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=2), [self.hit("person", .8)]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=4), []), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=5), [self.hit("person", .9)]), [])
+        completed = tracker.observe(start + timedelta(seconds=9), [])
         self.assertEqual(len(completed), 1)
         self.assertEqual((completed[0].first, completed[0].last), (start, start + timedelta(seconds=5)))
         self.assertEqual(completed[0].classes, ("person",))
@@ -40,7 +44,7 @@ class EventTrackerTest(unittest.TestCase):
     def test_different_single_classes_do_not_confirm_false_event(self):
         start = datetime(2026, 9, 29, 17)
         tracker = EventTracker("camera", "Garden")
-        for seconds, found in ((0, {"person": .6}), (1, {"bird": .6}), (4, {})):
+        for seconds, found in ((0, [self.hit("person", .6)]), (1, [self.hit("bird", .6)]), (4, [])):
             self.assertEqual(tracker.observe(start + timedelta(seconds=seconds), found), [])
 
     def test_sustained_event_splits_before_unbounded_clip(self):
@@ -48,10 +52,41 @@ class EventTrackerTest(unittest.TestCase):
         tracker = EventTracker("camera", "Garden")
         events = []
         for seconds in range(121):
-            events += tracker.observe(start + timedelta(seconds=seconds), {"dog": .8})
+            events += tracker.observe(start + timedelta(seconds=seconds), [self.hit("dog", .8)])
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].classes, ("dog",))
         self.assertLessEqual((events[0].last - events[0].first).total_seconds(), 120)
+
+    def test_one_cat_keeps_its_identity_when_the_model_calls_it_dog_or_bird(self):
+        start = datetime(2026, 9, 29, 20, 14)
+        tracker = EventTracker("camera", "Garden")
+        dog_box = (422, 248, 64, 46)
+        cat_box = (423, 250, 65, 43)
+        bird_box = (418, 226, 65, 68)
+        for seconds, hit in ((0, self.hit("dog", .64, dog_box)),
+                             (1, self.hit("dog", .69, dog_box)),
+                             (2, self.hit("cat", .62, cat_box)),
+                             (3, self.hit("dog", .74, dog_box))):
+            self.assertEqual(tracker.observe(start + timedelta(seconds=seconds), [hit]), [])
+        first = tracker.observe(start + timedelta(seconds=7), [])
+        self.assertEqual(first[0].classes, ("cat",))
+        self.assertEqual(tracker.observe(start + timedelta(seconds=21), [self.hit("bird", .59, bird_box)]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=22), [self.hit("bird", .61, bird_box)]), [])
+        second = tracker.observe(start + timedelta(seconds=26), [])
+        self.assertEqual(second[0].classes, ("cat",))
+        self.assertEqual(tracker.observe(start + timedelta(seconds=100), [self.hit("bird", .7, bird_box)]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=101), [self.hit("bird", .7, bird_box)]), [])
+        third = tracker.observe(start + timedelta(seconds=105), [])
+        self.assertEqual(third[0].classes, ("bird",))
+
+    def test_separate_cat_and_dog_remain_two_types(self):
+        start = datetime(2026, 9, 29, 20, 14)
+        tracker = EventTracker("camera", "Garden")
+        animals = [self.hit("cat", .8, (10, 10, 20, 20)), self.hit("dog", .9, (100, 100, 20, 20))]
+        self.assertEqual(tracker.observe(start, animals), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=1), animals), [])
+        completed = tracker.observe(start + timedelta(seconds=5), [])
+        self.assertEqual(completed[0].classes, ("cat", "dog"))
 
 
 class ModelInstallationTest(unittest.TestCase):

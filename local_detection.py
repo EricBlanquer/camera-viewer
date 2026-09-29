@@ -23,7 +23,10 @@ LOG = logging.getLogger("okam-linux.local_detection")
 MODEL_URL = "https://huggingface.co/opencv/opencv_zoo/resolve/main/models/object_detection_yolox/object_detection_yolox_2022nov.onnx"
 MODEL_SHA256 = "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063"
 MODEL_SIZE = 35858002
-CLASS_NAMES = {0: "person", 14: "bird", 15: "cat", 16: "dog"}
+PERSON_CLASS = "person"
+CAT_CLASS = "cat"
+ANIMAL_KIND = "animal"
+CLASS_NAMES = {0: PERSON_CLASS, 14: "bird", 15: CAT_CLASS, 16: "dog"}
 SCORE_THRESHOLD = 0.55
 SAMPLE_WIDTH = 640
 SAMPLE_HEIGHT = 360
@@ -32,6 +35,8 @@ EVENT_MARGIN_SECONDS = 5
 EVENT_GAP_SECONDS = 3
 EVENT_CONFIRM_SECONDS = 2
 EVENT_MAX_SECONDS = 120
+TRACK_MAX_AGE = timedelta(seconds=60)
+TRACK_OVERLAP_THRESHOLD = 0.25
 MODEL_DOWNLOAD_LIMIT = MODEL_SIZE + 1
 RETENTION = timedelta(hours=24)
 
@@ -84,7 +89,7 @@ class YoloXDetector:
         self.grids = np.concatenate(grids)
         self.strides = np.concatenate(strides)
 
-    def infer(self, frame: bytes) -> dict[str, float]:
+    def infer(self, frame: bytes) -> list[DetectionHit]:
         cv2, np = self.cv2, self.np
         source = np.frombuffer(frame, np.uint8).reshape(SAMPLE_HEIGHT, SAMPLE_WIDTH, 3)
         image = np.full((640, 640, 3), 114, np.float32)
@@ -93,7 +98,7 @@ class YoloXDetector:
         output = self.net.forward().reshape(-1, 85)
         scores = output[:, 4:5] * output[:, 5:]
         classes = np.argmax(scores, axis=1)
-        found = {}
+        found = []
         for index, name in CLASS_NAMES.items():
             matches = np.where((classes == index) & (scores[:, index] >= SCORE_THRESHOLD))[0]
             if not len(matches):
@@ -103,8 +108,37 @@ class YoloXDetector:
             boxes = np.concatenate((centers - sizes / 2, sizes), axis=1)
             kept = cv2.dnn.NMSBoxes(boxes.tolist(), scores[matches, index].tolist(), SCORE_THRESHOLD, 0.5)
             if len(kept):
-                found[name] = max(float(scores[matches[int(row)], index]) for row in np.asarray(kept).flatten())
+                for row in np.asarray(kept).flatten():
+                    position = int(row)
+                    box = tuple(float(value) for value in boxes[position])
+                    if box[1] < SAMPLE_HEIGHT:
+                        found.append(DetectionHit(name, float(scores[matches[position], index]), box))
         return found
+
+
+@dataclass(frozen=True)
+class DetectionHit:
+    name: str
+    score: float
+    box: tuple[float, float, float, float]
+
+
+@dataclass
+class DetectionTrack:
+    label: str
+    box: tuple[float, float, float, float]
+    last: datetime
+    cat_seen: datetime | None = None
+
+
+def box_overlap(first: tuple[float, float, float, float], second: tuple[float, float, float, float]) -> float:
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[0] + first[2], second[0] + second[2])
+    bottom = min(first[1] + first[3], second[1] + second[3])
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    union = first[2] * first[3] + second[2] * second[3] - intersection
+    return intersection / union if union > 0 else 0.0
 
 
 @dataclass(frozen=True)
@@ -123,21 +157,54 @@ class EventTracker:
     def __init__(self, uid: str, camera: str) -> None:
         self.uid = uid
         self.camera = camera
-        self.candidate: deque[tuple[datetime, dict[str, float]]] = deque()
+        self.candidate: deque[tuple[datetime, dict[int, float]]] = deque()
         self.first: datetime | None = None
         self.last: datetime | None = None
-        self.classes: set[str] = set()
+        self.tracks: dict[int, DetectionTrack] = {}
+        self.next_track_id = 0
+        self.active_hits: dict[int, int] = {}
         self.score = 0.0
 
-    def observe(self, when: datetime, found: dict[str, float]) -> list[DetectionEvent]:
+    def _match(self, when: datetime, hits: list[DetectionHit]) -> dict[int, float]:
+        for identifier, track in list(self.tracks.items()):
+            if when - track.last > TRACK_MAX_AGE and identifier not in self.active_hits:
+                del self.tracks[identifier]
+        found = {}
+        for hit in sorted(hits, key=lambda item: item.score, reverse=True):
+            kind = PERSON_CLASS if hit.name == PERSON_CLASS else ANIMAL_KIND
+            matches = (
+                (box_overlap(hit.box, track.box), identifier)
+                for identifier, track in self.tracks.items()
+                if when - track.last <= TRACK_MAX_AGE
+                and (PERSON_CLASS if track.label == PERSON_CLASS else ANIMAL_KIND) == kind
+            )
+            overlap, identifier = max(matches, default=(0.0, -1))
+            if overlap < TRACK_OVERLAP_THRESHOLD:
+                identifier = self.next_track_id
+                self.next_track_id += 1
+                self.tracks[identifier] = DetectionTrack(hit.name, hit.box, when)
+            track = self.tracks[identifier]
+            if hit.name == CAT_CLASS:
+                track.label = CAT_CLASS
+                track.cat_seen = when
+            elif track.cat_seen is None or when - track.cat_seen > TRACK_MAX_AGE:
+                track.label = hit.name
+            track.box = hit.box
+            track.last = when
+            found[identifier] = max(found.get(identifier, 0.0), hit.score)
+        return found
+
+    def observe(self, when: datetime, hits: list[DetectionHit]) -> list[DetectionEvent]:
         completed = []
         if self.last is not None and (when - self.last).total_seconds() > EVENT_GAP_SECONDS:
             completed.append(self.finish())
+        found = self._match(when, hits)
         if not found:
             return completed
         if self.first is not None:
             self.last = when
-            self.classes.update(found)
+            for identifier in found:
+                self.active_hits[identifier] = self.active_hits.get(identifier, 0) + 1
             self.score = max(self.score, *found.values())
             if (when - self.first).total_seconds() >= EVENT_MAX_SECONDS:
                 completed.append(self.finish())
@@ -148,7 +215,8 @@ class EventTracker:
             if earlier.keys() & found.keys():
                 self.first = start
                 self.last = when
-                self.classes = set(earlier) | set(found)
+                self.active_hits = {identifier: int(identifier in earlier) + int(identifier in found)
+                                    for identifier in earlier.keys() | found.keys()}
                 self.score = max(*earlier.values(), *found.values())
                 self.candidate.clear()
                 return completed
@@ -157,10 +225,12 @@ class EventTracker:
 
     def finish(self) -> DetectionEvent:
         assert self.first is not None and self.last is not None
-        event = DetectionEvent(self.uid, self.camera, self.first, self.last, tuple(sorted(self.classes)), self.score)
+        classes = tuple(sorted({self.tracks[identifier].label for identifier, count in self.active_hits.items()
+                                if count >= 2 and identifier in self.tracks}))
+        event = DetectionEvent(self.uid, self.camera, self.first, self.last, classes, self.score)
         self.first = None
         self.last = None
-        self.classes.clear()
+        self.active_hits.clear()
         self.score = 0.0
         self.candidate.clear()
         return event
