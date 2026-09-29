@@ -36,7 +36,10 @@ EVENT_GAP_SECONDS = 3
 EVENT_CONFIRM_SECONDS = 2
 EVENT_MAX_SECONDS = 120
 TRACK_MAX_AGE = timedelta(seconds=60)
+TRACK_NEARBY_AGE = timedelta(seconds=20)
 TRACK_OVERLAP_THRESHOLD = 0.25
+TRACK_DISTANCE_FACTOR = 1.1
+TRACK_AREA_RATIO_LIMIT = 2.5
 MODEL_DOWNLOAD_LIMIT = MODEL_SIZE + 1
 RETENTION = timedelta(hours=24)
 
@@ -141,6 +144,30 @@ def box_overlap(first: tuple[float, float, float, float], second: tuple[float, f
     return intersection / union if union > 0 else 0.0
 
 
+def box_proximity(first: tuple[float, float, float, float], second: tuple[float, float, float, float]) -> float:
+    first_area = first[2] * first[3]
+    second_area = second[2] * second[3]
+    if min(first_area, second_area) <= 0 or max(first_area, second_area) / min(first_area, second_area) > TRACK_AREA_RATIO_LIMIT:
+        return 0.0
+    distance_limit = max(first[2], first[3], second[2], second[3]) * TRACK_DISTANCE_FACTOR
+    horizontal = first[0] + first[2] / 2 - second[0] - second[2] / 2
+    vertical = first[1] + first[3] / 2 - second[1] - second[3] / 2
+    distance_squared = horizontal * horizontal + vertical * vertical
+    return max(0.0, 1 - distance_squared / (distance_limit * distance_limit))
+
+
+def track_match_score(hit: DetectionHit, track: DetectionTrack, when: datetime) -> float:
+    kind = PERSON_CLASS if hit.name == PERSON_CLASS else ANIMAL_KIND
+    if (PERSON_CLASS if track.label == PERSON_CLASS else ANIMAL_KIND) != kind or when - track.last > TRACK_MAX_AGE:
+        return 0.0
+    overlap = box_overlap(hit.box, track.box)
+    if overlap >= TRACK_OVERLAP_THRESHOLD:
+        return 2 + overlap
+    if timedelta(0) < when - track.last <= TRACK_NEARBY_AGE:
+        return box_proximity(hit.box, track.box)
+    return 0.0
+
+
 @dataclass(frozen=True)
 class DetectionEvent:
     uid: str
@@ -171,15 +198,12 @@ class EventTracker:
                 del self.tracks[identifier]
         found = {}
         for hit in sorted(hits, key=lambda item: item.score, reverse=True):
-            kind = PERSON_CLASS if hit.name == PERSON_CLASS else ANIMAL_KIND
             matches = (
-                (box_overlap(hit.box, track.box), identifier)
+                (track_match_score(hit, track, when), identifier)
                 for identifier, track in self.tracks.items()
-                if when - track.last <= TRACK_MAX_AGE
-                and (PERSON_CLASS if track.label == PERSON_CLASS else ANIMAL_KIND) == kind
             )
-            overlap, identifier = max(matches, default=(0.0, -1))
-            if overlap < TRACK_OVERLAP_THRESHOLD:
+            match_score, identifier = max(matches, default=(0.0, -1))
+            if match_score <= 0:
                 identifier = self.next_track_id
                 self.next_track_id += 1
                 self.tracks[identifier] = DetectionTrack(hit.name, hit.box, when)

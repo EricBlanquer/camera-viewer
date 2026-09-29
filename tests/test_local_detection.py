@@ -82,11 +82,24 @@ class EventTrackerTest(unittest.TestCase):
     def test_separate_cat_and_dog_remain_two_types(self):
         start = datetime(2026, 9, 29, 20, 14)
         tracker = EventTracker("camera", "Garden")
-        animals = [self.hit("cat", .8, (10, 10, 20, 20)), self.hit("dog", .9, (100, 100, 20, 20))]
+        animals = [self.hit("cat", .8, (10, 10, 50, 50)), self.hit("dog", .9, (60, 10, 50, 50))]
         self.assertEqual(tracker.observe(start, animals), [])
         self.assertEqual(tracker.observe(start + timedelta(seconds=1), animals), [])
         completed = tracker.observe(start + timedelta(seconds=5), [])
         self.assertEqual(completed[0].classes, ("cat", "dog"))
+
+    def test_moving_cat_keeps_its_identity_after_a_short_detection_gap(self):
+        start = datetime(2026, 9, 29, 20, 25)
+        tracker = EventTracker("camera", "Garden")
+        self.assertEqual(tracker.observe(start, [self.hit("cat", .7, (138, 127, 68, 36))]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=1),
+                                         [self.hit("cat", .7, (132, 128, 67, 33))]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=5), [])[0].classes, ("cat",))
+        self.assertEqual(tracker.observe(start + timedelta(seconds=18),
+                                         [self.hit("dog", .77, (85, 112, 45, 38))]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=19),
+                                         [self.hit("dog", .78, (87, 111, 46, 39))]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=23), [])[0].classes, ("cat",))
 
 
 class ModelInstallationTest(unittest.TestCase):
