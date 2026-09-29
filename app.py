@@ -94,7 +94,7 @@ from okam_native.p2p import (
     select_camera_password,
 )
 from okam_native.wakeup import WakeError, load_wake_credentials, wake_camera
-from icam365 import close_bridge, get_bridge
+from icam365 import PTZ_COMMAND, PTZ_POSITION_COMMAND, close_bridge, get_bridge
 from Xlib import X as X11, Xutil, display as xdisplay
 from Xlib.protocol import event as xevent
 
@@ -161,6 +161,19 @@ ICAM365_SERVER = "TAS-Tech IPCam"
 TOOLTIP_STYLE = (
     "QToolTip { color: white; background-color: rgb(32, 32, 32);"
     " border: 1px solid rgba(255, 255, 255, 60); border-radius: 6px; padding: 4px 8px; }"
+)
+CAMERA_CONTROLS_STYLE = (
+    "#cameraControls QPushButton { color: white; background-color: transparent;"
+    " border: none; border-radius: 6px; padding: 4px; }"
+    "#cameraControls QPushButton:hover { background-color: rgba(255, 255, 255, 35); }"
+    "#cameraControls #qualityButton { border: 2px solid white; border-radius: 8px;"
+    " font-weight: 600; margin: 6px 2px; }"
+    "#ptzPanel, #presetControls, #liveBar, #replayBar { background: transparent; }"
+    "#cameraControls #pillButton { border: 2px solid white; border-radius: 8px;"
+    " font-weight: 600; margin: 6px 2px; }"
+    "#cameraControls QPushButton:disabled { color: rgba(255, 255, 255, 90);"
+    " border-color: rgba(255, 255, 255, 90); }"
+    + TOOLTIP_STYLE
 )
 MAX_ZOOM_LEVEL = 4
 X11_WHEEL_UP = 4
@@ -1061,6 +1074,64 @@ class ControlsOverlay(QWidget):
         radius = min(self.height() / 2, OVERLAY_MAX_RADIUS)
         painter.drawRoundedRect(self.rect(), radius, radius)
         painter.end()
+
+
+class MovementControls(QWidget):
+    command_requested = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("ptzPanel")
+        self.buttons: list[QPushButton] = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        directions = QHBoxLayout()
+        for direction in ("Left", "Right", "Up", "Down"):
+            button = QPushButton()
+            set_button_icon(button, direction.lower(), f"Move camera {direction.lower()}", 40)
+            button.setEnabled(False)
+            button.clicked.connect(lambda checked=False, value=direction: self.command_requested.emit(value))
+            directions.addWidget(button)
+            self.buttons.append(button)
+        layout.addLayout(directions)
+        self.presets = QWidget(self)
+        self.presets.setObjectName("presetControls")
+        presets = QHBoxLayout(self.presets)
+        presets.setContentsMargins(0, 0, 0, 0)
+        for index in range(1, 6):
+            command = f"Preset {index}"
+            button = QPushButton()
+            set_button_icon(button, f"preset_{index}", f"Go to {command.lower()}", 40)
+            button.setEnabled(False)
+            button.clicked.connect(lambda checked=False, value=command: self.command_requested.emit(value))
+            button.setProperty("movementCommand", command)
+            presets.addWidget(button)
+            self.buttons.append(button)
+        layout.addWidget(self.presets)
+
+    def set_tilt_only(self, tilt_only: bool) -> None:
+        self.set_capabilities(not tilt_only, {} if tilt_only else None)
+
+    def set_capabilities(self, pan: bool, presets: dict[str, str] | None) -> None:
+        for index, button in enumerate(self.buttons[:4]):
+            button.setVisible(pan or index in (2, 3))
+        available = presets if presets is not None else {f"Preset {index}": f"Preset {index}" for index in range(1, 6)}
+        commands = {button.property("movementCommand") for button in self.buttons[4:]}
+        for command in available.keys() - commands:
+            button = QPushButton(command.removeprefix("Preset "))
+            button.setFixedSize(40, 40)
+            button.setProperty("movementCommand", command)
+            button.clicked.connect(lambda checked=False, value=command: self.command_requested.emit(value))
+            self.presets.layout().addWidget(button)
+            self.buttons.append(button)
+        for button in self.buttons[4:]:
+            command = button.property("movementCommand")
+            button.setVisible(command in available)
+            if command in available:
+                label = f"Go to {available[command]}"
+                button.setToolTip(label)
+                button.setAccessibleName(label)
+        self.presets.setVisible(bool(available))
 
 
 class VideoStatusOverlay(ControlsOverlay):
@@ -2985,13 +3056,22 @@ class RtspStreamWorker(QThread):
             self.light_request = mode
 
     def set_ptz(self, direction: str) -> bool:
-        if direction not in ICAM365_TILT_ACTIONS:
+        if self.native_bridge is not None:
+            pan, presets = self.movement_options()
+            if direction not in ICAM365_TILT_ACTIONS and not (pan and direction in ("Left", "Right")) and direction not in presets:
+                return False
+        elif direction not in ICAM365_TILT_ACTIONS:
             return False
         with self.ptz_lock:
             if self.ptz_request is not None:
                 return False
             self.ptz_request = direction
         return True
+
+    def movement_options(self) -> tuple[bool, dict[str, str]]:
+        if self.native_bridge is None:
+            return False, {}
+        return self.native_bridge.pan_supported, {command: preset.name for command, preset in self.native_bridge.presets.items()}
 
     def stop(self) -> None:
         self.stop_requested.set()
@@ -3082,6 +3162,7 @@ class RtspStreamWorker(QThread):
             ptz_supported = self.native_bridge.ptz_supported if self.native_bridge is not None else icam365_ptz_request(self.camera)
             if ptz_supported:
                 self.ptz_available.emit()
+            movement_options = self.movement_options()
             last_prune = 0.0
             last_position = None
             last_progress_at = time.monotonic()
@@ -3092,6 +3173,12 @@ class RtspStreamWorker(QThread):
                     raise OSError(self.native_bridge.error)
                 if self.player.poll() is not None:
                     raise OSError("The camera video player stopped.")
+                current_options = self.movement_options()
+                current_ptz = self.native_bridge.ptz_supported if self.native_bridge is not None else ptz_supported
+                if current_ptz and (not ptz_supported or current_options != movement_options):
+                    movement_options = current_options
+                    self.ptz_available.emit()
+                ptz_supported = current_ptz
                 with self.light_lock:
                     light_mode = self.light_request
                     self.light_request = None
@@ -3110,8 +3197,7 @@ class RtspStreamWorker(QThread):
                     self.ptz_request = None
                 if direction is not None:
                     if self.native_bridge is not None:
-                        control = 1 if direction == "Up" else 2
-                        if self.native_bridge.control(0x1001, bytes([control, 0, 0, 0, 0, 6, 0, 0])):
+                        if self.native_bridge.move_camera(direction):
                             pending_ptz = (direction, time.monotonic() + 8)
                         else:
                             self.control_failed.emit("Camera movement failed.")
@@ -3128,7 +3214,7 @@ class RtspStreamWorker(QThread):
                             else:
                                 self.light_failed.emit()
                             pending_light = None
-                        elif command == 0x1001 and pending_ptz is not None:
+                        elif command in (PTZ_COMMAND, PTZ_POSITION_COMMAND) and pending_ptz is not None:
                             if success:
                                 self.control_completed.emit(pending_ptz[0])
                             else:
@@ -3260,14 +3346,11 @@ class CameraPreview(QWidget):
         layout.addWidget(self.video_stack, 1)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
-        self.overlay.setStyleSheet(
-            "#cameraControls QPushButton { color: white; background-color: transparent;"
-            " border: none; border-radius: 6px; padding: 4px; }"
-            "#cameraControls QPushButton:hover { background-color: rgba(255, 255, 255, 35); }"
-            + TOOLTIP_STYLE
-        )
-        controls = QHBoxLayout(self.overlay)
-        controls.setContentsMargins(24, 10, 24, 10)
+        self.overlay.setStyleSheet(CAMERA_CONTROLS_STYLE)
+        overlay_layout = QVBoxLayout(self.overlay)
+        overlay_layout.setContentsMargins(24, 10, 24, 10)
+        controls = QHBoxLayout()
+        overlay_layout.addLayout(controls)
         controls.setSpacing(12)
         controls.addStretch(1)
         self.replay_button = QPushButton()
@@ -3325,33 +3408,42 @@ class CameraPreview(QWidget):
             self.ptz_button, "ptz", "Tilt controls" if isinstance(camera, RtspCamera) else "Pan and tilt controls"
         )
         self.ptz_button.setEnabled(False)
-        movement = QMenu(self.ptz_button)
-        for direction in (("Up", "Down") if isinstance(camera, RtspCamera) else ("Up", "Down", "Left", "Right")):
-            movement.addAction(direction).triggered.connect(
-                lambda checked=False, value=direction: self.move_camera(value)
-            )
+        self.ptz_button.clicked.connect(self.toggle_ptz_panel)
+        self.ptz_panel = MovementControls(self.overlay)
+        self.ptz_panel.set_tilt_only(isinstance(camera, RtspCamera))
+        self.ptz_panel.command_requested.connect(self.move_camera)
+        self.ptz_panel.hide()
+        overlay_layout.addWidget(self.ptz_panel)
         if not isinstance(camera, RtspCamera):
-            movement.addSeparator()
-            for index in range(1, 6):
-                movement.addAction(f"Preset {index}").triggered.connect(
-                    lambda checked=False, value=index: self.move_camera(f"Preset {value}")
-                )
-            movement.addSeparator()
-            self.light_action = movement.addAction("Turn white light on")
+            self.light_button = QPushButton()
+            self.light_button.hide()
+            controls.insertWidget(controls.indexOf(self.zoom_out_button), self.light_button)
+            self.light_action = QAction("Turn white light on", self)
             self.light_action.setVisible(False)
             self.light_action.triggered.connect(self.toggle_light)
-            quality_menu = movement.addMenu("Video quality")
-            quality_menu.menuAction().setVisible(False)
-            quality_group = QActionGroup(quality_menu)
+            self.light_action.changed.connect(self._update_light_action)
+            self.light_button.clicked.connect(self.light_action.trigger)
+            self.quality_button = QPushButton(DEFAULT_QUALITY_LABEL)
+            self.quality_button.setObjectName("qualityButton")
+            self.quality_button.setFixedSize(56, 44)
+            self.quality_button.hide()
+            controls.insertWidget(1, self.quality_button)
+            self.quality_menu = QMenu(self.quality_button)
+            self.quality_menu.menuAction().setVisible(False)
+            self.quality_menu.menuAction().changed.connect(
+                lambda: self.quality_button.setVisible(self.quality_menu.menuAction().isVisible())
+            )
+            self.quality_button.clicked.connect(lambda: self.quality_menu.popup(
+                self.quality_button.mapToGlobal(QPoint(0, -self.quality_menu.sizeHint().height()))
+            ))
+            quality_group = QActionGroup(self.quality_menu)
             for quality in VIDEO_QUALITIES:
-                action = quality_menu.addAction(quality)
+                action = self.quality_menu.addAction(quality)
                 action.setCheckable(True)
                 action.setVisible(False)
                 action.triggered.connect(lambda checked=False, value=quality: self.choose_quality(value))
                 quality_group.addAction(action)
                 self.quality_actions[quality] = action
-            self.quality_menu = quality_menu
-        self.ptz_button.setMenu(movement)
         if isinstance(camera, RtspCamera):
             self.ptz_button.hide()
         controls.addWidget(self.ptz_button)
@@ -3383,6 +3475,16 @@ class CameraPreview(QWidget):
         else:
             self.show_overlay()
 
+    def toggle_ptz_panel(self) -> None:
+        self.ptz_panel.setVisible(not self.ptz_panel.isVisible())
+        self.video.place_overlay()
+        self.show_overlay()
+
+    def set_movement_enabled(self, enabled: bool) -> None:
+        self.ptz_button.setEnabled(enabled)
+        for button in self.ptz_panel.buttons:
+            button.setEnabled(enabled)
+
     def start(self) -> None:
         if self.closing or self.worker is not None:
             return
@@ -3395,6 +3497,7 @@ class CameraPreview(QWidget):
             )
             self.rtsp_ptz_available = False
             self.ptz_button.hide()
+            self.ptz_panel.hide()
         if self.rtsp_light_button is not None:
             self.rtsp_light_button.hide()
             self.rtsp_light_mode = None
@@ -3480,7 +3583,7 @@ class CameraPreview(QWidget):
             self.zoom_in_button.setEnabled(True)
             if self.sound_button is not None and not isinstance(self.worker, RtspStreamWorker):
                 self.sound_button.setEnabled(True)
-            self.ptz_button.setEnabled(not isinstance(self.worker, RtspStreamWorker) or self.rtsp_ptz_available)
+            self.set_movement_enabled(not isinstance(self.worker, RtspStreamWorker) or self.rtsp_ptz_available)
         self.label.setText(f"{self.camera.name} · {message}")
 
     def _on_failed(self, message: str) -> None:
@@ -3497,6 +3600,8 @@ class CameraPreview(QWidget):
         self.sound_enabled = False
         self.control_pending = False
         self.rtsp_ptz_available = False
+        self.set_movement_enabled(False)
+        self.ptz_panel.hide()
         for button in (self.snapshot_button, self.record_button, self.zoom_out_button, self.zoom_in_button,
                        self.sound_button, self.ptz_button, self.rtsp_light_button):
             if button is not None:
@@ -3583,7 +3688,9 @@ class CameraPreview(QWidget):
     def _on_rtsp_ptz_available(self) -> None:
         if self.live and isinstance(self.worker, RtspStreamWorker):
             self.rtsp_ptz_available = True
-            self.ptz_button.setEnabled(True)
+            self.ptz_panel.set_capabilities(*self.worker.movement_options())
+            self.set_movement_enabled(not self.control_pending)
+            set_button_icon(self.ptz_button, "ptz", "Pan and tilt controls" if self.worker.movement_options()[0] else "Tilt controls")
             self.ptz_button.show()
             self.video.place_overlay()
 
@@ -3661,17 +3768,19 @@ class CameraPreview(QWidget):
             queued = False
         if queued:
             self.control_pending = True
-            self.ptz_button.setEnabled(False)
+            self.set_movement_enabled(False)
 
     def move_by_drag(self, dx: int, dy: int) -> None:
         if self.zoom_level > 0 or not self.live or not isinstance(self.worker, RtspStreamWorker):
             return
-        if abs(dy) >= max(abs(dx), DRAG_PIXELS_PER_STEP // 2):
+        if self.worker.movement_options()[0] and abs(dx) >= max(abs(dy), DRAG_PIXELS_PER_STEP // 2):
+            self.move_camera("Left" if dx > 0 else "Right")
+        elif abs(dy) >= max(abs(dx), DRAG_PIXELS_PER_STEP // 2):
             self.move_camera("Up" if dy > 0 else "Down")
 
     def _on_control_finished(self, command: str) -> None:
         self.control_pending = False
-        self.ptz_button.setEnabled(self.live and (
+        self.set_movement_enabled(self.live and (
             not isinstance(self.worker, RtspStreamWorker) or self.rtsp_ptz_available
         ))
 
@@ -3692,10 +3801,18 @@ class CameraPreview(QWidget):
             )
         if self.ptz_button is not None:
             self.quality_menu.menuAction().setVisible(bool(qualities))
+            saved = self.settings.value(f"{QUALITY_SETTING}/{self.camera.uid}", "", str) if self.settings is not None else ""
+            self.quality_button.setText(saved if saved in qualities else DEFAULT_QUALITY_LABEL)
 
     def _update_light_action(self) -> None:
         if self.light_action is not None:
-            self.light_action.setText("Turn white light off" if self.light_on else "Turn white light on")
+            label = "Turn white light off" if self.light_on else "Turn white light on"
+            if self.light_action.text() != label:
+                self.light_action.setText(label)
+            set_button_icon(self.light_button, "light_on" if self.light_on else "light",
+                            "Turn white light off" if self.light_on else "Turn white light on")
+            self.light_button.setVisible(self.light_action.isVisible())
+            self.light_button.setEnabled(self.light_action.isEnabled())
 
     def _queue_setting(self, name: str, value: object) -> None:
         if not self.live or not isinstance(self.worker, StreamWorker) or self.setting_pending:
@@ -3727,6 +3844,7 @@ class CameraPreview(QWidget):
             self.settings.sync()
             for quality, action in self.quality_actions.items():
                 action.setChecked(quality == value)
+            self.quality_button.setText(str(value))
 
     def _on_setting_failed(self, name: str, message: str) -> None:
         self.setting_pending = False
@@ -4259,19 +4377,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(self.video_grid, 1)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
-        self.overlay.setStyleSheet(
-            "#cameraControls QPushButton { color: white; background-color: transparent;"
-            " border: none; border-radius: 6px; padding: 4px; }"
-            "#cameraControls QPushButton:hover { background-color: rgba(255, 255, 255, 35); }"
-            "#cameraControls #qualityButton { border: 2px solid white; border-radius: 8px;"
-            " font-weight: 600; margin: 6px 2px; }"
-            "#ptzPanel, #liveBar, #replayBar { background: transparent; }"
-            "#cameraControls #pillButton { border: 2px solid white; border-radius: 8px;"
-            " font-weight: 600; margin: 6px 2px; }"
-            "#cameraControls QPushButton:disabled { color: rgba(255, 255, 255, 90);"
-            " border-color: rgba(255, 255, 255, 90); }"
-            + TOOLTIP_STYLE
-        )
+        self.overlay.setStyleSheet(CAMERA_CONTROLS_STYLE)
         overlay_layout = QVBoxLayout(self.overlay)
         overlay_layout.setContentsMargins(24, 10, 24, 10)
         controls = QHBoxLayout()
@@ -4382,31 +4488,9 @@ class MainWindow(QMainWindow):
         overlay_layout.addWidget(self.timeline)
         self.replay_bar.hide()
         self.timeline.hide()
-        self.ptz_panel = QWidget(self.overlay)
-        self.ptz_panel.setObjectName("ptzPanel")
-        ptz_layout = QVBoxLayout(self.ptz_panel)
-        ptz_layout.setContentsMargins(0, 0, 0, 0)
-        movement = QHBoxLayout()
-        self.camera_buttons: list[QPushButton] = []
-        directions = ("Left", "Right", "Up", "Down")
-        for direction in directions:
-            button = QPushButton()
-            set_button_icon(button, direction.lower(), f"Move camera {direction.lower()}", 40)
-            button.setEnabled(False)
-            button.clicked.connect(lambda checked=False, value=direction: self.control_camera((value,)))
-            movement.addWidget(button)
-            self.camera_buttons.append(button)
-        ptz_layout.addLayout(movement)
-        presets = QHBoxLayout()
-        for index in range(1, 6):
-            label = f"Preset {index}"
-            button = QPushButton()
-            set_button_icon(button, f"preset_{index}", f"Go to {label.lower()}", 40)
-            button.setEnabled(False)
-            button.clicked.connect(lambda checked=False, value=label: self.control_camera((value,)))
-            presets.addWidget(button)
-            self.camera_buttons.append(button)
-        ptz_layout.addLayout(presets)
+        self.ptz_panel = MovementControls(self.overlay)
+        self.ptz_panel.command_requested.connect(lambda command: self.control_camera((command,)))
+        self.camera_buttons = self.ptz_panel.buttons
         overlay_layout.addWidget(self.ptz_panel)
         self.ptz_panel.hide()
         self.recording_badge = ControlsOverlay(self.video)
@@ -5478,15 +5562,17 @@ class MainWindow(QMainWindow):
 
     def set_controls_enabled(self, enabled: bool) -> None:
         rtsp = isinstance(getattr(self, "selected_device", None), RtspCamera)
-        for index, button in enumerate(self.camera_buttons):
-            button.setVisible(not rtsp or index in (2, 3))
-            button.setEnabled(enabled and (not rtsp or self.rtsp_ptz_available and index in (2, 3)))
+        options = self.stream_worker.movement_options() if rtsp and isinstance(self.stream_worker, RtspStreamWorker) else (not rtsp, {} if rtsp else None)
+        self.ptz_panel.set_capabilities(*options)
+        for button in self.camera_buttons:
+            button.setEnabled(enabled and (not rtsp or self.rtsp_ptz_available) and not button.isHidden())
         self.ptz_button.setEnabled(enabled and (not rtsp or self.rtsp_ptz_available))
 
     def on_rtsp_ptz_available(self) -> None:
         if self.stream_live and isinstance(self.stream_worker, RtspStreamWorker):
             self.rtsp_ptz_available = True
             self.ptz_button.show()
+            set_button_icon(self.ptz_button, "ptz", "Pan and tilt controls" if self.stream_worker.movement_options()[0] else "Tilt controls")
             self.set_controls_enabled(not self.control_pending)
             self.video.place_overlay()
 
@@ -5842,7 +5928,9 @@ class MainWindow(QMainWindow):
         if self.zoom_level > 0 or self.replay is not None:
             return
         if isinstance(getattr(self, "selected_device", None), RtspCamera):
-            if abs(dy) >= max(abs(dx), DRAG_PIXELS_PER_STEP // 2):
+            if isinstance(self.stream_worker, RtspStreamWorker) and self.stream_worker.movement_options()[0] and abs(dx) >= max(abs(dy), DRAG_PIXELS_PER_STEP // 2):
+                self.control_camera(("Left" if dx > 0 else "Right",))
+            elif abs(dy) >= max(abs(dx), DRAG_PIXELS_PER_STEP // 2):
                 self.control_camera(("Up" if dy > 0 else "Down",))
             return
         if abs(dx) < DRAG_PIXELS_PER_STEP // 2 and abs(dy) < DRAG_PIXELS_PER_STEP // 2:

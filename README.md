@@ -40,7 +40,9 @@ Use **Camera layout > Side by side** or **Stacked** to place the feeds horizonta
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 Drag one camera title onto another to exchange their positions; the order is remembered without restarting either stream.
 The camera panes share the available space equally in a side-by-side layout.
-Each camera has its own local playback, photo, recording, zoom, and full-screen controls; compatible RTSP panes also have sound and vertical tilt when the camera supports them, while O-KAM panes also have pan-and-tilt, saved positions, light, and video quality controls when the camera supports them.
+Each camera has its own local playback, photo, recording, zoom, and full-screen controls.
+All panes use the same inline movement panel and translucent controls, with directions and saved positions shown according to the connected camera's capabilities.
+Compatible RTSP panes also have sound and vertical tilt, native iCam365 panes have pan-and-tilt and their camera's saved positions, and O-KAM panes have pan-and-tilt, saved positions, light, and video quality controls when supported.
 Compatible iCam365 camera panes have a bulb button that switches white light between On and Automatic.
 Local playback stays in that camera's video pane and uses the same controls and timeline as camera microSD playback, with recordings from the last 24 hours, pause, seeking, speeds up to 8x, sound, photo, saved clips, and full-screen controls; **LIVE** returns to the camera stream.
 For an O-KAM pane, the playback button offers the camera's microSD recordings and its local 24-hour recordings.
@@ -91,7 +93,10 @@ Camera readiness is acknowledged during connection setup and repeated readiness 
 Closing a native session waits up to five seconds for video/audio stop acknowledgements despite media gaps, and closes all punched endpoints even after an unsuccessful connection attempt.
 A loopback-only HTTP stream feeds the existing player and recording UI, preserving the original HEVC video while converting A-law audio to AAC for the local stream.
 Audio is resampled against the live timestamps so differences in the camera's audio clock do not accumulate playback delay.
-The native connection supports the On/Automatic light control and short Up/Down motor pulses.
+The native muxer keeps AAC priming timestamps within the current stream timeline.
+The native connection supports the On/Automatic light control, short directional motor pulses, and horizontal or vertical mouse dragging.
+The camera's saved positions are retrieved over its native connection, displayed with their saved names in tooltips, and recalled with their original position coordinates and identifiers.
+Detection notifications are not integrated for native iCam365 connections.
 Directory lookup and a direct native connection were verified locally; the relay path outside the home remains unverified.
 This connection does not provide camera microSD playback or talkback.
 
@@ -114,7 +119,7 @@ The magnifier buttons zoom the picture locally.
 For O-KAM cameras, the arrow buttons send short pan and tilt pulses to the camera.
 For O-KAM cameras, drag the video horizontally or vertically with the left mouse button to move it by up to four short pulses.
 For O-KAM cameras, **Preset 1** through **Preset 5** recall its saved positions.
-For compatible iCam365 cameras, **PTZ** offers Up and Down after the local control endpoint is detected.
+For compatible iCam365 cameras, **PTZ** offers the movements available through the connected transport: Up and Down over the local HTTP endpoint, or pan-and-tilt and saved positions over the native connection.
 
 When the desktop provides a notification area, Camera Viewer shows an icon there instead of a taskbar entry.
 Click the icon to show or hide the window, or open its menu for camera selection, playback, and the **Camera controls** submenu.

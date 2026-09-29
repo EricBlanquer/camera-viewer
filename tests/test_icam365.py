@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import socket
 import struct
 import tempfile
@@ -14,7 +15,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from PyQt6.QtWidgets import QApplication
 from cs2pppp import PpppSession
 from app import CameraPreview, RtspCamera, mpv_rtsp_command
-from icam365 import MAX_FRAME_SIZE, MediaFrames, NativeConfig, NativeSession, OrderedChannel, load_config
+from icam365 import MAX_FRAME_SIZE, PTZ_COMMAND, PTZ_POSITION_COMMAND, MediaFrames, NativeBridge, NativeConfig, NativeSession, OrderedChannel, decode_presets, load_config
 
 
 class FakeTransport:
@@ -55,6 +56,37 @@ class FakeTransport:
 
 
 class NativeTransportTest(unittest.TestCase):
+    def test_saved_positions_preserve_camera_identifiers_and_coordinates(self):
+        payload = struct.pack("<HBBHHfff32s", 1, 2, 0, 2, 1, 0.415686, 0.36875, 0.01, b"Lieu1")
+        presets = decode_presets(payload)
+        preset = presets["Preset 1"]
+        self.assertEqual(preset.name, "Lieu1")
+        self.assertEqual(preset.payload(), payload[8:20] + struct.pack("<ii", 0, 1))
+        bridge = NativeBridge.__new__(NativeBridge)
+        bridge.ptz_supported = True
+        bridge.pan_supported = True
+        bridge.presets = presets
+        bridge.control_requests = queue.Queue(maxsize=1)
+        self.assertTrue(bridge.move_camera("Preset 1"))
+        self.assertEqual(bridge.control_requests.get_nowait(), (PTZ_POSITION_COMMAND, preset.payload()))
+        self.assertFalse(bridge.move_camera("Preset 2"))
+        self.assertTrue(bridge.move_camera("Left"))
+        self.assertEqual(bridge.control_requests.get_nowait(), (PTZ_COMMAND, bytes([3, 0, 0, 0, 0, 6, 0, 0])))
+        self.assertTrue(bridge.move_camera("Right"))
+        self.assertFalse(bridge.move_camera("Up"))
+        self.assertEqual(bridge.control_requests.get_nowait(), (PTZ_COMMAND, bytes([6, 0, 0, 0, 0, 6, 0, 0])))
+        bridge.pan_supported = False
+        self.assertFalse(bridge.move_camera("Left"))
+
+    def test_presets_reject_truncated_and_unknown_payloads(self):
+        for payload in (b"", struct.pack("<HBB", 1, 2, 0), struct.pack("<HBB", 0, 5, 0)):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                decode_presets(payload)
+        payload = struct.pack("<HBBHH", 1, 3, 0, 4, 7)
+        self.assertEqual(decode_presets(payload), {})
+        payload = struct.pack("<HBBHH", 1, 3, 0, 0, 7)
+        self.assertEqual(decode_presets(payload)["Preset 7"].number, 7)
+
     def session(self):
         transport = FakeTransport()
         decoded = SimpleNamespace(lib_ok=True, servers=("127.0.0.1",))

@@ -33,7 +33,46 @@ RECEIVE_POLL_SECONDS = 0.05
 STOP_ACK_TIMEOUT_SECONDS = 5
 CLOSE_NOTIFICATION_RETRIES = 2
 LIVE_AUDIO_CLOCK_FILTER = "aresample=async=1000"
+AAC_SAMPLE_RATE = 8000
+AAC_FRAME_SAMPLES = 1024
+PTZ_COMMAND = 0x1001
+PTZ_POSITION_COMMAND = 0x0408
+PRESETS_REQUEST_COMMAND = 0x0452
+PRESETS_RESPONSE_COMMAND = 0x0453
+NATIVE_PTZ_DIRECTIONS = {"Up": 1, "Down": 2, "Left": 3, "Right": 6}
 LOG = logging.getLogger("okam-linux.icam365")
+
+
+@dataclass(frozen=True)
+class NativePreset:
+    number: int
+    name: str
+    channel: int
+    position: tuple[float, float, float]
+
+    def payload(self) -> bytes:
+        return struct.pack("<fffii", *self.position, self.channel, self.number)
+
+
+def decode_presets(payload: bytes) -> dict[str, NativePreset]:
+    if len(payload) < 4:
+        raise ValueError("Invalid camera presets.")
+    count, kind, channel = struct.unpack_from("<HBB", payload)
+    sizes = {1: 36, 2: 48, 3: 4, 4: 16}
+    size = sizes.get(kind)
+    if size is None or len(payload) != 4 + count * size:
+        raise ValueError("Invalid camera presets.")
+    presets = {}
+    for offset in range(4, len(payload), size):
+        flags, number = struct.unpack_from("<HH", payload, offset)
+        if flags & 4:
+            continue
+        position = struct.unpack_from("<fff", payload, offset + 4) if kind in (2, 4) else (-1.0, -1.0, -1.0)
+        name_offset = offset + (16 if kind == 2 else 4)
+        name = payload[name_offset:name_offset + 32].split(b"\0", 1)[0].decode("utf-8", errors="replace") if kind in (1, 2) else ""
+        command = f"Preset {number}"
+        presets[command] = NativePreset(number, name or command, channel, position)
+    return presets
 
 
 @dataclass(frozen=True, repr=False)
@@ -335,6 +374,8 @@ class NativeBridge:
         self.light_mode: str | None = None
         self.light_supported = False
         self.ptz_supported = False
+        self.pan_supported = False
+        self.presets: dict[str, NativePreset] = {}
         self.subscribers: set[queue.Queue] = set()
         self.subscriber_lock = threading.Lock()
         self.control_requests: queue.Queue[tuple[int, bytes]] = queue.Queue(maxsize=16)
@@ -358,6 +399,17 @@ class NativeBridge:
             return True
         except queue.Full:
             return False
+
+    def move_camera(self, direction: str) -> bool:
+        if not self.ptz_supported:
+            return False
+        control = NATIVE_PTZ_DIRECTIONS.get(direction)
+        if control is not None:
+            if direction in ("Left", "Right") and not self.pan_supported:
+                return False
+            return self.control(PTZ_COMMAND, bytes([control, 0, 0, 0, 0, 6, 0, 0]))
+        preset = self.presets.get(direction)
+        return preset is not None and self.control(PTZ_POSITION_COMMAND, preset.payload())
 
     def _write_media(self, fd: int, source: queue.Queue) -> None:
         try:
@@ -416,6 +468,7 @@ class NativeBridge:
                 "-f", "alaw", "-ar", "8000", "-ac", "1", "-i", f"/proc/self/fd/{audio_read}",
                 "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
                 "-af", LIVE_AUDIO_CLOCK_FILTER, "-c:a", "aac", "-b:a", "32k",
+                "-output_ts_offset", str(AAC_FRAME_SAMPLES / AAC_SAMPLE_RATE),
                 "-max_interleave_delta", "100000", "-muxdelay", "0", "-muxpreload", "0",
                 "-mpegts_flags", "resend_headers", "-flush_packets", "1", "-f", "mpegts", "pipe:1",
             ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -468,9 +521,22 @@ class NativeBridge:
                         try:
                             features = json.loads(payload.rstrip(b"\0")).get("feature", {})
                             self.light_supported = features.get("DoubleLight", "").startswith("Yes")
-                            self.ptz_supported = features.get("SupportPTZ", "").startswith("Yes")
+                            ptz = features.get("SupportPTZ", "").split(",")
+                            self.ptz_supported = ptz[0] in ("Yes", "Relative", "Hybrid", "Absolute")
+                            self.pan_supported = self.ptz_supported and "VertOnly" not in ptz
+                            if self.ptz_supported and "PresetPos" in ptz:
+                                session.send(PRESETS_REQUEST_COMMAND, b"\0" * 8)
                         except (ValueError, AttributeError, TypeError):
                             pass
+                    elif command == PRESETS_RESPONSE_COMMAND:
+                        try:
+                            self.presets = decode_presets(payload)
+                        except ValueError:
+                            LOG.warning("Invalid iCam365 preset response.")
+                    elif command == 1 and len(payload) >= 8:
+                        request, error = struct.unpack_from("<II", payload)
+                        if request == PTZ_POSITION_COMMAND:
+                            self.control_results.put((request, error == 0))
                     elif command == 0x8013 and len(payload) >= 9:
                         self.light_mode = {1: "on", 2: "2"}.get(payload[8])
                     elif command == 0x8015:
@@ -482,7 +548,7 @@ class NativeBridge:
                     while not self.control_requests.empty():
                         command, payload = self.control_requests.get_nowait()
                         session.send(command, payload)
-                        if command == 0x1001:
+                        if command == PTZ_COMMAND and payload and payload[0] in NATIVE_PTZ_DIRECTIONS.values():
                             ptz_stop_at = time.monotonic() + 0.12
                     if ptz_stop_at is not None and time.monotonic() >= ptz_stop_at:
                         ptz_stop_index = session.sequence

@@ -63,6 +63,8 @@ class NativeMuxerClockTest(unittest.TestCase):
                 audio = [packet for packet in media if packet["codec_type"] == "audio"]
                 self.assertEqual(len(video), FRAME_COUNT)
                 self.assertGreater(len(audio), 10)
+                for packet in media:
+                    self.assertLess(float(packet["pts_time"]), FRAME_COUNT * FRAME_INTERVAL + 1)
                 steady_audio = audio[AAC_PRIMING_PACKETS:]
                 for previous, current in zip(steady_audio, steady_audio[1:]):
                     interval = (float(current["pts_time"]) - float(previous["pts_time"])) % MPEG_TIMESTAMP_WRAP

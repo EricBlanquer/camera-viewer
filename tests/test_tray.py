@@ -14,6 +14,7 @@ from PyQt6.QtCore import QObject, QSettings, Qt, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QPushButton, QWidget
 
 from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
+from icam365 import NativePreset
 
 
 class TrayTest(unittest.TestCase):
@@ -352,7 +353,7 @@ class TrayTest(unittest.TestCase):
         preview._on_rtsp_light_available()
         self.assertFalse(preview.rtsp_light_button.isHidden())
         self.assertIsNone(preview.rtsp_light_button.menu())
-        controls = preview.rtsp_light_button.parentWidget().layout()
+        controls = preview.overlay.layout().itemAt(0).layout()
         self.assertLess(controls.indexOf(preview.record_button), controls.indexOf(preview.rtsp_light_button))
         self.assertLess(controls.indexOf(preview.rtsp_light_button), controls.indexOf(preview.zoom_out_button))
         preview.rtsp_light_button.click()
@@ -406,8 +407,14 @@ class TrayTest(unittest.TestCase):
         self.assertTrue(preview.ptz_button.isHidden())
         preview._on_rtsp_ptz_available()
         self.assertFalse(preview.ptz_button.isHidden())
-        self.assertEqual([action.text() for action in preview.ptz_button.menu().actions()], ["Up", "Down"])
-        preview.ptz_button.menu().actions()[0].trigger()
+        self.assertIsNone(preview.ptz_button.menu())
+        self.assertIs(type(preview.ptz_panel), type(self.window.ptz_panel))
+        self.assertEqual(
+            [button.property("iconName") for button in preview.ptz_panel.buttons if not button.isHidden()],
+            ["up", "down"],
+        )
+        preview.ptz_panel.buttons[2].click()
+        self.assertFalse(preview.ptz_panel.buttons[3].isEnabled())
         self.assertEqual(preview.worker.ptz_request, "Up")
         preview._on_control_finished("Up")
         preview.close()
@@ -431,6 +438,41 @@ class TrayTest(unittest.TestCase):
         self.window.stream_worker.ptz_request = None
         self.window.move_by_drag(0, -80)
         self.assertEqual(self.window.stream_worker.ptz_request, "Down")
+
+    def test_native_ptz_pan_and_saved_positions_in_both_panes(self) -> None:
+        camera = RtspCamera("rtsp:entrance", "Entrance", "rtsp://192.0.2.10:8001/0")
+        preview = CameraPreview(camera)
+        try:
+            preview.worker = RtspStreamWorker(camera, Mock(), Path(self.settings_directory.name) / "preview.sock")
+            preview.worker.native_bridge = SimpleNamespace(
+                pan_supported=True, presets={"Preset 1": NativePreset(1, "Lieu1", 0, (0.4, 0.3, 0.01))},
+            )
+            preview.live = True
+            preview._on_rtsp_ptz_available()
+            self.window.selected_device = camera
+            self.window.stream_worker = preview.worker
+            self.window.stream_live = True
+            self.window.on_rtsp_ptz_available()
+            for panel in (preview.ptz_panel, self.window.ptz_panel):
+                self.assertEqual(
+                    [button.property("iconName") for button in panel.buttons if not button.isHidden()],
+                    ["left", "right", "up", "down", "preset_1"],
+                )
+                self.assertEqual(panel.buttons[4].toolTip(), "Go to Lieu1")
+                self.assertEqual(panel.presets.objectName(), "presetControls")
+            preview.ptz_panel.buttons[4].click()
+            self.assertEqual(preview.worker.ptz_request, "Preset 1")
+            preview.worker.ptz_request = None
+            preview._on_control_finished("Preset 1")
+            preview.move_by_drag(80, 0)
+            self.assertEqual(preview.worker.ptz_request, "Left")
+            preview.worker.ptz_request = None
+            self.window.move_by_drag(-80, 0)
+            self.assertEqual(preview.worker.ptz_request, "Right")
+            self.assertFalse(preview.worker.set_ptz("Preset 2"))
+        finally:
+            self.window.stream_worker = None
+            preview.close()
 
     def test_okam_preview_offers_camera_and_local_playback(self) -> None:
         camera = SimpleNamespace(name="Jardin", uid="garden")
