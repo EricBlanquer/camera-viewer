@@ -104,7 +104,6 @@ from local_detection import (
     DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, organize_events, prune_events,
 )
 from Xlib import X as X11, Xutil, display as xdisplay
-from Xlib.protocol import event as xevent
 
 
 APPLICATION_NAME = "Camera Viewer"
@@ -225,8 +224,6 @@ WM_NORMAL_HINTS_FIELDS = (
     "base_height",
     "win_gravity",
 )
-NET_WM_STATE_ADD = 1
-NET_WM_SOURCE_APPLICATION = 1
 CAMERA_STATUS_PATH = "get_status.cgi?"
 TRANSPARENT_RESPONSE_COMMAND = 0x60D1
 CAMERA_CONTROL_RESPONSE_COMMAND = 0x6012
@@ -366,14 +363,11 @@ def set_icam365_light_icon(button: QPushButton, mode: str | None) -> None:
 
 
 class X11WindowHints:
-    def __init__(self, window: QWidget, skip_taskbar: bool) -> None:
-        self.skip_taskbar = skip_taskbar
+    def __init__(self, window: QWidget) -> None:
         self.aspect_width = VIDEO_ASPECT_WIDTH
         self.aspect_height = VIDEO_ASPECT_HEIGHT
         self.x_display = xdisplay.Display()
         self.window = self.x_display.create_resource_object("window", int(window.winId()))
-        self.state_atom = self.x_display.intern_atom("_NET_WM_STATE")
-        self.skip_taskbar_atom = self.x_display.intern_atom("_NET_WM_STATE_SKIP_TASKBAR")
         self.normal_hints_atom = self.x_display.intern_atom("WM_NORMAL_HINTS")
         self.window.change_attributes(event_mask=X11.StructureNotifyMask | X11.PropertyChangeMask)
         self.notifier = QSocketNotifier(self.x_display.fileno(), QSocketNotifier.Type.Read, window)
@@ -383,21 +377,8 @@ class X11WindowHints:
     def process_events(self) -> None:
         while self.x_display.pending_events():
             event = self.x_display.next_event()
-            if event.type == X11.MapNotify and self.skip_taskbar:
-                self.hide_taskbar_entry()
-            elif event.type == X11.PropertyNotify and event.atom == self.normal_hints_atom:
+            if event.type == X11.PropertyNotify and event.atom == self.normal_hints_atom:
                 self.apply_aspect_ratio()
-
-    def hide_taskbar_entry(self) -> None:
-        self.x_display.screen().root.send_event(
-            xevent.ClientMessage(
-                window=self.window,
-                client_type=self.state_atom,
-                data=(32, [NET_WM_STATE_ADD, self.skip_taskbar_atom, 0, NET_WM_SOURCE_APPLICATION, 0]),
-            ),
-            event_mask=X11.SubstructureRedirectMask | X11.SubstructureNotifyMask,
-        )
-        self.x_display.flush()
 
     def apply_aspect_ratio(self) -> None:
         hints = self.window.get_wm_normal_hints()
@@ -5260,7 +5241,7 @@ class MainWindow(QMainWindow):
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.create_tray()
         if QApplication.platformName() == "xcb":
-            self.window_hints = X11WindowHints(self, self.tray is not None)
+            self.window_hints = X11WindowHints(self)
         self.set_status("Connecting to camera...")
         if self.accounts or self.rtsp_cameras or self.imou_accounts:
             QTimer.singleShot(0, self.find_cameras)

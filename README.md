@@ -163,7 +163,8 @@ For O-KAM cameras, drag the video horizontally or vertically with the right mous
 For O-KAM cameras, **Preset 1** through **Preset 5** recall its saved positions.
 For compatible iCam365 cameras, **PTZ** offers the movements available through the connected transport: Up and Down over the local HTTP endpoint, or pan-and-tilt and saved positions over the native connection.
 
-When the desktop provides a notification area, Camera Viewer shows an icon there instead of a taskbar entry.
+The title bar provides the desktop's minimize, maximize, and close buttons, and the window remains available from the taskbar.
+When the desktop provides a notification area, Camera Viewer also shows an icon there.
 Click the icon to show or hide the window, or open its menu for camera selection, layout, camera setup, recording, and local detection settings.
 Playback and camera controls are available in each camera's video pane.
 Opening Camera Viewer again from the application menu shows the running instance instead of starting a second one.
