@@ -30,6 +30,7 @@ Comment=Watch your security cameras
 Exec=$app_dir/.venv/bin/python $app_dir/app.py
 TryExec=$app_dir/.venv/bin/python
 Icon=$app_dir/assets/icons/app.svg
+StartupWMClass=camera-viewer
 Terminal=false
 Categories=AudioVideo;Video;
 EOF

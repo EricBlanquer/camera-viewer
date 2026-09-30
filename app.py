@@ -107,6 +107,7 @@ from Xlib import X as X11, Xutil, display as xdisplay
 
 
 APPLICATION_NAME = "Camera Viewer"
+DESKTOP_FILE_NAME = "camera-viewer"
 STORAGE_NAME = "O-KAM Linux"
 RTSP_ACCOUNT = "rtsp"
 RTSP_CAMERAS_SETTING = "cameras/rtsp"
@@ -7112,6 +7113,9 @@ def main() -> int:
     if len(sys.argv) != 1 and not start_in_tray:
         return 2
     app = QApplication(sys.argv)
+    app.setApplicationName(DESKTOP_FILE_NAME)
+    app.setApplicationDisplayName(APPLICATION_NAME)
+    app.setDesktopFileName(DESKTOP_FILE_NAME)
     configure_logging()
     server_name = f"{INSTANCE_SERVER_PREFIX}-{os.getuid()}"
     running_instance = QLocalSocket()
