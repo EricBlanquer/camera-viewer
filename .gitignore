@@ -1,3 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
+tv/web/native/
+tv/web/.buildResult/
+tv/dist/

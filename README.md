@@ -169,6 +169,14 @@ The application writes a log to `~/.cache/okam-linux/okam-linux.log`.
 The application fetches the camera's local password from the O-KAM account automatically.
 If the camera rejects the connection, `.venv/bin/python app.py --camera-password` prints the password the account returns for each camera.
 
+## Samsung TV
+
+The [Samsung TV application](tv/README.md) connects directly from the TV to iCam365 and O-KAM cameras and displays a fixed four-cell grid.
+Each camera occupies one quarter of the screen, and the diagnostic panel hides when live video appears.
+The last image remains visible during reconnection, and the grid omits camera titles and unused-cell labels.
+The ARM NaCl build was tested with Entrée and Jardin on a 2019 Samsung QE55Q85R running Tizen 5.0; video decoding runs on the TV without a PC gateway.
+Build, signing, private configuration, and remote-control instructions are in the TV guide.
+
 ## Source and limits
 
 The transport submodule is pinned to commit `eeb3e67d11a83a02ba1f408fde8df1ca73218037` of [O-KAM Native Bridge](https://github.com/oleandor/okam-ha-native), whose code is licensed under MIT.

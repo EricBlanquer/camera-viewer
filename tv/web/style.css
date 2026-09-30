@@ -1,0 +1,17 @@
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #111820; color: #fff; font: 24px sans-serif; }
+#grid { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+.camera { position: absolute; width: 50%; height: 50%; box-sizing: border-box; border: 1px solid #343a40; overflow: hidden; }
+.camera:nth-child(1) { left: 0; top: 0; }
+.camera:nth-child(2) { left: 50%; top: 0; }
+.camera:nth-child(3) { left: 0; top: 50%; }
+.camera:nth-child(4) { left: 50%; top: 50%; }
+.camera.selected { border: 2px solid #8bc4f4; }
+.camera canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+.camera .status { position: absolute; left: 24px; right: 24px; top: 45%; text-align: center; color: #cbd5df; z-index: 2; }
+.camera.playing .status { display: none; }
+.camera.reconnecting .status { left: 16px; right: auto; top: auto; bottom: 16px; margin: 0; padding: 4px 8px; text-align: left; font-size: 18px; color: #fff; background: rgba(0, 0, 0, .55); }
+#debug-panel { position: absolute; bottom: 24px; left: 24px; right: 24px; z-index: 4; padding: 16px 24px; background: rgba(0, 0, 0, .82); max-height: 300px; overflow: auto; }
+#debug-panel h1 { font-size: 24px; margin: 0 0 12px; }
+#debug-panel pre { font-size: 18px; white-space: pre-wrap; margin: 0; }
+#debug-panel[hidden] { display: none; }
+#native-listener { position: absolute; width: 1px; height: 1px; overflow: hidden; }
