@@ -36,36 +36,19 @@ class TrayTest(unittest.TestCase):
         self.settings_directory.cleanup()
         QApplication.setQuitOnLastWindowClosed(True)
 
-    def tray_action(self, label: str):
-        return next(action for action, button in self.window.tray_actions if button.toolTip() == label)
-
-    def test_tray_actions_follow_overlay_buttons(self) -> None:
-        self.window.show()
-        self.window.snapshot_button.setEnabled(True)
-        self.window.update_tray_menu()
-        self.assertTrue(self.tray_action("Save picture").isEnabled())
-        self.assertFalse(self.tray_action("Record video").isEnabled())
-        self.assertFalse(self.tray_action("Turn white light on").isVisible())
-        self.window.on_capabilities_found([], False)
-        self.window.update_tray_menu()
-        self.assertTrue(self.tray_action("Turn white light on").isVisible())
-        self.assertFalse(self.window.quality_menu.menuAction().isVisible())
-
-    def test_tray_keeps_camera_controls_in_a_short_submenu(self) -> None:
+    def test_tray_keeps_window_camera_and_recording_settings(self) -> None:
         menu = self.window.tray.contextMenu()
         labels = [action.text() for action in menu.actions() if not action.isSeparator()]
-        self.assertIn("Camera controls", labels)
-        self.assertLessEqual(len(labels), 11)
-        controls = next(action.menu() for action in menu.actions() if action.text() == "Camera controls")
-        self.assertIn(self.tray_action("Save picture"), controls.actions())
-
-    def test_tray_action_clicks_its_button(self) -> None:
-        self.window.show()
-        clicks: list[bool] = []
-        self.window.snapshot_button.setEnabled(True)
-        self.window.snapshot_button.clicked.connect(lambda: clicks.append(True))
-        self.tray_action("Save picture").trigger()
-        self.assertEqual(clicks, [True])
+        self.assertEqual(labels, [
+            "Hide window",
+            "Cameras",
+            "Camera layout",
+            "Add camera",
+            "Continuous recording (24 h)",
+            "Detect people and animals locally",
+            "Open recordings folder",
+            "Quit",
+        ])
 
     def test_closing_window_hides_it_to_tray(self) -> None:
         self.window.show()

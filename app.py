@@ -44,9 +44,7 @@ from PyQt6.QtGui import (
     QMouseEvent,
     QMoveEvent,
     QPainter,
-    QPalette,
     QPen,
-    QPixmap,
     QResizeEvent,
     QShowEvent,
     QWheelEvent,
@@ -137,7 +135,6 @@ CAMERA_SOURCE_LABELS = ("O-KAM account", "RTSP camera", "Imou Life camera (local
 FORM_ERROR_STYLE = "color: #bd4242;"
 ACCOUNT_ERROR_STYLE = "color: #ffb4ab; background-color: #3d2020; padding: 8px;"
 WAKE_SOURCE = Path.home() / ".local/share/okam-linux/vendor/device_wakeup_server.dart"
-ICON_COLOR = "#f5f5f5"
 ICON_NAME_PROPERTY = "iconName"
 ICON_DIRECTORY = Path(__file__).resolve().parent / "assets/icons"
 MAX_ACCOUNT_RESPONSE_BYTES = 1024 * 1024
@@ -329,16 +326,6 @@ def configure_logging() -> None:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     LOG.addHandler(handler)
     LOG.setLevel(logging.INFO)
-
-
-def menu_icon(name: str, color: QColor) -> QIcon:
-    try:
-        svg = (ICON_DIRECTORY / f"{name}.svg").read_text(encoding="utf-8")
-    except OSError:
-        return QIcon()
-    pixmap = QPixmap()
-    pixmap.loadFromData(svg.replace(ICON_COLOR, color.name()).encode("utf-8"), "SVG")
-    return QIcon(pixmap)
 
 
 def set_button_icon(button: QPushButton, name: str, label: str, size: int = 44) -> None:
@@ -4474,7 +4461,6 @@ class MainWindow(QMainWindow):
         self.notice_timer.timeout.connect(self.restore_status)
         self.aspect_fitted = False
         self.tray: QSystemTrayIcon | None = None
-        self.tray_actions: list[tuple[QAction, QPushButton]] = []
         self.window_hints: X11WindowHints | None = None
         self.normal_geometry: QRect | None = None
         self.devices: list[AccountDevice | RtspCamera] = []
@@ -4768,27 +4754,6 @@ class MainWindow(QMainWindow):
             if index == 0:
                 self.add_account_action = action
         menu.addSeparator()
-        self.add_tray_action(menu, self.replay_button)
-        controls_menu = menu.addMenu("Camera controls")
-        for button in (
-            self.live_button,
-            self.replay_play_button,
-            self.snapshot_button,
-            self.record_button,
-            self.sound_button,
-            self.light_button,
-            self.zoom_in_button,
-            self.zoom_out_button,
-            self.fullscreen_button,
-        ):
-            self.add_tray_action(controls_menu, button)
-        self.quality_menu.setTitle("Video quality")
-        controls_menu.addMenu(self.quality_menu)
-        self.quality_menu.menuAction().setVisible(False)
-        movement = controls_menu.addMenu("Move camera")
-        for button in self.camera_buttons:
-            self.add_tray_action(movement, button)
-        menu.addSeparator()
         self.continuous_action = menu.addAction("Continuous recording (24 h)")
         self.continuous_action.setCheckable(True)
         self.continuous_action.setChecked(self.continuous_recording_enabled())
@@ -4810,22 +4775,10 @@ class MainWindow(QMainWindow):
         self.tray.messageClicked.connect(self.open_detection_notification)
         self.tray.show()
 
-    def add_tray_action(self, menu: QMenu, button: QPushButton) -> None:
-        action = menu.addAction(button.toolTip())
-        action.triggered.connect(button.click)
-        self.tray_actions.append((action, button))
-
     def update_tray_menu(self) -> None:
         self.window_action.setText("Hide window" if self.isVisible() else "Show window")
         self.camera_layout_menu.setEnabled(len(self.visible_devices()) > 1)
         self.add_account_action.setEnabled(self.account_worker is None)
-        text_color = self.tray.contextMenu().palette().color(QPalette.ColorRole.WindowText)
-        for action, button in self.tray_actions:
-            action.setIcon(menu_icon(button.property(ICON_NAME_PROPERTY), text_color))
-            action.setText(button.toolTip())
-            action.setEnabled(button.isEnabled() and self.isVisible())
-            action.setVisible(button.isVisibleTo(self.overlay))
-        self.quality_menu.setEnabled(self.quality_button.isEnabled() and self.isVisible())
 
     def update_cameras_menu(self) -> None:
         self.cameras_menu.clear()
