@@ -1237,6 +1237,82 @@ class ControlsOverlay(QWidget):
         painter.end()
 
 
+class VideoQualityControl(QPushButton):
+    quality_requested = pyqtSignal(str)
+
+    def __init__(self, settings: QSettings | None, parent: QWidget, camera_uid: str = "") -> None:
+        super().__init__(DEFAULT_QUALITY_LABEL, parent)
+        self.settings = settings
+        self.camera_uid = camera_uid
+        self.available: list[str] = []
+        self.live = False
+        self.busy = False
+        self.setObjectName("qualityButton")
+        self.setFixedSize(56, 44)
+        self.quality_menu = QMenu(self)
+        self.quality_group = QActionGroup(self.quality_menu)
+        self.quality_actions: dict[str, QAction] = {}
+        for quality in VIDEO_QUALITIES:
+            action = self.quality_menu.addAction(quality)
+            action.setCheckable(True)
+            action.setVisible(False)
+            action.triggered.connect(lambda checked=False, value=quality: self.quality_requested.emit(value))
+            self.quality_group.addAction(action)
+            self.quality_actions[quality] = action
+        self.clicked.connect(self.show_options)
+        self.restore_quality()
+        self.set_capabilities([])
+
+    def bind_camera(self, settings: QSettings | None, uid: str) -> None:
+        if self.camera_uid == uid and self.settings is settings:
+            return
+        self.settings = settings
+        self.camera_uid = uid
+        self.live = False
+        self.busy = False
+        self.set_capabilities([])
+
+    def restore_quality(self) -> None:
+        key = f"{QUALITY_SETTING}/{self.camera_uid}" if self.camera_uid else QUALITY_SETTING
+        saved = self.settings.value(key, "", str) if self.settings is not None else ""
+        current = saved if saved in VIDEO_QUALITIES and (not self.available or saved in self.available) else DEFAULT_QUALITY_LABEL
+        self.setText(current)
+        for quality, action in self.quality_actions.items():
+            action.setChecked(quality == current)
+
+    def set_capabilities(self, qualities: list[str]) -> None:
+        self.available = [quality for quality in VIDEO_QUALITIES if quality in qualities]
+        for quality, action in self.quality_actions.items():
+            action.setVisible(quality in self.available)
+        self.setVisible(bool(self.available))
+        self.quality_menu.menuAction().setVisible(bool(self.available))
+        self.restore_quality()
+        self.update_enabled()
+
+    def set_live(self, live: bool) -> None:
+        self.live = live
+        self.update_enabled()
+
+    def set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        self.update_enabled()
+
+    def update_enabled(self) -> None:
+        enabled = self.live and bool(self.available) and not self.busy
+        self.setEnabled(enabled)
+        self.quality_menu.setEnabled(enabled)
+
+    def commit_quality(self, quality: str) -> None:
+        if self.settings is not None:
+            self.settings.setValue(f"{QUALITY_SETTING}/{self.camera_uid}", quality)
+            self.settings.sync()
+        self.set_busy(False)
+        self.restore_quality()
+
+    def show_options(self) -> None:
+        self.quality_menu.popup(self.mapToGlobal(QPoint(0, -self.quality_menu.sizeHint().height())))
+
+
 class MovementControls(QWidget):
     command_requested = pyqtSignal(str)
 
@@ -3722,7 +3798,6 @@ class CameraPreview(QWidget):
         self.rtsp_light_button: QPushButton | None = None
         self.rtsp_light_mode: str | None = None
         self.light_action: QAction | None = None
-        self.quality_actions: dict[str, QAction] = {}
         if isinstance(camera, RtspCamera):
             self.rtsp_light_button = QPushButton()
             set_icam365_light_icon(self.rtsp_light_button, None)
@@ -3757,28 +3832,11 @@ class CameraPreview(QWidget):
             self.light_action.triggered.connect(self.toggle_light)
             self.light_action.changed.connect(self._update_light_action)
             self.light_button.clicked.connect(self.light_action.trigger)
-        if not isinstance(camera, RtspCamera) or camera.provider == IMOU_ACCOUNT_PROVIDER:
-            self.quality_button = QPushButton(DEFAULT_QUALITY_LABEL)
-            self.quality_button.setObjectName("qualityButton")
-            self.quality_button.setFixedSize(56, 44)
-            self.quality_button.hide()
-            controls.insertWidget(1, self.quality_button)
-            self.quality_menu = QMenu(self.quality_button)
-            self.quality_menu.menuAction().setVisible(False)
-            self.quality_menu.menuAction().changed.connect(
-                lambda: self.quality_button.setVisible(self.quality_menu.menuAction().isVisible())
-            )
-            self.quality_button.clicked.connect(lambda: self.quality_menu.popup(
-                self.quality_button.mapToGlobal(QPoint(0, -self.quality_menu.sizeHint().height()))
-            ))
-            quality_group = QActionGroup(self.quality_menu)
-            for quality in VIDEO_QUALITIES:
-                action = self.quality_menu.addAction(quality)
-                action.setCheckable(True)
-                action.setVisible(False)
-                action.triggered.connect(lambda checked=False, value=quality: self.choose_quality(value))
-                quality_group.addAction(action)
-                self.quality_actions[quality] = action
+        self.quality_button = VideoQualityControl(settings, self.overlay, camera.uid)
+        self.quality_button.quality_requested.connect(self.choose_quality)
+        self.quality_menu = self.quality_button.quality_menu
+        self.quality_actions = self.quality_button.quality_actions
+        controls.insertWidget(1, self.quality_button)
         if isinstance(camera, RtspCamera):
             self.ptz_button.hide()
         controls.addWidget(self.ptz_button)
@@ -3929,6 +3987,7 @@ class CameraPreview(QWidget):
         if message == "Live video":
             self.retry_seconds = 2
             self.live = True
+            self.quality_button.set_live(True)
             self.snapshot_button.setEnabled(True)
             self.record_button.setEnabled(True)
             self.zoom_in_button.setEnabled(True)
@@ -3947,6 +4006,8 @@ class CameraPreview(QWidget):
 
     def _on_finished(self) -> None:
         self.live = False
+        self.quality_button.set_live(False)
+        self.quality_button.set_busy(False)
         self.recording_path = None
         self.zoom_level = 0
         self.video_pan = (0.0, 0.0)
@@ -4146,16 +4207,9 @@ class CameraPreview(QWidget):
         if self.light_action is not None:
             self.light_action.setVisible(light_on is not None)
             self._update_light_action()
-        for quality, action in self.quality_actions.items():
-            action.setVisible(quality in qualities)
-            action.setChecked(
-                self.settings is not None
-                and quality == self.settings.value(f"{QUALITY_SETTING}/{self.camera.uid}", "", str)
-            )
-        if self.ptz_button is not None:
-            self.quality_menu.menuAction().setVisible(bool(qualities))
-            saved = self.settings.value(f"{QUALITY_SETTING}/{self.camera.uid}", "", str) if self.settings is not None else ""
-            self.quality_button.setText(saved if saved in qualities else DEFAULT_QUALITY_LABEL)
+        self.quality_button.set_capabilities(qualities)
+        self.quality_button.set_live(self.live)
+        self.video.place_overlay()
 
     def _update_light_action(self) -> None:
         if self.light_action is not None:
@@ -4174,7 +4228,7 @@ class CameraPreview(QWidget):
             self.setting_pending = True
             if self.light_action is not None:
                 self.light_action.setEnabled(False)
-            self.quality_menu.setEnabled(False)
+            self.quality_button.set_busy(True)
 
     def toggle_light(self) -> None:
         if self.light_on is not None:
@@ -4183,31 +4237,26 @@ class CameraPreview(QWidget):
     def choose_quality(self, quality: str) -> None:
         if self.recording_path is None:
             self._queue_setting(SETTING_QUALITY, quality)
+        self.quality_button.restore_quality()
 
     def _on_setting_completed(self, name: str, value: object) -> None:
         self.setting_pending = False
         if self.light_action is not None:
             self.light_action.setEnabled(True)
-        self.quality_menu.setEnabled(True)
+        self.quality_button.set_busy(False)
         if name == SETTING_LIGHT:
             self.light_on = bool(value)
             self._update_light_action()
-        elif self.settings is not None:
-            self.settings.setValue(f"{QUALITY_SETTING}/{self.camera.uid}", value)
-            self.settings.sync()
-            for quality, action in self.quality_actions.items():
-                action.setChecked(quality == value)
-            self.quality_button.setText(str(value))
+        elif name == SETTING_QUALITY:
+            self.quality_button.commit_quality(str(value))
 
     def _on_setting_failed(self, name: str, message: str) -> None:
         self.setting_pending = False
         if self.light_action is not None:
             self.light_action.setEnabled(True)
-        self.quality_menu.setEnabled(True)
+        self.quality_button.set_busy(False)
         if name == SETTING_QUALITY:
-            saved = self.settings.value(f"{QUALITY_SETTING}/{self.camera.uid}", "", str) if self.settings is not None else ""
-            for quality, action in self.quality_actions.items():
-                action.setChecked(quality == saved)
+            self.quality_button.restore_quality()
         self.show_status(message)
 
     def _retry(self) -> None:
@@ -5159,23 +5208,10 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         controls.setSpacing(12)
         controls.addStretch(1)
-        self.quality_menu = QMenu(self)
-        self.quality_group = QActionGroup(self)
-        self.quality_actions: dict[str, QAction] = {}
-        for quality in VIDEO_QUALITIES:
-            action = self.quality_menu.addAction(quality)
-            action.setCheckable(True)
-            action.setChecked(quality == self.settings.value(QUALITY_SETTING, "", str))
-            action.setVisible(False)
-            action.triggered.connect(lambda checked=False, value=quality: self.choose_quality(value))
-            self.quality_group.addAction(action)
-            self.quality_actions[quality] = action
-        self.quality_button = QPushButton(self.quality_label())
-        self.quality_button.setObjectName("qualityButton")
-        self.quality_button.setFixedSize(56, 44)
-        self.quality_button.setEnabled(False)
-        self.quality_button.hide()
-        self.quality_button.clicked.connect(self.show_quality_menu)
+        self.quality_button = VideoQualityControl(self.settings, self.overlay)
+        self.quality_button.quality_requested.connect(self.choose_quality)
+        self.quality_menu = self.quality_button.quality_menu
+        self.quality_actions = self.quality_button.quality_actions
         controls.addWidget(self.quality_button)
         self.replay_button = QPushButton("Playback")
         self.replay_button.setEnabled(False)
@@ -6647,7 +6683,7 @@ class MainWindow(QMainWindow):
             self.zoom_out_button.setEnabled(False)
             self.zoom_in_button.setEnabled(True)
             self.light_button.setEnabled(not rtsp)
-            self.quality_button.setEnabled(not rtsp)
+            self.quality_button.set_live(True)
 
     def disable_live_controls(self) -> None:
         self.set_controls_enabled(False)
@@ -6658,7 +6694,8 @@ class MainWindow(QMainWindow):
         self.zoom_out_button.setEnabled(False)
         self.zoom_in_button.setEnabled(False)
         self.light_button.setEnabled(False)
-        self.quality_button.setEnabled(False)
+        self.quality_button.set_live(False)
+        self.quality_button.set_busy(False)
         self.setting_pending = False
 
     def set_controls_enabled(self, enabled: bool) -> None:
@@ -6871,23 +6908,10 @@ class MainWindow(QMainWindow):
                 self.hide_overlay()
             self.update_recording_badge()
 
-    def quality_label(self) -> str:
-        device = getattr(self, "selected_device", None)
-        setting = f"{QUALITY_SETTING}/{device.uid}" if device is not None else QUALITY_SETTING
-        quality = self.settings.value(setting, "", str)
-        return quality if quality in VIDEO_QUALITIES else DEFAULT_QUALITY_LABEL
-
-    def show_quality_menu(self) -> None:
-        self.quality_menu.popup(
-            self.quality_button.mapToGlobal(QPoint(0, -self.quality_menu.sizeHint().height()))
-        )
-
     def on_capabilities_found(self, qualities: list[str], light_on: bool | None) -> None:
-        for quality, action in self.quality_actions.items():
-            action.setVisible(quality in qualities)
-        self.quality_button.setVisible(bool(qualities))
-        self.quality_button.setEnabled(self.stream_live and bool(qualities))
-        self.quality_menu.menuAction().setVisible(bool(qualities))
+        self.sync_quality_actions()
+        self.quality_button.set_capabilities(qualities)
+        self.quality_button.set_live(self.stream_live)
         self.light_on = light_on
         self.light_button.setVisible(light_on is not None)
         self.update_light_button()
@@ -6935,7 +6959,7 @@ class MainWindow(QMainWindow):
             return False
         self.setting_pending = True
         self.light_button.setEnabled(False)
-        self.quality_button.setEnabled(False)
+        self.quality_button.set_busy(True)
         self.show_notice(message)
         return True
 
@@ -6960,29 +6984,26 @@ class MainWindow(QMainWindow):
             self.sync_quality_actions()
 
     def sync_quality_actions(self) -> None:
-        current = self.quality_label()
-        for quality, action in self.quality_actions.items():
-            action.setChecked(quality == current)
-        self.quality_button.setText(current)
+        device = getattr(self, "selected_device", None)
+        self.quality_button.bind_camera(self.settings, device.uid if device is not None else "")
+        self.quality_button.restore_quality()
 
     def on_setting_completed(self, name: str, value: object) -> None:
         self.setting_pending = False
         self.light_button.setEnabled(self.stream_live)
-        self.quality_button.setEnabled(self.stream_live)
+        self.quality_button.set_busy(False)
         if name == SETTING_LIGHT:
             self.light_on = bool(value)
             self.update_light_button()
             self.show_notice("White light on." if self.light_on else "White light off.")
         else:
-            self.settings.setValue(f"{QUALITY_SETTING}/{self.selected_device.uid}", value)
-            self.settings.sync()
-            self.sync_quality_actions()
+            self.quality_button.commit_quality(str(value))
             self.show_notice(f"Video quality set to {value}.")
 
     def on_setting_failed(self, name: str, message: str) -> None:
         self.setting_pending = False
         self.light_button.setEnabled(self.stream_live)
-        self.quality_button.setEnabled(self.stream_live)
+        self.quality_button.set_busy(False)
         if name == SETTING_QUALITY:
             self.sync_quality_actions()
         self.show_notice(message)

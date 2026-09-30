@@ -191,7 +191,8 @@ The tray menu switches continuous recording on or off and opens the recordings f
 A segment interrupted by a crash or power loss is recovered at the next start.
 The first check only records the latest existing detection, so older events are not announced.
 
-The video quality selector appears only when the camera can switch quality and return to its full resolution without restarting.
+All live panes use one shared video quality control, with camera-specific quality choices and saved selections.
+The selector appears only when the camera can switch quality and return to its full resolution without restarting.
 If the O-KAM account service omits the camera credential, the application reads a camera-specific secret from the desktop keyring under the attributes `application=okam-linux`, `camera=<camera UID>`.
 The account password and camera credential are never embedded in the source code.
 
