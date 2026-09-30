@@ -18,7 +18,7 @@ from datetime import datetime
 
 import websocket
 
-from icam365 import broadcast_media, start_media_server
+from icam365 import LIVE_MEDIA_OUTPUT_OPTIONS, broadcast_media, start_media_server
 
 
 RTSP_HEADER_END = b"\r\n\r\n"
@@ -170,8 +170,7 @@ class LocalRtspMediaBridge:
                 "ffmpeg", "-nostdin", "-nostats", "-loglevel", "error",
                 "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe,rtsp,tcp,udp,rtp",
                 "-i", f"/proc/self/fd/{playlist_fd}", "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
-                "-f", "mpegts", "-mpegts_flags", "+resend_headers", "-muxdelay", "0", "-muxpreload", "0",
-                "-flush_packets", "1", "pipe:1",
+                *LIVE_MEDIA_OUTPUT_OPTIONS,
             ], pass_fds=(playlist_fd,), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, bufsize=0)
         except OSError:

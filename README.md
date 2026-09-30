@@ -57,6 +57,7 @@ Enter its LAN address, camera username, and device password or the security code
 Outside the home, connect to the home VPN before opening these cameras; a local connection failure never falls back to cloud video.
 For cameras with TLS enabled, the viewer pins the camera certificate during configuration and provides the encrypted stream to the existing player through an authenticated loopback connection.
 One camera connection supplies live video, local recording, and detection through the same loopback media broadcaster used for native iCam365 video.
+Both live transports limit audio/video interleaving to 100 ms so sparse audio packets do not hold back video.
 The camera remains in its Imou account with the same identity, visibility, controls, and recording history; movement controls and microSD playback continue using the account API, and cloud microSD playback still consumes its traffic allowance.
 Local continuous recording uses the global recording setting and does not consume Imou video traffic.
 Use the account's submenu under **Cameras** to edit its region or recording choice, or remove the account and its keyring secret.

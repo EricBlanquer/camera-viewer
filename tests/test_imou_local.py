@@ -198,6 +198,61 @@ class LocalRtspTunnelTest(unittest.TestCase):
         self.assertFalse(bridge.thread.is_alive())
         self.assertFalse(bridge.server_thread.is_alive())
 
+    def test_sparse_audio_does_not_hold_back_live_video(self):
+        fixture = Path(self.directory.name) / "sparse-audio.mkv"
+        subprocess.run([
+            "ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "lavfi",
+            "-i", "testsrc2=size=160x90:rate=10", "-f", "lavfi",
+            "-i", "sine=frequency=440:sample_rate=16000", "-t", "12", "-c:v", "mpeg2video",
+            "-af", "aselect=lt(t\\,1)+gte(t\\,11)", "-c:a", "aac", str(fixture),
+        ], check=True, capture_output=True, timeout=10)
+        descriptor = os.memfd_create("sparse-audio-playlist")
+        os.write(descriptor, f"ffconcat version 1.0\nfile '{fixture}'\noption analyzeduration 1000000\n".encode())
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        start_process = subprocess.Popen
+        with patch("rtsp_tunnel.subprocess.Popen", side_effect=lambda command, **options:
+                   start_process(command[:1] + ["-re"] + command[1:], **options)):
+            bridge = LocalRtspMediaBridge(Mock(error=""), descriptor)
+        endpoint = urllib.parse.urlsplit(bridge.url)
+        client = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=8)
+        received = bytearray()
+        lock = threading.Lock()
+
+        def receive():
+            try:
+                while True:
+                    data = response.read1(8192)
+                    if not data:
+                        return
+                    with lock:
+                        received.extend(data)
+            except OSError:
+                pass
+
+        reader = None
+        try:
+            client.request("GET", endpoint.path)
+            response = client.getresponse()
+            reader = threading.Thread(target=receive, daemon=True)
+            reader.start()
+            time.sleep(4)
+            capture = Path(self.directory.name) / "sparse-audio.ts"
+            with lock:
+                capture.write_bytes(received)
+            packets = json.loads(subprocess.run([
+                "ffprobe", "-v", "error", "-select_streams", "v", "-show_packets",
+                "-show_entries", "packet=pts_time", "-of", "json", str(capture),
+            ], check=True, capture_output=True, text=True, timeout=5).stdout)["packets"]
+            timestamps = [float(packet["pts_time"]) for packet in packets if "pts_time" in packet]
+            self.assertGreater(max(timestamps) - min(timestamps), 2)
+        finally:
+            bridge.close()
+            client.close()
+            if reader is not None:
+                reader.join(3)
+                self.assertFalse(reader.is_alive())
+            os.close(descriptor)
+
 
 class ImouLocalUiTest(unittest.TestCase):
     @classmethod

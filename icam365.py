@@ -33,6 +33,10 @@ RECEIVE_POLL_SECONDS = 0.05
 STOP_ACK_TIMEOUT_SECONDS = 5
 CLOSE_NOTIFICATION_RETRIES = 2
 LIVE_AUDIO_CLOCK_FILTER = "aresample=async=1000"
+LIVE_MEDIA_OUTPUT_OPTIONS = (
+    "-max_interleave_delta", "100000", "-muxdelay", "0", "-muxpreload", "0",
+    "-mpegts_flags", "resend_headers", "-flush_packets", "1", "-f", "mpegts", "pipe:1",
+)
 AAC_SAMPLE_RATE = 8000
 AAC_FRAME_SAMPLES = 1024
 PTZ_COMMAND = 0x1001
@@ -476,8 +480,7 @@ class NativeBridge:
                 "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
                 "-af", LIVE_AUDIO_CLOCK_FILTER, "-c:a", "aac", "-b:a", "32k",
                 "-output_ts_offset", str(AAC_FRAME_SAMPLES / AAC_SAMPLE_RATE),
-                "-max_interleave_delta", "100000", "-muxdelay", "0", "-muxpreload", "0",
-                "-mpegts_flags", "resend_headers", "-flush_packets", "1", "-f", "mpegts", "pipe:1",
+                *LIVE_MEDIA_OUTPUT_OPTIONS,
             ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 pass_fds=(video_read, audio_read), bufsize=0)
         except OSError:
