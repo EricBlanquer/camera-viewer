@@ -5010,6 +5010,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APPLICATION_NAME)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setWindowIcon(QIcon(str(ICON_DIRECTORY / "app.svg")))
         self.resize(980, 590)
         self.quit_requested = False
@@ -5484,6 +5485,9 @@ class MainWindow(QMainWindow):
                 self.stream_worker.set_display(True)
         for preview in self.previews.values():
             preview.set_display(True)
+        self.resume_live_if_idle()
+
+    def resume_live_if_idle(self) -> None:
         if self.stream_worker is None and self.account_worker is None:
             self.reconnect()
 
@@ -6269,7 +6273,7 @@ class MainWindow(QMainWindow):
             self.pending_camera_replay = None
         if getattr(self, "selected_device", None) is not None and self.selected_device.uid == uid:
             self.sync_previews()
-            self.show_window()
+            self.resume_live_if_idle()
             return
         for replay_uid in list(self.local_replays):
             self.close_local_replay(replay_uid)
@@ -6313,7 +6317,6 @@ class MainWindow(QMainWindow):
         self.pending_camera_replay = None
         self.pending_selection_start = (uid, replay_requested) if switching_preview else None
         self.sync_previews()
-        self.show_window_without_stream()
         if not switching_preview:
             self.pending_selection_start = (uid, replay_requested)
             self._finish_selected_camera()
@@ -6325,8 +6328,6 @@ class MainWindow(QMainWindow):
         self.account_error.show()
         if self.account_dialog is not None:
             self.account_dialog.show_error(message)
-        elif message == ACCOUNT_REJECTED_MESSAGE:
-            self.show_window_without_stream()
 
     def enter_replay(self, start: datetime | None) -> None:
         if not self.devices or self.close_pending or isinstance(getattr(self, "selected_device", None), RtspCamera):

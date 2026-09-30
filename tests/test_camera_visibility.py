@@ -133,6 +133,31 @@ class CameraVisibilityTest(unittest.TestCase):
         self.assertIn(self.second.uid, self.window.previews)
         self.assertNotIn(preview, self.window.retired_previews)
 
+    def test_camera_selection_keeps_a_hidden_window_hidden(self) -> None:
+        self.window.hide()
+        self.window.select_camera("account@example.com", self.first.uid)
+        self.assertFalse(self.window.isVisible())
+
+    def test_camera_selection_preserves_minimization(self) -> None:
+        self.window.showMinimized()
+        self.window.select_camera("account@example.com", self.first.uid)
+        self.assertTrue(self.window.isMinimized())
+
+    def test_camera_switch_completion_does_not_reopen_a_hidden_window(self) -> None:
+        self.window.sync_previews()
+        self.window.stream_worker = SimpleNamespace(stop=Mock())
+        self.window.select_camera("rtsp", self.second.uid)
+        self.window.hide()
+        self.window.on_stream_finished()
+        self.application.processEvents()
+        self.assertEqual(self.window.selected_device.uid, self.second.uid)
+        self.assertFalse(self.window.isVisible())
+
+    def test_explicit_window_action_opens_a_hidden_window(self) -> None:
+        self.window.hide()
+        self.window.on_window_action_triggered()
+        self.assertTrue(self.window.isVisible())
+
 
 if __name__ == "__main__":
     unittest.main()

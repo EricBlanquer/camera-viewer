@@ -96,12 +96,12 @@ class OnboardingTest(unittest.TestCase):
         window.quit_requested = True
         window.close()
 
-    def test_rejected_saved_login_opens_the_hidden_window_and_displays_error(self) -> None:
+    def test_rejected_saved_login_keeps_the_window_hidden_and_preserves_error(self) -> None:
         self.window.hide()
         self.window.on_account_failed(ACCOUNT_REJECTED_MESSAGE)
         self.window.on_account_finished()
-        self.assertTrue(self.window.isVisible())
-        self.assertTrue(self.window.account_error.isVisible())
+        self.assertFalse(self.window.isVisible())
+        self.assertTrue(self.window.account_error.isVisibleTo(self.window))
         self.assertEqual(self.window.account_error.text(), ACCOUNT_REJECTED_MESSAGE)
         self.assertFalse(self.window.reconnect_timer.isActive())
 

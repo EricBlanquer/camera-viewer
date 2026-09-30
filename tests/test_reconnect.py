@@ -151,6 +151,12 @@ class ReconnectTest(unittest.TestCase):
         self.window.on_account_finished()
         self.assertFalse(self.window.reconnect_timer.isActive())
 
+    def test_rejected_account_login_does_not_reopen_a_hidden_window(self) -> None:
+        self.window.hide()
+        self.window.on_account_failed(ACCOUNT_REJECTED_MESSAGE)
+        self.assertFalse(self.window.isVisible())
+        self.assertEqual(self.window.account_error.text(), ACCOUNT_REJECTED_MESSAGE)
+
     def test_drag_moves_camera_opposite_to_image_motion(self) -> None:
         commands: list[tuple[str, ...]] = []
         self.window.control_camera = commands.append

@@ -171,6 +171,7 @@ Playback and camera controls are available in each camera's video pane.
 Opening Camera Viewer again from the application menu shows the running instance instead of starting a second one.
 Closing the window hides it; live video keeps running in the background so continuous recording and detection checks continue.
 Clicking the tray icon brings a window behind other applications to the front; clicking it while Camera Viewer is active hides it.
+Camera selection, connection retries, and account errors preserve the window's visibility, minimization, and focus.
 The tray menu enables local detection of people, cats, dogs, and birds while continuous recording is on.
 It analyzes one 640 × 360 frame per second with the SHA-256-verified OpenCV Zoo YOLOX-s model and confirms an event when the same object appears twice within two seconds.
 Nearby detections of the same animal retain a cat classification when the model briefly calls that animal a dog or bird; spatially separate animals retain their own types.
