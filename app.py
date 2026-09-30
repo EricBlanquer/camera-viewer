@@ -96,7 +96,7 @@ from okam_native.p2p import (
     select_camera_password,
 )
 from okam_native.wakeup import WakeError, load_wake_credentials, wake_camera
-from icam365 import PTZ_COMMAND, PTZ_POSITION_COMMAND, close_bridge, get_bridge
+from icam365 import PTZ_COMMAND, PTZ_POSITION_COMMAND, close_bridge, get_bridge, load_config as load_icam365_config
 from local_detection import (
     DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, organize_events, prune_events,
 )
@@ -112,6 +112,8 @@ RTSP_SOUND_SETTING = "audio/rtsp_sound"
 IMOU_PROVIDER = "imou"
 IMOU_RTSP_PATH = "/cam/realmonitor"
 MULTIVIEW_SETTING = "view/show_all_cameras"
+CAMERA_VISIBLE_SETTING = "view/camera_visible"
+NO_VISIBLE_CAMERAS_MESSAGE = "No cameras selected."
 MULTIVIEW_LAYOUT_SETTING = "view/camera_layout"
 CAMERA_ORDER_SETTING = "view/camera_order"
 CAMERA_DRAG_MIME = "application/x-camera-viewer-uid"
@@ -4581,6 +4583,9 @@ class MainWindow(QMainWindow):
         self.primary_video_stack.addWidget(self.primary_frame)
         primary_layout.addWidget(self.primary_video_stack, 1)
         self.video_grid.addWidget(self.primary_pane, 0, 0)
+        self.empty_camera_label = QLabel(NO_VISIBLE_CAMERAS_MESSAGE, body)
+        self.empty_camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_camera_label.hide()
         layout.addLayout(self.video_grid, 1)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
@@ -4748,10 +4753,6 @@ class MainWindow(QMainWindow):
         self.window_action.triggered.connect(self.on_window_action_triggered)
         self.cameras_menu = menu.addMenu("Cameras")
         self.cameras_menu.aboutToShow.connect(self.update_cameras_menu)
-        self.show_all_action = menu.addAction("Show all cameras")
-        self.show_all_action.setCheckable(True)
-        self.show_all_action.setChecked(self.settings.value(MULTIVIEW_SETTING, True, bool))
-        self.show_all_action.toggled.connect(self.set_show_all_cameras)
         self.camera_layout_menu = menu.addMenu("Camera layout")
         layout_group = QActionGroup(self)
         for value, label in (("horizontal", "Side by side"), ("vertical", "Stacked")):
@@ -4816,7 +4817,7 @@ class MainWindow(QMainWindow):
 
     def update_tray_menu(self) -> None:
         self.window_action.setText("Hide window" if self.isVisible() else "Show window")
-        self.camera_layout_menu.setEnabled(len(self.devices) > 1)
+        self.camera_layout_menu.setEnabled(len(self.visible_devices()) > 1)
         self.add_account_action.setEnabled(self.account_worker is None)
         text_color = self.tray.contextMenu().palette().color(QPalette.ColorRole.WindowText)
         for action, button in self.tray_actions:
@@ -4832,14 +4833,20 @@ class MainWindow(QMainWindow):
             username = self.device_accounts[device.uid]
             if isinstance(device, RtspCamera):
                 source = "Imou Life (local)" if device.provider == IMOU_PROVIDER else "RTSP (local)"
+                if device.provider == "rtsp":
+                    try:
+                        if load_icam365_config(device.uid) is not None:
+                            source = "iCam365"
+                    except OSError:
+                        source = "iCam365 (configuration error)"
                 label = f"{device.name} · {source}"
             else:
                 label = f"{device.name} · O-KAM ({username})"
             action = self.cameras_menu.addAction(label)
             action.setCheckable(True)
-            action.setChecked(device is getattr(self, "selected_device", None))
+            action.setChecked(self.camera_visible(device.uid))
             action.triggered.connect(
-                lambda checked=False, account=username, uid=device.uid: self.select_camera(account, uid)
+                lambda checked, uid=device.uid: self.set_camera_visible(uid, checked)
             )
         if not self.devices:
             self.cameras_menu.addAction("No cameras available").setEnabled(False)
@@ -4860,6 +4867,9 @@ class MainWindow(QMainWindow):
 
     def check_detections(self) -> None:
         if not self.devices or self.detection_worker is not None or self.close_pending or self.replay is not None:
+            return
+        selected = getattr(self, "selected_device", None)
+        if selected is None or not self.camera_visible(selected.uid):
             return
         if isinstance(getattr(self, "selected_device", None), RtspCamera):
             return
@@ -5104,9 +5114,48 @@ class MainWindow(QMainWindow):
         self.settings.setValue(RTSP_CAMERAS_SETTING, json.dumps(records))
         self.settings.sync()
 
-    def set_show_all_cameras(self, enabled: bool) -> None:
-        self.settings.setValue(MULTIVIEW_SETTING, enabled)
+    def camera_visible(self, uid: str) -> bool:
+        selected = getattr(self, "selected_device", None)
+        saved_uid = self.settings.value("camera/selected_uid", getattr(selected, "uid", ""), str)
+        default = self.settings.value(MULTIVIEW_SETTING, True, bool) or uid == saved_uid
+        return self.settings.value(f"{CAMERA_VISIBLE_SETTING}/{uid}", default, bool)
+
+    def visible_devices(self) -> list[AccountDevice | RtspCamera]:
+        return [camera for camera in self.ordered_devices() if self.camera_visible(camera.uid)]
+
+    def save_camera_visibility(self, uid: str, enabled: bool) -> None:
+        for camera in self.devices:
+            setting = f"{CAMERA_VISIBLE_SETTING}/{camera.uid}"
+            if not self.settings.contains(setting):
+                self.settings.setValue(setting, self.camera_visible(camera.uid))
+        self.settings.setValue(f"{CAMERA_VISIBLE_SETTING}/{uid}", enabled)
+        self.settings.remove(MULTIVIEW_SETTING)
         self.settings.sync()
+
+    def set_camera_visible(self, uid: str, enabled: bool) -> None:
+        if uid not in self.device_accounts:
+            return
+        selected = getattr(self, "selected_device", None)
+        selected_was_visible = selected is not None and self.camera_visible(selected.uid)
+        self.save_camera_visibility(uid, enabled)
+        if not enabled and self.pending_camera is not None and self.pending_camera[1] == uid:
+            self.pending_camera = None
+        if not selected_was_visible or not self.camera_visible(selected.uid):
+            remaining = self.visible_devices()
+            if remaining:
+                camera = remaining[0]
+                self.select_camera(self.device_accounts[camera.uid], camera.uid)
+            else:
+                self.pending_camera = None
+                self.pending_camera_replay = None
+                self.pending_selection_start = None
+                self.pending_replay = None
+                self.exit_replay(False)
+                if selected is not None:
+                    self.close_local_replay(selected.uid)
+                self.stop_stream()
+                self.disable_live_controls()
+                self.set_status(NO_VISIBLE_CAMERAS_MESSAGE)
         self.sync_previews()
 
     def camera_layout(self) -> str:
@@ -5115,7 +5164,7 @@ class MainWindow(QMainWindow):
 
     def effective_camera_layout(self) -> str:
         preferred = self.camera_layout()
-        if not self.isVisible() or len(self.devices) < 2:
+        if not self.isVisible() or len(self.visible_devices()) < 2:
             return preferred
         screen = self.screen() or QApplication.primaryScreen()
         available = screen.availableGeometry()
@@ -5164,13 +5213,17 @@ class MainWindow(QMainWindow):
         preview.deleteLater()
         if self.pending_selection_start is not None and self.pending_selection_start[0] == preview.camera.uid:
             QTimer.singleShot(0, self._finish_selected_camera)
+        elif not self.close_pending and self.camera_visible(preview.camera.uid):
+            QTimer.singleShot(0, self.sync_previews)
         if self.close_pending and self.stream_worker is None and self.account_worker is None:
             QTimer.singleShot(0, self.close)
 
     def _finish_selected_camera(self) -> None:
         pending = self.pending_selection_start
         self.pending_selection_start = None
-        if pending is None or self.close_pending or getattr(getattr(self, "selected_device", None), "uid", None) != pending[0]:
+        if (pending is None or self.close_pending
+                or getattr(getattr(self, "selected_device", None), "uid", None) != pending[0]
+                or not self.camera_visible(pending[0])):
             return
         if pending[1]:
             self.enter_replay(None)
@@ -5179,11 +5232,8 @@ class MainWindow(QMainWindow):
 
     def sync_previews(self) -> None:
         selected = getattr(self, "selected_device", None)
-        ordered = self.ordered_devices()
-        cameras = (
-            [camera for camera in ordered if camera.uid != selected.uid]
-            if selected is not None and self.settings.value(MULTIVIEW_SETTING, True, bool) else []
-        )
+        visible = self.visible_devices()
+        cameras = [camera for camera in visible if selected is None or camera.uid != selected.uid]
         layout = self.effective_camera_layout()
         changed = len(cameras) != len(self.previews) or layout != self.preview_layout
         desired = {camera.uid for camera in cameras}
@@ -5191,7 +5241,12 @@ class MainWindow(QMainWindow):
             if uid not in desired:
                 del self.previews[uid]
                 self._retire_preview(preview)
-        visible = ordered if cameras else ([selected] if selected is not None else [])
+        self.video_grid.removeWidget(self.primary_pane)
+        self.primary_pane.setVisible(selected is not None and self.camera_visible(selected.uid))
+        self.video_grid.removeWidget(self.empty_camera_label)
+        self.empty_camera_label.setVisible(not visible)
+        if not visible:
+            self.video_grid.addWidget(self.empty_camera_label, 0, 0)
         self.video_grid.setColumnStretch(0, 1)
         self.video_grid.setColumnStretch(1, 1 if layout == "horizontal" and len(visible) > 1 else 0)
         for index, camera in enumerate(visible):
@@ -5201,6 +5256,8 @@ class MainWindow(QMainWindow):
                 continue
             preview = self.previews.get(camera.uid)
             if preview is None:
+                if any(retired.camera.uid == camera.uid for retired in self.retired_previews):
+                    continue
                 preview = CameraPreview(
                     camera, self.continuous_recording_enabled(), self.settings,
                     self.local_detection_enabled(), self.local_detection_ready.emit,
@@ -5347,17 +5404,22 @@ class MainWindow(QMainWindow):
         self.device_accounts.pop(camera.uid, None)
         self.save_rtsp_cameras()
         self.settings.remove(f"{RTSP_SOUND_SETTING}/{camera.uid}")
+        self.settings.remove(f"{CAMERA_VISIBLE_SETTING}/{camera.uid}")
         self.settings.remove("camera/selected_uid")
         self.settings.remove("camera/selected_account")
         self.settings.sync()
-        if self.devices:
-            replacement = self.devices[0]
+        remaining = self.visible_devices()
+        if remaining:
+            replacement = remaining[0]
             self.select_camera(self.device_accounts[replacement.uid], replacement.uid)
         else:
             self.stop_stream()
-            del self.selected_device
+            if self.devices:
+                self.selected_device = self.devices[0]
+            else:
+                del self.selected_device
             self.sync_previews()
-            self.set_status("No cameras available.")
+            self.set_status(NO_VISIBLE_CAMERAS_MESSAGE if self.devices else "No cameras available.")
 
     def camera_source_actions(self) -> tuple[Callable[[], None], ...]:
         return self.change_account, self.add_rtsp_camera, self.add_imou_camera
@@ -5497,9 +5559,12 @@ class MainWindow(QMainWindow):
     def select_camera(self, username: str, uid: str) -> None:
         if self.device_accounts.get(uid) != username:
             return
+        if not self.camera_visible(uid):
+            self.save_camera_visibility(uid, True)
         if uid != self.pending_camera_replay:
             self.pending_camera_replay = None
         if getattr(self, "selected_device", None) is not None and self.selected_device.uid == uid:
+            self.sync_previews()
             self.show_window()
             return
         for replay_uid in list(self.local_replays):
@@ -5518,6 +5583,8 @@ class MainWindow(QMainWindow):
             return
         username, uid = self.pending_camera
         self.pending_camera = None
+        if uid not in self.device_accounts or not self.camera_visible(uid):
+            return
         self.selected_device = next(device for device in self.devices if device.uid == uid)
         self.primary_label.uid = uid
         self.primary_label.setText(self.selected_device.name)
@@ -5557,6 +5624,8 @@ class MainWindow(QMainWindow):
 
     def enter_replay(self, start: datetime | None) -> None:
         if not self.devices or self.close_pending or isinstance(getattr(self, "selected_device", None), RtspCamera):
+            return
+        if not self.camera_visible(self.selected_device.uid):
             return
         self.show_window_without_stream()
         if self.replay is not None:
@@ -5646,6 +5715,8 @@ class MainWindow(QMainWindow):
                 (device for device in self.devices if device.uid == saved_uid),
                 next((device for device in self.devices if device.name == "Jardin"), self.devices[0]),
             )
+            if not self.camera_visible(self.selected_device.uid) and self.visible_devices():
+                self.selected_device = self.visible_devices()[0]
             self.primary_label.uid = self.selected_device.uid
             self.primary_label.setText(self.selected_device.name)
             self.rtsp_ptz_available = False
@@ -5681,12 +5752,16 @@ class MainWindow(QMainWindow):
 
     def reconnect(self) -> None:
         if self.devices and hasattr(self, "selected_device"):
-            self.watch_live()
+            if self.camera_visible(self.selected_device.uid):
+                self.watch_live()
         else:
             self.find_cameras()
 
     def watch_live(self) -> None:
         if not self.devices or self.stream_worker is not None:
+            return
+        if not self.camera_visible(self.selected_device.uid):
+            self.set_status(NO_VISIBLE_CAMERAS_MESSAGE)
             return
         self.reconnect_timer.stop()
         self.retry_pending = False
@@ -5996,7 +6071,9 @@ class MainWindow(QMainWindow):
     def fit_video_aspect(self) -> None:
         if self.isFullScreen():
             return
-        count = 1 + len(self.previews)
+        count = len(self.visible_devices())
+        if not count:
+            return
         columns = 1 if self.effective_camera_layout() == "vertical" or count == 1 else 2
         rows = (count + columns - 1) // columns
         label_height = self.primary_label.sizeHint().height()
@@ -6280,6 +6357,9 @@ class MainWindow(QMainWindow):
         self.control_pending = False
         self.rtsp_ptz_available = False
         self.sound_enabled = False
+        selected = getattr(self, "selected_device", None)
+        if selected is not None and not self.camera_visible(selected.uid):
+            self.retry_pending = False
         if not (self.retry_pending or self.keep_player) or self.close_pending:
             self.stop_player()
         self.keep_player = False
@@ -6302,6 +6382,8 @@ class MainWindow(QMainWindow):
             start = self.pending_replay[0]
             self.pending_replay = None
             self.enter_replay(start)
+        elif not self.visible_devices():
+            self.set_status(NO_VISIBLE_CAMERAS_MESSAGE)
 
     def closeEvent(self, event: object) -> None:
         if self.tray is not None and not self.quit_requested:

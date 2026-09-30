@@ -34,8 +34,13 @@ Use **Add camera > O-KAM account...** in the tray menu to add another account.
 Use **Add camera > RTSP camera...** to add a camera by name, RTSP URL without embedded credentials, and UDP or TCP transport.
 Use **Add camera > Imou Life camera (local)...** to add an Imou camera by local IP address, RTSP port, channel, camera username, and device password or safety code.
 The device password is kept in the desktop keyring; saved camera settings and media-player command lines omit it.
-The **Cameras** submenu lists O-KAM cameras by account and local RTSP or Imou cameras by name, switches the displayed camera, and can remove the selected local camera.
-With **Show all cameras** enabled in the tray menu, the selected camera and the other cameras appear together in a grid; this is on by default.
+The **Cameras** submenu lists O-KAM cameras by account and RTSP, Imou, or configured native iCam365 cameras by name and source.
+Each checkbox independently shows or hides its camera, and the choice is remembered across application restarts.
+Checked cameras appear together in a grid; all cameras are checked by default.
+Unchecking a camera stops its live connection, local recording, and local detection, while the other checked feeds continue.
+All cameras can be unchecked to pause viewing and recording.
+The previous single-camera or all-camera choice is preserved when migrating existing settings.
+The submenu can also remove the selected local camera.
 Use **Camera layout > Side by side** or **Stacked** to place the feeds horizontally or vertically; the layout choice is remembered.
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 Drag one camera title onto another to exchange their positions; the order is remembered without restarting either stream.
@@ -50,7 +55,7 @@ Selecting microSD playback makes that camera the selected pane while the other l
 The other camera views reconnect independently.
 Click either video to show or hide its own control bar; the bars are hidden initially and close after five seconds.
 Double-click either video to toggle full screen.
-Turn off **Show all cameras** to return to one video.
+Keep only one camera checked to display one video.
 Use **Refresh camera list** there after adding a camera to an existing O-KAM account.
 Later launches show the video with controls available on click.
 Run `.venv/bin/python app.py --forget-account` to remove all saved O-KAM accounts.
@@ -148,7 +153,7 @@ Clicking a detection notification opens the playback at that detection.
 Every minute, Camera Viewer checks the selected O-KAM camera's microSD card for new detection recordings and shows a desktop notification with the time of the latest one.
 The check uses the live connection.
 
-With **Show all cameras** enabled, Camera Viewer records every displayed live video continuously on this computer, in ten-minute Matroska files in the desktop's `Videos/O-KAM Linux/Continuous` folder, and deletes files older than 24 hours.
+Camera Viewer records every checked live camera continuously on this computer, in ten-minute Matroska files in the desktop's `Videos/O-KAM Linux/Continuous` folder, and deletes files older than 24 hours.
 This keeps a copy of the last day even if the camera and its microSD card are taken, as long as the computer and the application are running.
 The tray menu switches continuous recording on or off and opens the recordings folder.
 A segment interrupted by a crash or power loss is recovered at the next start.

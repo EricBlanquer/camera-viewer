@@ -120,7 +120,7 @@ class TrayTest(unittest.TestCase):
             self.assertEqual(messages, [("Camera detection", "Jardin \u00b7 26/09 15:00:01 (2 new detections)")])
             self.assertEqual(self.window.settings.value("detections/last_seen/garden"), "20260926150001_011.mp4")
 
-    def test_tray_lists_and_switches_account_cameras(self) -> None:
+    def test_tray_lists_and_toggles_account_cameras(self) -> None:
         garden = SimpleNamespace(name="Jardin", uid="garden")
         entrance = SimpleNamespace(name="Entrée", uid="entrance")
         self.window.devices = [garden, entrance]
@@ -133,11 +133,12 @@ class TrayTest(unittest.TestCase):
             "Entrée · O-KAM (second@example.com)",
         ])
         self.assertTrue(actions[0].isChecked())
-        self.assertFalse(actions[1].isChecked())
-        chosen: list[tuple[str, str]] = []
-        self.window.select_camera = lambda account, uid: chosen.append((account, uid))
+        self.assertTrue(actions[1].isChecked())
+        chosen: list[tuple[str, bool]] = []
+        self.window.set_camera_visible = lambda uid, enabled: chosen.append((uid, enabled))
         actions[1].trigger()
-        self.assertEqual(chosen, [("second@example.com", "entrance")])
+        self.assertEqual(chosen, [("entrance", False)])
+        self.assertTrue(actions[0].isChecked())
 
     def test_selected_camera_survives_account_refresh(self) -> None:
         with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:
@@ -171,10 +172,10 @@ class TrayTest(unittest.TestCase):
             actions = self.window.cameras_menu.actions()
             self.assertEqual(actions[0].text(), "Jardin · O-KAM (first@example.com)")
             self.assertEqual(actions[1].text(), "Entrée · RTSP (local)")
-            chosen: list[tuple[str, str]] = []
-            self.window.select_camera = lambda account, uid: chosen.append((account, uid))
+            chosen: list[tuple[str, bool]] = []
+            self.window.set_camera_visible = lambda uid, enabled: chosen.append((uid, enabled))
             actions[1].trigger()
-            self.assertEqual(chosen, [(RTSP_ACCOUNT, camera.uid)])
+            self.assertEqual(chosen, [(camera.uid, False)])
             self.window.accounts = []
             with patch.object(self.window, "watch_live"):
                 self.window.find_cameras()
@@ -237,7 +238,7 @@ class TrayTest(unittest.TestCase):
         self.assertEqual(failures, ["The RTSP video stream stopped producing frames."])
         self.assertLessEqual(len(positions), 3)
 
-    def test_show_all_cameras_keeps_a_preview_for_each_other_camera(self) -> None:
+    def test_visible_cameras_keep_independent_previews_and_saved_layout(self) -> None:
         garden = SimpleNamespace(name="Jardin", uid="garden")
         entrance = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
         self.window.devices = [garden, entrance]
@@ -259,9 +260,10 @@ class TrayTest(unittest.TestCase):
             self.window.selected_device = entrance
             self.window.sync_previews()
             self.assertEqual(list(self.window.previews), [garden.uid])
-            self.window.set_show_all_cameras(False)
+            self.window.device_accounts = {garden.uid: "account@example.com", entrance.uid: RTSP_ACCOUNT}
+            self.window.set_camera_visible(garden.uid, False)
             self.assertEqual(self.window.previews, {})
-            self.assertFalse(self.window.settings.value("view/show_all_cameras", True, bool))
+            self.assertFalse(self.window.camera_visible(garden.uid))
 
     def test_video_frame_preserves_aspect_ratio_when_resized(self) -> None:
         video = QWidget()
