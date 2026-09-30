@@ -352,7 +352,7 @@ class ImouAccountUiTest(unittest.TestCase):
             transport.return_value.close.assert_called_once()
             self.assertEqual(worker.recording_tunnels, {})
 
-    def test_quality_uses_shared_controls_and_failed_open_preserves_live_transport(self):
+    def test_failed_quality_change_preserves_live_transport(self):
         camera = imou_account_camera(ACCOUNT, DEVICE)
         worker = RtspStreamWorker(camera, Mock(), Path("/tmp/test.sock"))
         worker.imou_client = Mock()
@@ -365,14 +365,8 @@ class ImouAccountUiTest(unittest.TestCase):
             self.assertEqual(worker.quality, "HD")
             previous.close.assert_not_called()
             transport.return_value.close.assert_called_once()
-        self.window.selected_device = camera
-        self.window.stream_worker = worker
-        self.window.stream_live = True
-        self.window.on_capabilities_found(["HD", "SD"], None)
-        self.assertTrue(self.window.quality_button.isEnabled())
         self.assertTrue(worker.queue_setting("quality", "SD"))
         self.assertFalse(worker.queue_setting("quality", "LD"))
-        self.window.stream_worker = None
 
     def test_cloud_continuous_recording_requires_account_opt_in(self):
         worker = RtspStreamWorker(imou_account_camera(ACCOUNT, DEVICE), Mock(), Path("/tmp/test.sock"))

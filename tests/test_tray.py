@@ -608,22 +608,17 @@ class TrayTest(unittest.TestCase):
         self.assertEqual(local_replays, [camera])
         preview.close()
 
-    def test_okam_preview_light_and_quality_target_its_worker(self) -> None:
+    def test_okam_preview_light_targets_its_worker(self) -> None:
         camera = SimpleNamespace(name="Jardin", uid="garden")
         preview = CameraPreview(camera, settings=self.window.settings)
         preview.worker = StreamWorker(camera, "", io.BytesIO())
         preview.live = True
         preview._on_capabilities(["HD"], False)
         self.assertTrue(preview.light_action.isVisible())
-        self.assertTrue(preview.quality_actions["HD"].isVisible())
         preview.toggle_light()
         self.assertEqual(preview.worker.settings.get_nowait(), ("light", True))
         preview._on_setting_completed("light", True)
         self.assertEqual(preview.light_action.text(), "Turn white light off")
-        preview.choose_quality("HD")
-        self.assertEqual(preview.worker.settings.get_nowait(), ("quality", "HD"))
-        preview._on_setting_completed("quality", "HD")
-        self.assertEqual(self.window.settings.value("camera/quality/garden"), "HD")
         preview.close()
 
     def test_preview_camera_playback_selects_its_own_feed(self) -> None:
@@ -787,7 +782,6 @@ class TrayTest(unittest.TestCase):
                 self.window.on_stream_finished()
             self.assertEqual(started, ["entrance"])
             self.assertEqual(self.window.settings.value("camera/selected_uid"), "entrance")
-            self.assertEqual(self.window.quality_button.text(), "Auto")
 
     def test_recording_badge_shows_elapsed_time(self) -> None:
         self.window.show()
