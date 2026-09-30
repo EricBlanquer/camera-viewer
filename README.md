@@ -171,10 +171,10 @@ If the camera rejects the connection, `.venv/bin/python app.py --camera-password
 
 ## Samsung TV
 
-The [Samsung TV application](tv/README.md) connects directly from the TV to iCam365 and O-KAM cameras and displays a fixed four-cell grid.
+The [Samsung TV application](tv/README.md) connects from the TV to iCam365, O-KAM, and Imou Life cameras and displays a fixed four-cell grid with an opaque black background.
 Each camera occupies one quarter of the screen, and the diagnostic panel hides when live video appears.
 The last image remains visible during reconnection, and the grid omits camera titles and unused-cell labels.
-The ARM NaCl build was tested with Entrée and Jardin on a 2019 Samsung QE55Q85R running Tizen 5.0; video decoding runs on the TV without a PC gateway.
+The ARM NaCl build was tested with Entrée, Jardin, and Cuisine on a 2019 Samsung QE55Q85R running Tizen 5.0; video decoding runs on the TV without a PC gateway.
 Build, signing, private configuration, and remote-control instructions are in the TV guide.
 
 ## Source and limits

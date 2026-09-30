@@ -26,12 +26,18 @@ function validateConfiguration(configuration) {
   ) throw new Error("Configure between one and four cameras");
   configuration.forEach((camera) => {
     if (
-      !camera || !["icam365", "okam"].includes(camera.type) ||
+      !camera || !["icam365", "okam", "imou"].includes(camera.type) ||
       typeof camera.name !== "string" || !camera.name ||
       camera.name.length > 128
     ) throw new Error("Invalid camera configuration");
-    new CameraProtocol.NativeSession(camera, transport, {});
+    createSession(camera, {});
   });
+}
+function createSession(camera, callbacks) {
+  const Session = camera.type === "imou"
+    ? ImouVideo.Session
+    : CameraProtocol.NativeSession;
+  return new Session(camera, transport, callbacks);
 }
 function configure(configuration) {
   validateConfiguration(configuration);
@@ -120,6 +126,11 @@ class CameraPane {
     if (!camera || !this.camera || camera.type !== this.camera.type) {
       return false;
     }
+    if (camera.type === "imou") {
+      return camera.device_id === this.camera.device_id &&
+        camera.channel_id === this.camera.channel_id &&
+        camera.account.app_id === this.camera.account.app_id;
+    }
     return camera.type === "okam"
       ? camera.uid === this.camera.uid
       : camera.p2p_id === this.camera.p2p_id;
@@ -151,7 +162,7 @@ class CameraPane {
       config = Object.assign({}, config, {
         local_host: webapis.network.getIp(),
       });
-      this.session = new CameraProtocol.NativeSession(config, transport, {
+      this.session = createSession(config, {
         status: (message) => this.status(message),
         video: (payload, codec) => this.video(payload, codec),
         error: (message, relay) => this.failed(message, relay),
@@ -171,6 +182,7 @@ class CameraPane {
       generation: this.generation,
       codec,
       key: CameraProtocol.isKeyframe(payload, codec),
+      burst: this.camera.type === "imou",
       data: payload.buffer.slice(
         payload.byteOffset,
         payload.byteOffset + payload.byteLength,
@@ -207,6 +219,7 @@ class CameraPane {
       refreshOverlay();
     }
     this.lastProgress = now;
+    this.metrics.lastFrame = Date.now();
     this.metrics.playtime = Math.round(now - this.firstFrame);
     this.metrics.decoded++;
   }

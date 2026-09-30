@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 const protocol = require("../web/protocol.js");
+const imou = require("../web/imou.js");
 function viewer() {
   const listeners = {};
   const intervals = [];
@@ -73,6 +74,21 @@ function viewer() {
     }
     event() {}
   }
+  class ImouSession extends Session {
+    constructor(config, native, callbacks) {
+      super(
+        {
+          type: "icam365",
+          p2p_id: "TEST-9-ABCDE",
+          p2p_platform: "ppcs:EBGIEABAKIIMGMIMFJ",
+          password: "test",
+        },
+        native,
+        callbacks,
+      );
+      imou.validate(config);
+    }
+  }
   const context = vm.createContext({
     document,
     window: {},
@@ -80,6 +96,7 @@ function viewer() {
     performance: { now: () => now },
     localStorage: { getItem: () => null, setItem: () => {} },
     CameraProtocol: Object.assign({}, protocol, { NativeSession: Session }),
+    ImouVideo: Object.assign({}, imou, { Session: ImouSession }),
     webapis: { network: { getIp: () => "192.0.2.10" } },
     setInterval: (callback) => intervals.push(callback),
     clearInterval: () => {},
@@ -207,6 +224,36 @@ test("camera names and empty-cell labels are absent from the video grid", async 
   for (let index = 1; index < 4; index++) {
     assert.equal(app.pane(index).statusElement.textContent, "");
   }
+});
+test("an Imou pane plays independently and retains only its own camera image", async () => {
+  const app = viewer();
+  const kitchen = {
+    type: "imou",
+    name: "Kitchen",
+    device_id: "testKitchen",
+    channel_id: "0",
+    account: { app_id: "testApp", app_secret: "testSecret", region: "Europe" },
+  };
+  app.context.window.cameraViewer.configure([app.camera, {
+    ...app.camera,
+    p2p_id: "TEST-2-ABCDE",
+  }, kitchen]);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  [0, 1, 2].forEach((index) => app.render(index));
+  const pane = app.pane(2);
+  const image = pane.canvas.image;
+  const firstSession = app.pane(0).session;
+  const secondSession = app.pane(1).session;
+  await pane.connect({ ...kitchen });
+  assert.equal(pane.canvas.image, image);
+  assert.equal(app.pane(0).session, firstSession);
+  assert.equal(app.pane(1).session, secondSession);
+  await pane.connect({ ...kitchen, channel_id: "1" });
+  assert.equal(pane.canvas.image, null);
+  app.render(2);
+  assert.equal(app.context.window.cameraViewer.state()[2].state, "playing");
+  assert.equal(app.pane(3).statusElement.textContent, "");
 });
 test("stalled rendering closes only the affected connection", async () => {
   const app = viewer();

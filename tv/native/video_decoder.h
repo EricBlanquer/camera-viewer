@@ -22,20 +22,24 @@ class VideoDecoder {
     callbacks_.CancelAll();
     Release();
   }
-  void Submit(const std::string& bytes, int codec, int generation, bool key) {
+  void Submit(const std::string& bytes, int codec, int generation, bool key, bool burst) {
     if (!running_) { Error("Decoder worker unavailable", generation); return; }
     if (generation != input_generation_) { input_generation_ = generation; waiting_key_ = true; }
-    if (pending_.load() >= MAX_PENDING) { waiting_key_ = true; return; }
+    if (pending_.load() >= (burst ? MAX_BURST_PENDING : MAX_PENDING) || pending_bytes_.load() + bytes.size() > MAX_PENDING_BYTES) { waiting_key_ = true; return; }
     if (waiting_key_ && !key) return;
     bool reset = waiting_key_;
     waiting_key_ = false;
     pending_++;
+    pending_bytes_ += bytes.size();
     auto callback = callbacks_.NewCallback(&VideoDecoder::Decode, DecodeRequest{bytes, codec, generation, reset});
-    if (worker_.message_loop().PostWork(callback) != PP_OK) { pending_--; Error("Decoder worker stopped", generation); }
+    if (worker_.message_loop().PostWork(callback) != PP_OK) { Complete(bytes.size()); Error("Decoder worker stopped", generation); }
   }
  private:
   static const int MAX_PENDING = 4;
+  static const int MAX_BURST_PENDING = 32;
+  static const size_t MAX_PENDING_BYTES = 16 * 1024 * 1024;
   struct DecodeRequest { std::string bytes; int codec; int generation; bool reset; };
+  void Complete(size_t size) { pending_bytes_ -= size; pending_--; }
   void Release() {
     avcodec_free_context(&context_);
     av_frame_free(&frame_);
@@ -70,18 +74,18 @@ class VideoDecoder {
     int codec = request.codec;
     int generation = request.generation;
     bool reset = request.reset;
-    if (status != PP_OK) { pending_--; return; }
-    if ((!context_ || codec != codec_ || generation != generation_) && !Initialize(codec, generation)) { Error("Video decoder initialization failed", generation); pending_--; return; }
+    if (status != PP_OK) { Complete(bytes.size()); return; }
+    if ((!context_ || codec != codec_ || generation != generation_) && !Initialize(codec, generation)) { Error("Video decoder initialization failed", generation); Complete(bytes.size()); return; }
     else if (reset) avcodec_flush_buffers(context_);
     AVPacket* packet = av_packet_alloc();
-    if (!packet || av_new_packet(packet, bytes.size()) < 0) { av_packet_free(&packet); Error("Video decoder allocation failed", generation); pending_--; return; }
+    if (!packet || av_new_packet(packet, bytes.size()) < 0) { av_packet_free(&packet); Error("Video decoder allocation failed", generation); Complete(bytes.size()); return; }
     std::memcpy(packet->data, bytes.data(), bytes.size());
     int code = avcodec_send_packet(context_, packet);
     if (code == AVERROR(EAGAIN)) { Drain(generation); code = avcodec_send_packet(context_, packet); }
     av_packet_free(&packet);
-    if (code < 0 && code != AVERROR(EAGAIN)) { Error("Camera video could not be decoded", generation); pending_--; return; }
+    if (code < 0 && code != AVERROR(EAGAIN)) { Error("Camera video could not be decoded", generation); Complete(bytes.size()); return; }
     Drain(generation);
-    pending_--;
+    Complete(bytes.size());
   }
   void Drain(int generation) { while (avcodec_receive_frame(context_, frame_) == 0) Render(generation); }
   void Render(int generation) {
@@ -110,6 +114,7 @@ class VideoDecoder {
   pp::SimpleThread worker_;
   pp::CompletionCallbackFactory<VideoDecoder> callbacks_;
   std::atomic<int> pending_{0};
+  std::atomic<size_t> pending_bytes_{0};
   bool waiting_key_ = true;
   bool running_ = false;
   AVCodecContext* context_ = nullptr;
