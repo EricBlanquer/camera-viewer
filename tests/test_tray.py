@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PyQt6.QtCore import QObject, QSettings, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, QSettings, Qt, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QPushButton, QSystemTrayIcon, QWidget
 
 from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
@@ -289,6 +289,69 @@ class TrayTest(unittest.TestCase):
             self.window.sync_previews()
             self.assertEqual(self.window.effective_camera_layout(), "vertical")
             self.assertIs(self.window.video_grid.itemAtPosition(1, 0).widget(), self.window.previews["rtsp:entrance"])
+
+    def test_grid_keeps_three_equal_panes_and_a_transparent_fourth_cell(self) -> None:
+        cameras = [
+            SimpleNamespace(name="Garden", uid="garden"),
+            RtspCamera("rtsp:entrance", "Entrance", "rtsp://192.0.2.10:554/stream"),
+            RtspCamera("rtsp:kitchen", "Kitchen", "rtsp://192.0.2.11:554/stream"),
+        ]
+        self.window.devices = cameras
+        self.window.selected_device = cameras[0]
+        with patch.object(CameraPreview, "start") as start, patch.object(self.window, "fit_video_aspect"):
+            self.window.set_camera_layout("grid")
+            self.window.show()
+            for width, height in ((600, 800), (720, 640)):
+                self.window.resize(width, height)
+                self.application.processEvents()
+                self.assertEqual(self.window.effective_camera_layout(), "grid")
+                self.window.update_camera_mask()
+                panes = [self.window.primary_pane, *self.window.previews.values()]
+                for index, pane in enumerate(panes):
+                    row, column = divmod(index, 2)
+                    self.assertIs(self.window.video_grid.itemAtPosition(row, column).widget(), pane)
+                    self.assertLessEqual(abs(pane.width() - panes[0].width()), 1)
+                    self.assertLessEqual(abs(pane.height() - panes[0].height()), 1)
+                    self.assertTrue(self.window.mask().contains(pane.mapTo(self.window, pane.rect().center())))
+                empty = self.window.video_grid.cellRect(1, 1)
+                offset = self.window.centralWidget().mapTo(self.window, QPoint())
+                self.assertIsNone(self.window.video_grid.itemAtPosition(1, 1))
+                self.assertGreater(empty.width(), 0)
+                self.assertGreater(empty.height(), 0)
+                self.assertFalse(self.window.mask().contains(empty.center() + offset))
+            self.assertEqual(self.window.settings.value("view/camera_layout"), "grid")
+            self.window.set_camera_layout("vertical")
+            self.application.processEvents()
+            self.assertTrue(self.window.mask().isEmpty())
+            self.assertEqual(self.window.video_grid.columnStretch(1), 0)
+            self.window.set_camera_layout("grid")
+            fourth = RtspCamera("rtsp:office", "Office", "rtsp://192.0.2.12:554/stream")
+            self.window.devices.append(fourth)
+            self.window.sync_previews()
+            self.application.processEvents()
+            self.assertTrue(self.window.mask().isEmpty())
+            self.assertIs(self.window.video_grid.itemAtPosition(1, 1).widget(), self.window.previews[fourth.uid])
+            self.assertEqual(start.call_count, 3)
+
+    def test_grid_reserves_empty_cells_and_clears_transparency_without_cameras(self) -> None:
+        camera = SimpleNamespace(name="Garden", uid="garden")
+        self.window.devices = [camera]
+        self.window.device_accounts = {camera.uid: "account@example.com"}
+        self.window.selected_device = camera
+        with patch.object(self.window, "fit_video_aspect"):
+            self.window.set_camera_layout("grid")
+            self.window.show()
+            self.application.processEvents()
+            self.window.update_camera_mask()
+            self.assertEqual(self.window.camera_grid_dimensions(), (2, 2))
+            offset = self.window.centralWidget().mapTo(self.window, QPoint())
+            for row, column in ((0, 1), (1, 0), (1, 1)):
+                self.assertFalse(self.window.mask().contains(self.window.video_grid.cellRect(row, column).center() + offset))
+            self.window.set_camera_visible(camera.uid, False)
+            self.application.processEvents()
+            self.assertTrue(self.window.mask().isEmpty())
+            self.assertTrue(self.window.empty_camera_label.isVisible())
+            self.assertEqual(self.window.camera_grid_dimensions(), (1, 1))
 
     def test_each_video_opens_only_its_own_controls_on_click(self) -> None:
         garden = SimpleNamespace(name="Jardin", uid="garden")

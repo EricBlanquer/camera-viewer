@@ -45,6 +45,7 @@ from PyQt6.QtGui import (
     QMoveEvent,
     QPainter,
     QPen,
+    QRegion,
     QResizeEvent,
     QShowEvent,
     QWheelEvent,
@@ -132,6 +133,10 @@ ACCOUNT_REJECTED_MESSAGE = "O-KAM account login was rejected."
 ACCOUNT_INPUT_MESSAGE = "Enter your O-KAM account and password."
 ACCOUNT_LOADING_MESSAGE = "An account is already loading."
 CAMERA_SOURCE_LABELS = ("O-KAM account", "RTSP camera", "Imou Life camera (local)")
+CAMERA_LAYOUTS = (("horizontal", "Side by side"), ("vertical", "Stacked"), ("grid", "Grid 2 × 2"))
+CAMERA_LAYOUT_VALUES = tuple(value for value, label in CAMERA_LAYOUTS)
+CAMERA_GRID_COLUMNS = 2
+CAMERA_GRID_MIN_ROWS = 2
 FORM_ERROR_STYLE = "color: #bd4242;"
 ACCOUNT_ERROR_STYLE = "color: #ffb4ab; background-color: #3d2020; padding: 8px;"
 WAKE_SOURCE = Path.home() / ".local/share/okam-linux/vendor/device_wakeup_server.dart"
@@ -4472,6 +4477,9 @@ class MainWindow(QMainWindow):
         self.layout_refresh_timer = QTimer(self)
         self.layout_refresh_timer.setSingleShot(True)
         self.layout_refresh_timer.timeout.connect(self.sync_previews)
+        self.camera_mask_timer = QTimer(self)
+        self.camera_mask_timer.setSingleShot(True)
+        self.camera_mask_timer.timeout.connect(self.update_camera_mask)
         self.pending_camera: tuple[str, str] | None = None
         self.pending_camera_replay: str | None = None
         self.pending_selection_start: tuple[str, bool] | None = None
@@ -4741,7 +4749,7 @@ class MainWindow(QMainWindow):
         self.cameras_menu.aboutToShow.connect(self.update_cameras_menu)
         self.camera_layout_menu = menu.addMenu("Camera layout")
         layout_group = QActionGroup(self)
-        for value, label in (("horizontal", "Side by side"), ("vertical", "Stacked")):
+        for value, label in CAMERA_LAYOUTS:
             action = self.camera_layout_menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(value == self.camera_layout())
@@ -5113,11 +5121,11 @@ class MainWindow(QMainWindow):
 
     def camera_layout(self) -> str:
         value = self.settings.value(MULTIVIEW_LAYOUT_SETTING, "horizontal", str)
-        return value if value in ("horizontal", "vertical") else "horizontal"
+        return value if value in CAMERA_LAYOUT_VALUES else "horizontal"
 
     def effective_camera_layout(self) -> str:
         preferred = self.camera_layout()
-        if not self.isVisible() or len(self.visible_devices()) < 2:
+        if preferred == "grid" or not self.isVisible() or len(self.visible_devices()) < 2:
             return preferred
         screen = self.screen() or QApplication.primaryScreen()
         available = screen.availableGeometry()
@@ -5128,11 +5136,39 @@ class MainWindow(QMainWindow):
         return preferred
 
     def set_camera_layout(self, value: str) -> None:
-        if value not in ("horizontal", "vertical"):
+        if value not in CAMERA_LAYOUT_VALUES:
             return
         self.settings.setValue(MULTIVIEW_LAYOUT_SETTING, value)
         self.settings.sync()
         self.sync_previews()
+
+    def camera_grid_dimensions(self) -> tuple[int, int]:
+        count = len(self.visible_devices())
+        layout = self.effective_camera_layout()
+        if not count:
+            return 1, 1
+        if layout == "grid":
+            return CAMERA_GRID_COLUMNS, max(CAMERA_GRID_MIN_ROWS, math.ceil(count / CAMERA_GRID_COLUMNS))
+        columns = 1 if layout == "vertical" or count == 1 else CAMERA_GRID_COLUMNS
+        return columns, math.ceil(count / columns)
+
+    def update_camera_mask(self) -> None:
+        count = len(self.visible_devices())
+        if self.effective_camera_layout() != "grid" or not count:
+            self.clearMask()
+            return
+        columns, rows = self.camera_grid_dimensions()
+        if count == columns * rows:
+            self.clearMask()
+            return
+        self.video_grid.activate()
+        region = QRegion(self.rect())
+        offset = self.centralWidget().mapTo(self, QPoint())
+        for index in range(count, columns * rows):
+            row, column = divmod(index, columns)
+            region = region.subtracted(QRegion(self.video_grid.cellRect(row, column).translated(offset)))
+        if region != self.mask():
+            self.setMask(region)
 
     def ordered_devices(self) -> list[AccountDevice | RtspCamera]:
         try:
@@ -5184,6 +5220,8 @@ class MainWindow(QMainWindow):
             self.watch_live()
 
     def sync_previews(self) -> None:
+        if self.quit_requested or self.close_pending:
+            return
         selected = getattr(self, "selected_device", None)
         visible = self.visible_devices()
         cameras = [camera for camera in visible if selected is None or camera.uid != selected.uid]
@@ -5200,10 +5238,13 @@ class MainWindow(QMainWindow):
         self.empty_camera_label.setVisible(not visible)
         if not visible:
             self.video_grid.addWidget(self.empty_camera_label, 0, 0)
-        self.video_grid.setColumnStretch(0, 1)
-        self.video_grid.setColumnStretch(1, 1 if layout == "horizontal" and len(visible) > 1 else 0)
+        columns, rows = self.camera_grid_dimensions()
+        for column in range(max(columns, self.video_grid.columnCount())):
+            self.video_grid.setColumnStretch(column, 1 if column < columns else 0)
+        for row in range(max(rows, self.video_grid.rowCount())):
+            self.video_grid.setRowStretch(row, 1 if row < rows else 0)
         for index, camera in enumerate(visible):
-            row, column = (index, 0) if layout == "vertical" else (index // 2, index % 2)
+            row, column = divmod(index, columns)
             if selected is not None and camera.uid == selected.uid:
                 self.video_grid.addWidget(self.primary_pane, row, column)
                 continue
@@ -5227,6 +5268,7 @@ class MainWindow(QMainWindow):
             else:
                 self.video_grid.addWidget(preview, row, column)
         self.preview_layout = layout
+        self.camera_mask_timer.start(0)
         if len(cameras) == 1 and layout == "horizontal" and self.width() < 1120:
             self.resize(1120, self.height())
         if changed:
@@ -6027,8 +6069,7 @@ class MainWindow(QMainWindow):
         count = len(self.visible_devices())
         if not count:
             return
-        columns = 1 if self.effective_camera_layout() == "vertical" or count == 1 else 2
-        rows = (count + columns - 1) // columns
+        columns, rows = self.camera_grid_dimensions()
         label_height = self.primary_label.sizeHint().height()
         available_height = QApplication.primaryScreen().availableGeometry().height() - 80
         width = self.width()
@@ -6045,6 +6086,8 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if getattr(self, "previews", None) and self.effective_camera_layout() != self.preview_layout:
             self.layout_refresh_timer.start(0)
+        if getattr(self, "camera_mask_timer", None) is not None:
+            self.camera_mask_timer.start(0)
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
@@ -6345,6 +6388,7 @@ class MainWindow(QMainWindow):
             return
         self.reconnect_timer.stop()
         self.layout_refresh_timer.stop()
+        self.camera_mask_timer.stop()
         self.retry_pending = False
         for uid in list(self.local_replays):
             self.close_local_replay(uid)
