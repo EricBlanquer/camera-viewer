@@ -347,11 +347,30 @@ class TrayTest(unittest.TestCase):
             offset = self.window.centralWidget().mapTo(self.window, QPoint())
             for row, column in ((0, 1), (1, 0), (1, 1)):
                 self.assertFalse(self.window.mask().contains(self.window.video_grid.cellRect(row, column).center() + offset))
+            top_right = self.window.video_grid.cellRect(0, 1)
+            self.assertFalse(self.window.mask().contains(QPoint(top_right.center().x(), top_right.bottom() + 1) + offset))
             self.window.set_camera_visible(camera.uid, False)
             self.application.processEvents()
             self.assertTrue(self.window.mask().isEmpty())
             self.assertTrue(self.window.empty_camera_label.isVisible())
             self.assertEqual(self.window.camera_grid_dimensions(), (1, 1))
+
+    def test_grid_with_two_cameras_has_no_separator_in_the_empty_row(self) -> None:
+        self.window.devices = [
+            SimpleNamespace(name="Garden", uid="garden"),
+            RtspCamera("rtsp:entrance", "Entrance", "rtsp://192.0.2.10:554/stream"),
+        ]
+        self.window.selected_device = self.window.devices[0]
+        with patch.object(CameraPreview, "start"), patch.object(self.window, "fit_video_aspect"):
+            self.window.set_camera_layout("grid")
+            self.window.show()
+            self.application.processEvents()
+            self.window.update_camera_mask()
+            offset = self.window.centralWidget().mapTo(self.window, QPoint())
+            bottom_left = self.window.video_grid.cellRect(1, 0)
+            bottom_right = self.window.video_grid.cellRect(1, 1)
+            for x in range(bottom_left.right() + 1, bottom_right.left()):
+                self.assertFalse(self.window.mask().contains(QPoint(x, bottom_left.center().y()) + offset))
 
     def test_each_video_opens_only_its_own_controls_on_click(self) -> None:
         garden = SimpleNamespace(name="Jardin", uid="garden")

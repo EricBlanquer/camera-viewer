@@ -44,6 +44,7 @@ The submenu can also remove the selected local camera.
 Use **Camera layout > Side by side** or **Stacked** to place the feeds horizontally or vertically; the layout choice is remembered.
 Use **Camera layout > Grid 2 × 2** for two columns and at least two rows, with empty cells transparent to the desktop.
 With three cameras, the fourth cell stays empty; additional cameras extend the grid by rows.
+Adjacent empty cells form one transparent area without separators.
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 The grid keeps its saved layout when docked.
 Drag one camera title onto another to exchange their positions; the order is remembered without restarting either stream.

@@ -5162,11 +5162,16 @@ class MainWindow(QMainWindow):
             self.clearMask()
             return
         self.video_grid.activate()
-        region = QRegion(self.rect())
         offset = self.centralWidget().mapTo(self, QPoint())
-        for index in range(count, columns * rows):
+        region = QRegion(self.rect()).subtracted(QRegion(self.video_grid.geometry().translated(offset)))
+        for index in range(count):
             row, column = divmod(index, columns)
-            region = region.subtracted(QRegion(self.video_grid.cellRect(row, column).translated(offset)))
+            cell = self.video_grid.cellRect(row, column)
+            region = region.united(QRegion(cell.translated(offset)))
+            if column:
+                region = region.united(QRegion(cell.united(self.video_grid.cellRect(row, column - 1)).translated(offset)))
+            if row:
+                region = region.united(QRegion(cell.united(self.video_grid.cellRect(row - 1, column)).translated(offset)))
         if region != self.mask():
             self.setMask(region)
 
