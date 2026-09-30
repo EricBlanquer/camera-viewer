@@ -524,7 +524,8 @@ class ImouAccountUiTest(unittest.TestCase):
         with patch("app.subprocess.Popen") as player:
             preview.start()
             player.assert_not_called()
-        self.assertIn(IMOU_PRIVACY_MESSAGE, preview.label.text())
+        self.assertIn(IMOU_PRIVACY_MESSAGE, preview.status_overlay.label.text())
+        self.assertFalse(preview.status_overlay.timer.isActive())
         self.assertFalse(preview.retry_timer.isActive())
         preview.stop()
         self.window.devices = [camera]

@@ -233,7 +233,7 @@ class TrayTest(unittest.TestCase):
             self.assertIs(self.window.primary_frame.parentWidget(), self.window.primary_video_stack)
             self.assertIs(self.window.previews[entrance.uid].frame.parentWidget(), self.window.previews[entrance.uid].video_stack)
             self.assertIs(self.window.video_grid.itemAtPosition(0, 1).widget(), self.window.previews[entrance.uid])
-            self.window.primary_label.moved.emit(garden.uid, entrance.uid)
+            self.window.swap_cameras(garden.uid, entrance.uid)
             self.assertEqual([camera.uid for camera in self.window.ordered_devices()], [entrance.uid, garden.uid])
             self.assertIs(self.window.video_grid.itemAtPosition(0, 0).widget(), self.window.previews[entrance.uid])
             self.window.set_camera_layout("vertical")
@@ -410,7 +410,6 @@ class TrayTest(unittest.TestCase):
             preview = self.window.previews[entrance.uid]
             self.assertFalse(self.window.overlay.isVisible())
             self.assertFalse(preview.overlay.isVisible())
-            self.assertEqual(preview.label.parentWidget().findChildren(QPushButton), [])
             self.window.video.clicked.emit()
             self.assertTrue(self.window.overlay.isVisible())
             self.assertFalse(preview.overlay.isVisible())
@@ -706,7 +705,7 @@ class TrayTest(unittest.TestCase):
             self.assertEqual(fullscreen.call_count, 3)
         self.window.on_stream_status("Live video")
         self.assertEqual(self.window.windowTitle(), "Camera Viewer")
-        self.assertEqual(self.window.primary_label.text(), "Jardin · Live video")
+        self.assertEqual(self.window.video.camera_uid, garden.uid)
 
     def test_local_replay_excludes_the_open_recording(self) -> None:
         camera = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")

@@ -31,15 +31,12 @@ from dataclasses import asdict, dataclass, replace
 from typing import BinaryIO, Callable
 from datetime import datetime, timedelta, timezone
 
-from PyQt6.QtCore import QEvent, QMimeData, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QDesktopServices,
     QActionGroup,
     QColor,
-    QDrag,
-    QDragEnterEvent,
-    QDropEvent,
     QIcon,
     QMouseEvent,
     QMoveEvent,
@@ -126,8 +123,6 @@ CAMERA_VISIBLE_SETTING = "view/camera_visible"
 NO_VISIBLE_CAMERAS_MESSAGE = "No cameras selected."
 MULTIVIEW_LAYOUT_SETTING = "view/camera_layout"
 CAMERA_ORDER_SETTING = "view/camera_order"
-CAMERA_DRAG_MIME = "application/x-camera-viewer-uid"
-CAMERA_LABEL_STYLE = "color: white; background-color: #242424; padding: 5px 10px;"
 LOG = logging.getLogger("okam-linux")
 LOG_DIRECTORY = Path.home() / ".cache/okam-linux"
 LOG_FILE_NAME = "okam-linux.log"
@@ -1314,7 +1309,7 @@ class VideoStatusOverlay(ControlsOverlay):
         video.set_status_overlay(self)
         self.hide()
 
-    def display(self, message: str) -> None:
+    def display(self, message: str, persistent: bool = False) -> None:
         if message.startswith("Playback "):
             self.timer.stop()
             self.hide()
@@ -1323,9 +1318,12 @@ class VideoStatusOverlay(ControlsOverlay):
         self.label.setWordWrap(self.parentWidget().width() < 400)
         self.adjustSize()
         self.parentWidget().place_overlay()
-        self.show()
-        self.raise_()
-        if message.startswith("Loading") or message.startswith("Looking"):
+        if self.parentWidget().isVisible():
+            self.show()
+            self.raise_()
+        else:
+            self.hide()
+        if persistent or message.startswith("Loading") or message.startswith("Looking"):
             self.timer.stop()
         else:
             self.timer.start(NOTICE_MS)
@@ -2473,11 +2471,17 @@ class VideoWidget(QWidget):
     drag_moved = pyqtSignal(int, int)
     wheel_zoomed = pyqtSignal(int, int, int)
     double_clicked = pyqtSignal(int, int)
+    camera_drop_requested = pyqtSignal(str, QPoint)
 
     def __init__(self) -> None:
         super().__init__()
         self.drag_start: tuple[int, int] | None = None
         self.drag_last: tuple[int, int] | None = None
+        self.camera_uid = ""
+        self.reorder_enabled = False
+        self.drag_camera_uid = ""
+        self.drag_exceeded = False
+        self.drag_button = Qt.MouseButton.NoButton
         self.click_timer = QTimer(self)
         self.click_timer.setSingleShot(True)
         self.click_timer.timeout.connect(self.clicked.emit)
@@ -2569,9 +2573,12 @@ class VideoWidget(QWidget):
             self.x_display.flush()
         self.place_overlay()
 
-    def _start_drag(self, x: int, y: int) -> None:
+    def _start_drag(self, x: int, y: int, button: Qt.MouseButton = Qt.MouseButton.LeftButton) -> None:
         self.drag_start = (x, y)
         self.drag_last = (x, y)
+        self.drag_button = button
+        self.drag_camera_uid = self.camera_uid if self.reorder_enabled and button == Qt.MouseButton.LeftButton else ""
+        self.drag_exceeded = False
 
     def _move_drag(self, x: int, y: int) -> None:
         if self.drag_last is None:
@@ -2579,6 +2586,12 @@ class VideoWidget(QWidget):
         dx = x - self.drag_last[0]
         dy = y - self.drag_last[1]
         self.drag_last = (x, y)
+        if self.drag_camera_uid:
+            if abs(x - self.drag_start[0]) + abs(y - self.drag_start[1]) >= QApplication.startDragDistance():
+                self.drag_exceeded = True
+                self.click_timer.stop()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
         if dx or dy:
             self.drag_moved.emit(dx, dy)
 
@@ -2589,6 +2602,16 @@ class VideoWidget(QWidget):
         dx = x - self.drag_start[0]
         dy = y - self.drag_start[1]
         self.drag_start = None
+        if self.drag_camera_uid:
+            self.unsetCursor()
+            if self.drag_exceeded or abs(dx) + abs(dy) >= QApplication.startDragDistance():
+                self.click_timer.stop()
+                self.camera_drop_requested.emit(self.drag_camera_uid, self.mapToGlobal(QPoint(x, y)))
+                return
+        if self.drag_button == Qt.MouseButton.RightButton:
+            if abs(dx) >= DRAG_PIXELS_PER_STEP // 2 or abs(dy) >= DRAG_PIXELS_PER_STEP // 2:
+                self.dragged.emit(dx, dy)
+            return
         if abs(dx) < DRAG_PIXELS_PER_STEP // 2 and abs(dy) < DRAG_PIXELS_PER_STEP // 2:
             if self.click_timer.isActive():
                 self.click_timer.stop()
@@ -2599,8 +2622,8 @@ class VideoWidget(QWidget):
             self.dragged.emit(dx, dy)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._start_drag(round(event.position().x()), round(event.position().y()))
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            self._start_drag(round(event.position().x()), round(event.position().y()), event.button())
             event.accept()
         else:
             super().mousePressEvent(event)
@@ -2615,7 +2638,7 @@ class VideoWidget(QWidget):
             )
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == self.drag_button:
             self._finish_drag(round(event.position().x()), round(event.position().y()))
             event.accept()
         else:
@@ -2642,10 +2665,12 @@ class VideoWidget(QWidget):
                 motion = None
             if event.type == X11.ButtonPress and event.detail in (X11_WHEEL_UP, X11_WHEEL_DOWN):
                 self.wheel_zoomed.emit(1 if event.detail == X11_WHEEL_UP else -1, event.event_x, event.event_y)
-            elif event.type == X11.ButtonPress and event.detail == 1:
-                self._start_drag(event.event_x, event.event_y)
-            elif event.type == X11.ButtonRelease and event.detail == 1 and self.drag_start is not None:
-                self._finish_drag(event.event_x, event.event_y)
+            elif event.detail in (1, 3):
+                button = Qt.MouseButton.LeftButton if event.detail == 1 else Qt.MouseButton.RightButton
+                if event.type == X11.ButtonPress:
+                    self._start_drag(event.event_x, event.event_y, button)
+                elif button == self.drag_button:
+                    self._finish_drag(event.event_x, event.event_y)
         if motion is not None:
             self._move_drag(*motion)
 
@@ -2671,48 +2696,6 @@ class AspectVideoFrame(QWidget):
         width = min(self.width(), round(self.height() * VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT))
         height = min(self.height(), round(width * VIDEO_ASPECT_HEIGHT / VIDEO_ASPECT_WIDTH))
         self.video.setGeometry((self.width() - width) // 2, (self.height() - height) // 2, width, height)
-
-
-class CameraTitle(QLabel):
-    moved = pyqtSignal(str, str)
-
-    def __init__(self, uid: str, text: str) -> None:
-        super().__init__(text)
-        self.uid = uid
-        self.drag_start: QPoint | None = None
-        self.setAcceptDrops(True)
-        self.setStyleSheet(CAMERA_LABEL_STYLE)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_start = event.position().toPoint()
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self.drag_start is None or not self.uid:
-            return
-        if (event.position().toPoint() - self.drag_start).manhattanLength() < QApplication.startDragDistance():
-            return
-        self.drag_start = None
-        data = QMimeData()
-        data.setData(CAMERA_DRAG_MIME, self.uid.encode("utf-8"))
-        drag = QDrag(self)
-        drag.setMimeData(data)
-        drag.exec(Qt.DropAction.MoveAction)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        self.drag_start = None
-        super().mouseReleaseEvent(event)
-
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasFormat(CAMERA_DRAG_MIME) and bytes(event.mimeData().data(CAMERA_DRAG_MIME)).decode("utf-8") != self.uid:
-            event.acceptProposedAction()
-
-    def dropEvent(self, event: QDropEvent) -> None:
-        source = bytes(event.mimeData().data(CAMERA_DRAG_MIME)).decode("utf-8")
-        if source != self.uid:
-            self.moved.emit(source, self.uid)
-            event.acceptProposedAction()
 
 
 class TimelineWidget(QWidget):
@@ -3687,16 +3670,8 @@ class CameraPreview(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        header = QWidget()
-        header.setStyleSheet("background-color: #242424;")
-        header.setFixedHeight(30)
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(0, 0, 4, 0)
-        header_layout.setSpacing(0)
-        self.label = CameraTitle(camera.uid, camera.name)
-        header_layout.addWidget(self.label, 1)
-        layout.addWidget(header)
         self.video = VideoWidget()
+        self.video.camera_uid = camera.uid
         self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.video.setStyleSheet("background-color: #171717;")
         self.video.clicked.connect(self.toggle_overlay)
@@ -3708,6 +3683,7 @@ class CameraPreview(QWidget):
         self.video_stack = QStackedWidget()
         self.video_stack.addWidget(self.frame)
         layout.addWidget(self.video_stack, 1)
+        self.status_overlay = VideoStatusOverlay(self.video)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
         self.overlay.setStyleSheet(CAMERA_CONTROLS_STYLE)
@@ -3816,6 +3792,13 @@ class CameraPreview(QWidget):
             button.clicked.connect(self.show_overlay)
         self.overlay.hide()
 
+    def show_status(self, message: str, persistent: bool = False) -> None:
+        if message == "Live video":
+            self.status_overlay.timer.stop()
+            self.status_overlay.hide()
+        else:
+            self.status_overlay.display(message, persistent)
+
     def show_overlay(self) -> None:
         if not self.isVisible():
             return
@@ -3865,11 +3848,11 @@ class CameraPreview(QWidget):
             self.rtsp_light_button.hide()
             self.rtsp_light_mode = None
             set_icam365_light_icon(self.rtsp_light_button, None)
-        self.label.setText(f"{self.camera.name} · Connecting...")
+        self.show_status("Connecting...", True)
         try:
             self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-mpv-")
         except OSError:
-            self.label.setText(f"{self.camera.name} · Player unavailable")
+            self.show_status("Player unavailable", True)
             self._retry()
             return
         socket_path = Path(self.mpv_directory.name) / "control.sock"
@@ -3891,7 +3874,7 @@ class CameraPreview(QWidget):
             if rtsp_camera is not None:
                 close_bridge(rtsp_camera.uid)
             message = str(ex) if isinstance(ex, CameraCredentialError) else "Player unavailable"
-            self.label.setText(f"{self.camera.name} · {message}")
+            self.show_status(message)
             self._cleanup_player()
             self._retry()
             return
@@ -3907,7 +3890,7 @@ class CameraPreview(QWidget):
                 continuous = ContinuousRecorder(continuous_directory(), continuous_prefix(self.camera))
             except OSError:
                 continuous = None
-                self.label.setText(f"{self.camera.name} · Unable to create the recording folder")
+                self.show_status("Unable to create the recording folder")
             self.worker = StreamWorker(
                 self.camera, stored_camera_password(self.camera.uid) or "", self.player.stdin, continuous,
             )
@@ -3952,12 +3935,12 @@ class CameraPreview(QWidget):
             if self.sound_button is not None and not isinstance(self.worker, RtspStreamWorker):
                 self.sound_button.setEnabled(True)
             self.set_movement_enabled(not isinstance(self.worker, RtspStreamWorker) or self.rtsp_ptz_available)
-        self.label.setText(f"{self.camera.name} · {message}")
+        self.show_status(message)
 
     def _on_failed(self, message: str) -> None:
         self.control_pending = False
         self.setting_pending = False
-        self.label.setText(f"{self.camera.name} · {message}")
+        self.show_status(message, True)
         self.retry_enabled = message not in (
             "The camera rejected the available credentials.", IMOU_PRIVACY_MESSAGE, IMOU_SECRET_MISSING_MESSAGE,
         )
@@ -4016,18 +3999,18 @@ class CameraPreview(QWidget):
             set_button_icon(self.record_button, "record", "Record video", 30)
 
     def _on_recording_started(self) -> None:
-        self.label.setText(f"{self.camera.name} · Recording video")
+        self.show_status("Recording video")
 
     def _on_recording_saved(self, path: str) -> None:
-        self.label.setText(f"{self.camera.name} · Live video")
+        self.show_status("Live video")
 
     def _on_recording_failed(self, message: str) -> None:
         self.recording_path = None
         set_button_icon(self.record_button, "record", "Record video", 30)
-        self.label.setText(f"{self.camera.name} · {message}")
+        self.show_status(message)
 
     def _on_continuous_failed(self, message: str) -> None:
-        self.label.setText(f"{self.camera.name} · {message}")
+        self.show_status(message)
 
     def _on_rtsp_light_available(self) -> None:
         if self.rtsp_light_button is not None and self.live:
@@ -4053,7 +4036,7 @@ class CameraPreview(QWidget):
     def _on_rtsp_light_failed(self) -> None:
         if self.rtsp_light_button is not None:
             self.rtsp_light_button.setEnabled(self.live)
-        self.label.setText(f"{self.camera.name} · Unable to change white light mode")
+        self.show_status("Unable to change white light mode")
 
     def _on_rtsp_ptz_available(self) -> None:
         if self.live and isinstance(self.worker, RtspStreamWorker):
@@ -4125,7 +4108,7 @@ class CameraPreview(QWidget):
     def _on_sound_failed(self, message: str) -> None:
         if self.sound_button is not None:
             self.sound_button.setEnabled(self.live)
-        self.label.setText(f"{self.camera.name} · {message}")
+        self.show_status(message)
 
     def move_camera(self, direction: str) -> None:
         if not self.live or self.control_pending:
@@ -4156,7 +4139,7 @@ class CameraPreview(QWidget):
 
     def _on_control_failed(self, message: str) -> None:
         self._on_control_finished("")
-        self.label.setText(f"{self.camera.name} · {message}")
+        self.show_status(message)
 
     def _on_capabilities(self, qualities: list[str], light_on: bool | None) -> None:
         self.light_on = light_on
@@ -4225,7 +4208,7 @@ class CameraPreview(QWidget):
             saved = self.settings.value(f"{QUALITY_SETTING}/{self.camera.uid}", "", str) if self.settings is not None else ""
             for quality, action in self.quality_actions.items():
                 action.setChecked(quality == saved)
-        self.label.setText(f"{self.camera.name} · {message}")
+        self.show_status(message)
 
     def _retry(self) -> None:
         if self.closing:
@@ -4244,6 +4227,7 @@ class CameraPreview(QWidget):
         if not enabled:
             self.overlay_timer.stop()
             self.hide_overlay()
+            self.status_overlay.hide()
         if isinstance(self.worker, StreamWorker):
             self.worker.set_display(enabled)
 
@@ -4257,6 +4241,8 @@ class CameraPreview(QWidget):
         self.retry_timer.stop()
         self.overlay_timer.stop()
         self.hide_overlay()
+        self.status_overlay.timer.stop()
+        self.status_overlay.hide()
         if self.worker is not None:
             self.worker.stop()
         else:
@@ -4429,8 +4415,6 @@ class LocalReplayPane(QWidget):
         self.remote_recordings: dict[Path, ImouRecording] = {}
         self.remote_days: set[datetime] = set()
         self.closing = False
-        self.live_title = ""
-        self.playback_title = f"{camera.name} · Playback"
         self.player: subprocess.Popen[bytes] | None = None
         self.mpv_directory: tempfile.TemporaryDirectory[str] | None = None
         self.socket_path: Path | None = None
@@ -4446,7 +4430,9 @@ class LocalReplayPane(QWidget):
         self.speed_index = 0
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         self.video = VideoWidget()
+        self.video.camera_uid = camera.uid
         self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.video.setStyleSheet("background-color: #171717;")
         self.video.clicked.connect(self.toggle_overlay)
@@ -5148,23 +5134,14 @@ class MainWindow(QMainWindow):
         self.video.drag_moved.connect(self.pan_zoomed_video)
         self.video.wheel_zoomed.connect(self.change_zoom)
         self.video.double_clicked.connect(lambda x, y: self.toggle_fullscreen())
+        self.video.camera_drop_requested.connect(self.drop_camera)
         self.video_grid = QGridLayout()
         self.video_grid.setContentsMargins(0, 0, 0, 0)
-        self.video_grid.setSpacing(2)
+        self.video_grid.setSpacing(0)
         self.primary_pane = QWidget()
         primary_layout = QVBoxLayout(self.primary_pane)
         primary_layout.setContentsMargins(0, 0, 0, 0)
         primary_layout.setSpacing(0)
-        primary_header = QWidget()
-        primary_header.setStyleSheet("background-color: #242424;")
-        primary_header.setFixedHeight(30)
-        primary_header_layout = QHBoxLayout(primary_header)
-        primary_header_layout.setContentsMargins(0, 0, 0, 0)
-        primary_header_layout.setSpacing(0)
-        self.primary_label = CameraTitle("", "")
-        self.primary_label.moved.connect(self.swap_cameras)
-        primary_header_layout.addWidget(self.primary_label, 1)
-        primary_layout.addWidget(primary_header)
         self.primary_frame = AspectVideoFrame(self.video)
         self.primary_video_stack = QStackedWidget()
         self.primary_video_stack.addWidget(self.primary_frame)
@@ -5621,10 +5598,9 @@ class MainWindow(QMainWindow):
             return
         replay.live_requested.connect(lambda uid=camera.uid: self.close_local_replay(uid))
         replay.fullscreen_requested.connect(self.toggle_fullscreen)
+        replay.video.reorder_enabled = len(self.visible_devices()) > 1
+        replay.video.camera_drop_requested.connect(self.drop_camera)
         self.local_replays[camera.uid] = replay
-        label = self.primary_label if selected else preview.label
-        replay.live_title = label.text()
-        label.setText(replay.playback_title)
         if selected:
             self.hide_overlay()
         else:
@@ -5642,16 +5618,11 @@ class MainWindow(QMainWindow):
         stack = self.primary_video_stack if uid == getattr(getattr(self, "selected_device", None), "uid", None) else (
             self.previews[uid].video_stack if uid in self.previews else None
         )
-        label = self.primary_label if stack is self.primary_video_stack else (
-            self.previews[uid].label if uid in self.previews else None
-        )
         replay.setParent(self)
         replay.hide()
         self.retired_replays.append(replay)
         replay.stopped.connect(lambda current=replay: self._local_replay_stopped(current))
         replay.stop()
-        if label is not None and label.text() == replay.playback_title:
-            label.setText(replay.live_title)
         if stack is not None:
             stack.setCurrentIndex(0)
             stack.removeWidget(replay)
@@ -5777,6 +5748,8 @@ class MainWindow(QMainWindow):
         return columns, math.ceil(count / columns)
 
     def update_camera_mask(self) -> None:
+        self.video_grid.activate()
+        self.place_video_overlays()
         count = len(self.visible_devices())
         if self.isFullScreen() or self.effective_camera_layout() != "grid" or not count:
             self.clearMask()
@@ -5785,7 +5758,6 @@ class MainWindow(QMainWindow):
         if count == columns * rows:
             self.clearMask()
             return
-        self.video_grid.activate()
         offset = self.centralWidget().mapTo(self, QPoint())
         region = QRegion(self.rect()).subtracted(QRegion(self.video_grid.geometry().translated(offset)))
         for index in range(count):
@@ -5817,6 +5789,17 @@ class MainWindow(QMainWindow):
         self.settings.setValue(CAMERA_ORDER_SETTING, json.dumps(order))
         self.settings.sync()
         self.sync_previews()
+
+    def drop_camera(self, source_uid: str, position: QPoint) -> None:
+        visible = self.visible_devices()
+        if not self.isVisible() or len(visible) < 2 or source_uid not in {camera.uid for camera in visible}:
+            return
+        selected_uid = getattr(getattr(self, "selected_device", None), "uid", None)
+        for camera in visible:
+            pane = self.primary_pane if camera.uid == selected_uid else self.previews.get(camera.uid)
+            if pane is not None and pane.isVisible() and QRect(pane.mapToGlobal(QPoint()), pane.size()).contains(position):
+                self.swap_cameras(source_uid, camera.uid)
+                return
 
     def _retire_preview(self, preview: CameraPreview) -> None:
         self.close_local_replay(preview.camera.uid)
@@ -5853,6 +5836,10 @@ class MainWindow(QMainWindow):
             return
         selected = getattr(self, "selected_device", None)
         visible = self.visible_devices()
+        self.video.camera_uid = selected.uid if selected is not None else ""
+        self.video.reorder_enabled = len(visible) > 1
+        for replay in self.local_replays.values():
+            replay.video.reorder_enabled = self.video.reorder_enabled
         cameras = [camera for camera in visible if selected is None or camera.uid != selected.uid]
         layout = self.effective_camera_layout()
         changed = len(cameras) != len(self.previews) or layout != self.preview_layout
@@ -5886,7 +5873,7 @@ class MainWindow(QMainWindow):
                     self.local_detection_enabled(), self.local_detection_ready.emit,
                     self.local_detection_failed.emit,
                 )
-                preview.label.moved.connect(self.swap_cameras)
+                preview.video.camera_drop_requested.connect(self.drop_camera)
                 preview.replay_requested.connect(self.open_local_replay)
                 preview.camera_replay_requested.connect(self.open_camera_sd_replay)
                 preview.fullscreen_requested.connect(self.toggle_fullscreen)
@@ -5896,6 +5883,7 @@ class MainWindow(QMainWindow):
                 preview.start()
             else:
                 self.video_grid.addWidget(preview, row, column)
+            preview.video.reorder_enabled = self.video.reorder_enabled
         self.preview_layout = layout
         self.camera_mask_timer.start(0)
         if len(cameras) == 1 and layout == "horizontal" and self.width() < 1120:
@@ -6341,8 +6329,6 @@ class MainWindow(QMainWindow):
         if uid not in self.device_accounts or not self.camera_visible(uid):
             return
         self.selected_device = next(device for device in self.devices if device.uid == uid)
-        self.primary_label.uid = uid
-        self.primary_label.setText(self.selected_device.name)
         self.settings.setValue("camera/selected_uid", uid)
         self.settings.setValue("camera/selected_account", username)
         self.settings.sync()
@@ -6477,8 +6463,6 @@ class MainWindow(QMainWindow):
             )
             if not self.camera_visible(self.selected_device.uid) and self.visible_devices():
                 self.selected_device = self.visible_devices()[0]
-            self.primary_label.uid = self.selected_device.uid
-            self.primary_label.setText(self.selected_device.name)
             self.rtsp_ptz_available = False
             self.replay_button.setEnabled(True)
             self.ptz_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
@@ -6648,9 +6632,6 @@ class MainWindow(QMainWindow):
 
     def on_stream_status(self, message: str) -> None:
         self.set_status(message)
-        self.primary_label.setText(
-            f"{self.selected_device.name} · Live video" if message == "Live video" else self.selected_device.name
-        )
         if message == "Live video":
             self.stream_live = True
             self.reconnect_attempts = 0
@@ -6843,13 +6824,12 @@ class MainWindow(QMainWindow):
         if not count:
             return
         columns, rows = self.camera_grid_dimensions()
-        label_height = self.primary_label.sizeHint().height()
         available_height = QApplication.primaryScreen().availableGeometry().height() - 80
         width = self.width()
-        height = rows * (round(width / columns * VIDEO_ASPECT_HEIGHT / VIDEO_ASPECT_WIDTH) + label_height)
+        height = rows * round(width / columns * VIDEO_ASPECT_HEIGHT / VIDEO_ASPECT_WIDTH)
         height += (rows - 1) * self.video_grid.spacing()
         if height > available_height:
-            width = round((available_height / rows - label_height) * VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT * columns)
+            width = round(available_height / rows * VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT * columns)
             height = available_height
         if self.window_hints is not None:
             self.window_hints.set_aspect_ratio(width, height)
@@ -6871,6 +6851,9 @@ class MainWindow(QMainWindow):
 
     def moveEvent(self, event: QMoveEvent) -> None:
         super().moveEvent(event)
+        self.place_video_overlays()
+
+    def place_video_overlays(self) -> None:
         self.video.place_overlay()
         for preview in self.previews.values():
             preview.video.place_overlay()

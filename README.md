@@ -68,7 +68,10 @@ Adjacent empty cells form one transparent area without separators.
 Full-screen view displays empty cells on a black background; leaving full screen restores their transparency.
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 The grid keeps its saved layout when docked.
-Drag one camera title onto another to exchange their positions; the order is remembered without restarting either stream.
+Camera videos appear without names, title bars, borders, or gaps between their panes.
+With multiple cameras displayed, drag one video onto another with the left mouse button to exchange their positions; the order is remembered without restarting either stream.
+The same gesture works during playback.
+Use the right mouse button to drag the zoomed image or move a supported camera while multiple cameras are displayed.
 The camera panes share the available space equally in a side-by-side layout.
 Each camera has its own local playback, photo, recording, zoom, and full-screen controls.
 All panes use the same inline movement panel and translucent controls, with directions and saved positions shown according to the connected camera's capabilities.
@@ -140,7 +143,7 @@ Talkback is unavailable in the viewer.
 For access away from the camera's network, the computer needs a route to its local IP address, such as a VPN.
 
 Each camera keeps its 16:9 ratio in single-camera and multi-camera views, including when the window is resized.
-The selected camera's live state appears next to its name; playback loading and errors appear over the affected video.
+Connection state, playback loading, and errors appear over the affected video.
 Click the video to show or hide the translucent control bar.
 Live video starts automatically, and the viewer reconnects by itself after a network or transport interruption.
 RTSP and native iCam365 live views also reconnect when playback accumulates at least six seconds of additional delay for three seconds.
@@ -153,7 +156,7 @@ A counter at the top of the video shows the recording duration.
 For O-KAM cameras, use **Sound** to listen to or silence the camera microphone, and the bulb button to switch the camera's white light.
 The magnifier buttons zoom the picture locally.
 For O-KAM cameras, the arrow buttons send short pan and tilt pulses to the camera.
-For O-KAM cameras, drag the video horizontally or vertically with the left mouse button to move it by up to four short pulses.
+For O-KAM cameras, drag the video horizontally or vertically with the right mouse button to move it by up to four short pulses; the left button also moves the camera when only one camera is displayed.
 For O-KAM cameras, **Preset 1** through **Preset 5** recall its saved positions.
 For compatible iCam365 cameras, **PTZ** offers the movements available through the connected transport: Up and Down over the local HTTP endpoint, or pan-and-tilt and saved positions over the native connection.
 
