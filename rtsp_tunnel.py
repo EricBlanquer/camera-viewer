@@ -13,7 +13,7 @@ import threading
 import time
 import urllib.parse
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 import websocket
@@ -25,6 +25,7 @@ RTSP_HEADER_END = b"\r\n\r\n"
 RTSP_MESSAGE_LIMIT = 4 * 1024 * 1024
 RTSP_TUNNEL_TIMEOUT = 15
 IMOU_REPLAY_TIME_FORMAT = "%Y_%m_%d_%H_%M_%S"
+IMOU_REPLAY_RTSP_PATH = "/cam/playback"
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,19 @@ class LocalRtspConnection:
                 or any(character in self.url + self.username for character in ("\r", "\n", "\x00"))
                 or self.certificate_sha256 and not re.fullmatch(r"[a-f0-9]{64}", self.certificate_sha256)):
             raise ValueError("Enter a valid local RTSP camera connection.")
+
+    def recording(self, start: datetime, end: datetime) -> LocalRtspConnection:
+        if end <= start:
+            raise ValueError("The camera recording must end after its start.")
+        parsed = urllib.parse.urlsplit(self.url)
+        channel = urllib.parse.parse_qs(parsed.query).get("channel", ["1"])[0]
+        if not channel.isdecimal() or int(channel) < 1:
+            raise ValueError("The local camera channel is invalid.")
+        query = urllib.parse.urlencode({
+            "channel": channel, "subtype": "0", "starttime": start.strftime(IMOU_REPLAY_TIME_FORMAT),
+            "endtime": end.strftime(IMOU_REPLAY_TIME_FORMAT),
+        })
+        return replace(self, url=urllib.parse.urlunsplit(parsed._replace(path=IMOU_REPLAY_RTSP_PATH, query=query)))
 
 
 def local_tls_context() -> ssl.SSLContext:
@@ -72,8 +86,12 @@ def loopback_media_listener() -> socket.socket:
 
 
 class LocalRtspTunnel:
-    def __init__(self, configuration: LocalRtspConnection) -> None:
+    def __init__(self, configuration: LocalRtspConnection, delivery_speed: int = 1) -> None:
+        if delivery_speed not in (1, 2, 4):
+            raise ValueError("Unsupported local recording delivery speed.")
         self.configuration = configuration
+        self.delivery_speed = delivery_speed
+        self.request_buffer = bytearray()
         self.listener = loopback_media_listener()
         parsed = urllib.parse.urlsplit(configuration.url)
         self.url = urllib.parse.urlunsplit((
@@ -125,15 +143,23 @@ class LocalRtspTunnel:
                     target = self.connection if source is self.client else self.client
                     try:
                         data = source.recv(min(65536, RTSP_MESSAGE_LIMIT - len(pending[target])))
+                    except ConnectionResetError:
+                        if source is self.client:
+                            return
+                        raise
                     except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
                         continue
                     if not data:
                         draining = True
                         continue
-                    pending[target].extend(data)
+                    pending[target].extend(self._client_data(data) if source is self.client else data)
                 for target in writers:
                     try:
                         written = target.send(pending[target])
+                    except (BrokenPipeError, ConnectionResetError):
+                        if target is self.client:
+                            return
+                        raise
                     except (ssl.SSLWantWriteError, ssl.SSLWantReadError, BlockingIOError):
                         continue
                     del pending[target][:written]
@@ -142,6 +168,21 @@ class LocalRtspTunnel:
                 self.error = "The local camera connection failed. Check the camera network or VPN."
         finally:
             self._close_sockets()
+
+    def _client_data(self, data: bytes) -> bytes:
+        if self.delivery_speed == 1:
+            return data
+        self.request_buffer.extend(data)
+        output = bytearray()
+        while (length := rtsp_message_length(self.request_buffer)) is not None and len(self.request_buffer) >= length:
+            message = bytes(self.request_buffer[:length])
+            del self.request_buffer[:length]
+            if message.startswith(b"PLAY "):
+                end = message.index(RTSP_HEADER_END)
+                header = re.sub(rb"\r\nSpeed:[^\r\n]*", b"", message[:end], flags=re.IGNORECASE)
+                message = header + f"\r\nSpeed: {self.delivery_speed:g}\r\n\r\n".encode() + message[end + 4:]
+            output.extend(message)
+        return bytes(output)
 
     def _close_sockets(self) -> None:
         self.stopped.set()

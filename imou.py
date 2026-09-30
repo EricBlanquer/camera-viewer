@@ -279,13 +279,14 @@ class ImouClient:
         params = dict(self.camera_params(camera), beginTime=start.strftime(IMOU_RECORD_TIME_FORMAT),
                       endTime=end.strftime(IMOU_RECORD_TIME_FORMAT), type="All")
         recordings: dict[str, ImouRecording] = {}
+        seen: set[str] = set()
         for page in range(IMOU_MAX_PAGES):
             first = page * IMOU_RECORD_PAGE_SIZE + 1
             data = self.call("queryLocalRecords", dict(params, queryRange=f"{first}-{first + IMOU_RECORD_PAGE_SIZE - 1}"))
             records = data.get("records", [])
             if not isinstance(records, list):
                 raise ImouError("Imou returned an invalid recording list.")
-            before = len(recordings)
+            before = len(seen)
             for record in records:
                 if not isinstance(record, dict):
                     raise ImouError("Imou returned invalid recording metadata.")
@@ -296,14 +297,16 @@ class ImouClient:
                         str(record.get("type", "normal")).lower() not in ("normal", "regular"), int(record.get("fileLength", 0)),
                     )
                     if (not isinstance(recording.record_id, str) or not recording.record_id
-                            or recording.end <= recording.start or recording.size < 0):
+                            or recording.end < recording.start or recording.size < 0):
                         raise ValueError()
                 except (ValueError, KeyError, TypeError):
                     raise ImouError("Imou returned invalid recording metadata.") from None
-                recordings[recording.key] = recording
+                seen.add(recording.key)
+                if recording.end > recording.start:
+                    recordings[recording.key] = recording
             if len(records) < IMOU_RECORD_PAGE_SIZE:
                 return sorted(recordings.values(), key=lambda recording: recording.start)
-            if len(recordings) == before:
+            if len(seen) == before:
                 raise ImouError("Imou repeated the same recording page.")
         raise ImouError("The Imou recording list exceeded the pagination limit.")
 

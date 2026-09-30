@@ -187,6 +187,22 @@ class ImouClientTest(unittest.TestCase):
         with self.assertRaisesRegex(ImouError, "metadata"):
             client.recordings(DEVICE, start, start + timedelta(hours=1))
 
+    def test_zero_duration_camera_files_do_not_block_later_pages_or_hide_repeated_pages(self):
+        start = datetime(2026, 9, 30, 2)
+        empty = {"recordId": "/private/empty.dav", "beginTime": "2026-09-30 02:00:00",
+                 "endTime": "2026-09-30 02:00:00", "fileLength": 131940, "type": "normal"}
+        complete = dict(empty, recordId="/private/complete.dav", endTime="2026-09-30 02:05:00")
+        client = self.client([response({"accessToken": "token"}), response({"records": [empty]}),
+                              response({"records": [complete]}), response({"records": []})])
+        with patch("imou.IMOU_RECORD_PAGE_SIZE", 1):
+            records = client.recordings(DEVICE, start, start + timedelta(hours=1))
+        self.assertEqual([record.record_id for record in records], [complete["recordId"]])
+        self.assertEqual(self.requests[-1][1]["params"]["queryRange"], "3-3")
+        client = self.client([response({"accessToken": "token"}), response({"records": [empty]}),
+                              response({"records": [empty]})])
+        with patch("imou.IMOU_RECORD_PAGE_SIZE", 1), self.assertRaisesRegex(ImouError, "repeated"):
+            client.recordings(DEVICE, start, start + timedelta(hours=1))
+
     def test_playback_requests_private_sd_video_and_caches_its_scoped_token(self):
         start = datetime(2026, 9, 30, 2, 0)
         recording = ImouRecording("private-record", start, start + timedelta(minutes=5), False, 12345)

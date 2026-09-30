@@ -11,6 +11,7 @@ import time
 import unittest
 import urllib.parse
 from dataclasses import asdict, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -21,10 +22,10 @@ from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, 
 
 from app import (
     IMOU_ACCOUNT_PROVIDER, IMOU_LOCAL_CONNECTIONS_SETTING, IMOU_PROVIDER, CameraPreview,
-    MainWindow, RtspStreamWorker, imou_account_camera, imou_rtsp_url, load_imou_cameras,
+    ImouReplayWorker, LocalReplayPane, MainWindow, RtspStreamWorker, imou_account_camera, imou_rtsp_url, load_imou_cameras,
     mpv_rtsp_command,
 )
-from imou import ImouAccount, ImouDevice
+from imou import ImouAccount, ImouDevice, ImouRecording
 from rtsp_tunnel import LocalRtspConnection, LocalRtspMediaBridge, LocalRtspTunnel, rtsp_certificate_sha256
 
 
@@ -158,6 +159,39 @@ class LocalRtspTunnelTest(unittest.TestCase):
         self.assertFalse(tunnel.thread.is_alive())
         self.assertEqual(tunnel.listener.fileno(), -1)
         self.assertEqual(tunnel.error, "")
+
+    def test_recording_url_preserves_local_identity_and_selects_the_main_stream(self):
+        connection = LocalRtspConnection("rtsp://192.168.1.108:8554/cam/realmonitor?channel=3&subtype=1",
+                                         "camera-user", "a" * 64)
+        start = datetime(2026, 9, 30, 23, 59, 50)
+        end = start + timedelta(seconds=30)
+        recording = connection.recording(start, end)
+        self.assertEqual(recording.username, connection.username)
+        self.assertEqual(recording.certificate_sha256, connection.certificate_sha256)
+        self.assertEqual(recording.url, "rtsp://192.168.1.108:8554/cam/playback?channel=3&subtype=0&"
+                         "starttime=2026_09_30_23_59_50&endtime=2026_10_01_00_00_20")
+        with self.assertRaises(ValueError):
+            connection.recording(end, start)
+        with self.assertRaises(ValueError):
+            replace(connection, url="rtsp://192.168.1.108/cam/realmonitor?channel=0").recording(start, end)
+
+    def test_recording_delivery_speed_preserves_fragmented_requests_authentication_and_media(self):
+        tunnel = LocalRtspTunnel(CONNECTION, delivery_speed=4)
+        request = (b"PLAY rtsp://127.0.0.1:40000/cam/playback RTSP/1.0\r\nCSeq: 4\r\n"
+                   b"Authorization: Digest private-authentication\r\nRange: npt=0-\r\nSpeed: 1\r\n\r\n")
+        media = b"$\x01\x00\x04data"
+        try:
+            self.assertEqual(tunnel._client_data(request[:20]), b"")
+            output = tunnel._client_data(request[20:] + media[:3])
+            self.assertIn(b"Authorization: Digest private-authentication\r\n", output)
+            self.assertIn(b"Range: npt=0-\r\n", output)
+            self.assertIn(b"Speed: 4\r\n", output)
+            self.assertEqual(output.count(b"Speed:"), 1)
+            self.assertEqual(tunnel._client_data(media[3:]), media)
+            teardown = b"TEARDOWN /recording RTSP/1.0\r\nCSeq: 5\r\n\r\n"
+            self.assertEqual(tunnel._client_data(teardown), teardown)
+        finally:
+            tunnel.close()
 
     def test_one_media_source_broadcasts_complete_bytes_to_multiple_local_consumers(self):
         read_fd, write_fd = os.pipe()
@@ -369,6 +403,129 @@ class ImouLocalUiTest(unittest.TestCase):
                 worker._open_imou_tunnel("HD")
             local.return_value.close.assert_called()
         worker.imou_client.secure_stream_url.assert_not_called()
+
+    def test_camera_recording_seek_uses_local_rtsp_without_requesting_cloud_video(self):
+        connection = replace(CONNECTION, certificate_sha256="a" * 64)
+        camera = replace(self.camera, local_connection=connection)
+        worker = ImouReplayWorker(camera)
+        start = datetime(2026, 9, 30, 12)
+        recording = ImouRecording("camera-record", start, start + timedelta(minutes=5), False, 12345)
+        with patch("app.stored_secret", return_value="private-device-key"), patch("app.ImouClient") as cloud, patch(
+            "app.LocalRtspTunnel", return_value=Mock(url="rtsp://127.0.0.1:40000/recording", error="")
+        ) as local, patch("app.ImouReplayTunnel", return_value=Mock(url="http://127.0.0.1:40001/recording")):
+            try:
+                worker.open_recording(recording, 60)
+                worker.start()
+                deadline = time.monotonic() + 2
+                while not local.called and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(local.called)
+                requested = local.call_args.args[0]
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(requested.url).query)
+                self.assertEqual(urllib.parse.urlsplit(requested.url).path, "/cam/playback")
+                self.assertEqual(query, {"channel": ["1"], "subtype": ["0"],
+                                        "starttime": ["2026_09_30_12_01_00"], "endtime": ["2026_09_30_12_05_00"]})
+                self.assertEqual(requested.certificate_sha256, connection.certificate_sha256)
+                self.assertEqual(requested.username, connection.username)
+                cloud.return_value.replay_url.assert_not_called()
+            finally:
+                worker.stop()
+                self.assertTrue(worker.wait(5000))
+
+    def test_local_camera_download_preserves_credentials_and_uses_the_same_atomic_save(self):
+        camera = replace(self.camera, local_connection=CONNECTION)
+        worker = ImouReplayWorker(camera)
+        worker.client = Mock()
+        start = datetime(2026, 9, 30, 12)
+        recording = ImouRecording("camera-record", start, start + timedelta(seconds=15), False, 12345)
+        target = Path(self.directory.name) / "saved.mkv"
+        target.write_bytes(b"previous recording")
+        existing_files = set(target.parent.iterdir())
+        descriptors = []
+
+        def download(command, **options):
+            self.assertIn("concat", command)
+            self.assertNotIn("dhav", command)
+            self.assertNotIn("private-device-key", " ".join(command))
+            descriptor, = options["pass_fds"]
+            descriptors.append(descriptor)
+            self.assertIn("admin:private-device-key@127.0.0.1", os.read(descriptor, 4096).decode())
+            Path(command[-1]).write_bytes(b"complete camera recording")
+            return Mock(poll=Mock(return_value=0))
+
+        with patch("app.stored_secret", return_value="private-device-key"), patch(
+            "app.LocalRtspTunnel", return_value=Mock(url="rtsp://127.0.0.1:40000/recording", error="")
+        ) as local, patch("app.subprocess.Popen", side_effect=download):
+            worker._save(recording, target)
+            local.return_value.close.assert_called_once()
+        worker.client.replay_url.assert_not_called()
+        self.assertEqual(target.read_bytes(), b"complete camera recording")
+        self.assertEqual(set(target.parent.iterdir()), existing_files)
+        for descriptor in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_local_replay_failures_and_privacy_never_fall_back_to_cloud_video(self):
+        start = datetime(2026, 9, 30, 12)
+        recording = ImouRecording("camera-record", start, start + timedelta(minutes=5), False, 12345)
+        worker = ImouReplayWorker(replace(self.camera, local_connection=CONNECTION))
+        worker.client = Mock()
+        with patch("app.stored_secret", return_value=None), patch("app.LocalRtspTunnel") as local:
+            with self.assertRaisesRegex(OSError, "password is unavailable"):
+                worker._open_tunnel(recording)
+            local.assert_not_called()
+        with patch("app.stored_secret", return_value="private-key"), patch(
+            "app.LocalRtspTunnel", side_effect=OSError("Local connection failed")
+        ):
+            with self.assertRaisesRegex(OSError, "Local connection failed"):
+                worker._open_tunnel(recording)
+        worker.camera = replace(worker.camera, imou_device=replace(DEVICE, privacy=True))
+        with patch("app.LocalRtspTunnel") as local:
+            with self.assertRaises(OSError):
+                worker._open_tunnel(recording)
+            local.assert_not_called()
+        worker.client.replay_url.assert_not_called()
+
+    def test_local_replay_player_keeps_credentials_private_and_uses_shared_pause_controls(self):
+        camera = replace(self.camera, local_connection=CONNECTION)
+        descriptors = []
+
+        def player(command, **options):
+            descriptor, = options["pass_fds"]
+            descriptors.append(descriptor)
+            self.assertIn(f"--playlist=/proc/self/fd/{descriptor}", command)
+            self.assertIn("--rtsp-transport=tcp", command)
+            self.assertIn("--length=240", command)
+            self.assertIn("--demuxer-readahead-secs=240", command)
+            self.assertNotIn("--demuxer-lavf-format=dhav", command)
+            self.assertNotIn("private-device-key", " ".join(command))
+            self.assertIn("admin:private-device-key@127.0.0.1", os.read(descriptor, 4096).decode())
+            return Mock(poll=Mock(return_value=0))
+
+        with patch("app.ImouReplayWorker"), patch("app.QTimer.singleShot"), patch(
+            "app.stored_secret", return_value="private-device-key"
+        ), patch("app.subprocess.Popen", side_effect=player):
+            pane = LocalReplayPane(camera, self.window, camera_recordings=True)
+            try:
+                pane.remote_worker.tunnel = Mock(spec=LocalRtspTunnel)
+                pane.remote_offset = 60
+                pane.current_path = Path("recording")
+                pane.segment_durations[pane.current_path] = 300
+                self.assertEqual(pane.playback_offset(), 60)
+                pane.start_replay_player("rtsp://127.0.0.1:40000/recording")
+                with patch("app.mpv_request", return_value=(True, False)) as ipc:
+                    pane.toggle_playing()
+                    ipc.assert_any_call(pane.socket_path, ["set_property", "pause", True])
+                    for speed in (2, 4, 1):
+                        pane.change_speed()
+                        ipc.assert_any_call(pane.socket_path, ["set_property", "speed", speed])
+                    ipc.assert_any_call(pane.socket_path, ["set_property", "aid", "auto"])
+            finally:
+                pane.stop()
+                pane.deleteLater()
+        for descriptor in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
 
     def test_invalid_saved_connection_does_not_restore_cloud_video(self):
         for record in ("[]", "invalid", json.dumps({self.camera.uid: "invalid"}),

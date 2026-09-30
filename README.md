@@ -45,20 +45,26 @@ Live view, sound, photos, manual video and audio recording, zoom, and playback u
 Supported pan, tilt, and saved positions use the shared movement panel.
 The playback menu offers camera microSD recordings and local 24-hour recordings, with the same timeline, pause, seeking, speeds up to 8x, sound, photos, and clip saving.
 Imou recording times retain the camera's local clock, with motion recordings shown in red and continuous recordings in blue.
-Live and camera playback share a certificate-verified secure WebSocket transport exposed through loopback-only listeners.
-Live video uses RTSP, while camera playback uses Imou's native recording transport and FFmpeg's DHAV demuxer for video, audio, pause, and supported camera playback speeds.
+Zero-duration camera files are omitted from the recording catalog while later pages remain accessible.
+Cloud live and camera playback share a certificate-verified secure WebSocket transport exposed through loopback-only listeners.
+Cloud live video uses RTSP, while cloud camera playback uses Imou's native recording transport and FFmpeg's DHAV demuxer for video, audio, pause, and supported camera playback speeds.
 Accelerated camera playback is silent; normal speed restores sound.
 Private upstream URLs and tokens remain in memory; player and recorder command lines contain only the loopback URL.
 Camera clip saving runs in the background, publishes the complete file atomically, and removes temporary downloads on cancellation.
 Cloud video consumes the account's Imou traffic allowance; continuous cloud recording requires an explicit opt-in in that account's form and the global continuous recording setting.
 When the Imou traffic allowance is exhausted, the camera displays an explanation and pauses automatic reconnection; after adding traffic in Imou Cloud, use **Refresh camera list** to reconnect.
-Use **Cameras > Imou Life account > Local video access > camera** to route live video, photos, local recording, and detection directly to that camera's RTSP service.
+Use **Cameras > Imou Life account > Local video access > camera** to route live video, photos, local recording, detection, and microSD video playback and saving directly to that camera's RTSP service.
 Enter its LAN address, camera username, and device password or the security code shown by Imou Life under the camera's device label.
 Outside the home, connect to the home VPN before opening these cameras; a local connection failure never falls back to cloud video.
 For cameras with TLS enabled, the viewer pins the camera certificate during configuration and provides the encrypted stream to the existing player through an authenticated loopback connection.
 One camera connection supplies live video, local recording, and detection through the same loopback media broadcaster used for native iCam365 video.
 Both live transports limit audio/video interleaving to 100 ms so sparse audio packets do not hold back video.
-The camera remains in its Imou account with the same identity, visibility, controls, and recording history; movement controls and microSD playback continue using the account API, and cloud microSD playback still consumes its traffic allowance.
+The camera remains in its Imou account with the same identity, visibility, controls, and recording history.
+Movement controls and the microSD recording catalog use the account API and require Internet access and API request allowance.
+When local video access is configured, microSD playback and clip saving use the local main stream with the existing camera credentials and certificate pin, without requesting a cloud video URL or consuming Imou video traffic.
+Local microSD playback uses the shared timeline, seeking, pause, sound, photos, and clip saving controls, with speeds of 1x, 2x, and 4x.
+The camera delivers recorded media ahead of playback into a bounded 256 MiB player cache; available network throughput still limits accelerated playback.
+Camera playback without a configured local connection continues to use the cloud video allowance.
 Local continuous recording uses the global recording setting and does not consume Imou video traffic.
 Use the account's submenu under **Cameras** to edit its region or recording choice, or remove the account and its keyring secret.
 Privacy mode is preserved: a masked camera displays its state and does not open a video connection.
