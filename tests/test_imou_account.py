@@ -105,6 +105,17 @@ class ImouClientTest(unittest.TestCase):
             client.devices()
         self.assertNotIn("private-application-key", str(failure.exception))
 
+    def test_exhausted_cloud_traffic_has_an_actionable_error_without_token_retry(self):
+        for code in ("FL1004", "FL1005"):
+            with self.subTest(code=code):
+                client = self.client([response({"accessToken": "token"}), response({"kitToken": "kit"}),
+                                      response(code=code, message="private-service-detail")])
+                with self.assertRaisesRegex(ImouError, "cloud traffic is exhausted") as failure:
+                    client.secure_stream_url(DEVICE)
+                self.assertEqual(failure.exception.code, code)
+                self.assertNotIn("private-service-detail", str(failure.exception))
+                self.assertEqual(len(self.requests), 3)
+
     def test_paging_preserves_channels_and_rejects_repeated_pages(self):
         record = {"deviceId": "recorder", "deviceName": "NVR", "channelList": [
             {"channelId": 0, "channelName": "Front"}, {"channelId": 1, "channelName": "Back"},
@@ -528,6 +539,37 @@ class ImouAccountUiTest(unittest.TestCase):
         with patch.object(self.window, "start_player") as start:
             self.window.watch_live()
             start.assert_not_called()
+
+    def test_exhausted_imou_traffic_stops_retries_in_main_and_preview(self):
+        message = "Imou cloud traffic is exhausted. Add traffic in Imou Cloud, then refresh the camera list."
+        camera = imou_account_camera(ACCOUNT, DEVICE)
+        preview = CameraPreview(camera, settings=self.settings)
+        try:
+            preview._on_failed(message)
+            preview._on_finished()
+            self.assertFalse(preview.retry_timer.isActive())
+            self.assertFalse(preview.retry_enabled)
+            self.window.selected_device = camera
+            self.window.on_stream_error(message)
+            self.assertFalse(self.window.retry_pending)
+            self.assertIn(message, preview.status_overlay.label.text())
+            preview._on_failed("Temporary network failure")
+            self.window.on_stream_error("Temporary network failure")
+            self.assertTrue(preview.retry_enabled)
+            self.assertTrue(self.window.retry_pending)
+        finally:
+            preview.stop()
+
+    def test_manual_camera_refresh_retries_a_quota_blocked_imou_preview(self):
+        camera = imou_account_camera(ACCOUNT, DEVICE)
+        preview = CameraPreview(camera, settings=self.settings)
+        preview.retry_enabled = False
+        self.window.devices = [camera]
+        self.window.previews[camera.uid] = preview
+        with patch.object(preview, "start") as start, patch.object(self.window, "refresh_imou_accounts"), \
+                patch.object(self.window, "on_account_finished"):
+            self.window.refresh_cameras()
+            start.assert_called_once_with()
 
     def test_refresh_adds_imou_without_restarting_the_existing_camera(self):
         existing = RtspCamera("rtsp:existing", "Entrance", "rtsp://192.0.2.1/video")

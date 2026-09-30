@@ -57,6 +57,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QMenu,
@@ -95,7 +96,7 @@ from okam_native.p2p import (
 from okam_native.wakeup import WakeError, load_wake_credentials, wake_camera
 from icam365 import PTZ_COMMAND, PTZ_POSITION_COMMAND, close_bridge, get_bridge, load_config as load_icam365_config
 from imou import (
-    IMOU_ACCOUNT_URL, IMOU_PRIVACY_MESSAGE, IMOU_REGIONS, IMOU_SECRET_MISSING_MESSAGE,
+    IMOU_ACCOUNT_URL, IMOU_PRIVACY_MESSAGE, IMOU_REGIONS, IMOU_SECRET_MISSING_MESSAGE, IMOU_TRAFFIC_MESSAGE,
     ImouAccount, ImouClient, ImouDevice, ImouError, ImouRecording,
 )
 from rtsp_tunnel import ImouReplayTunnel, RtspWebSocketTunnel
@@ -147,6 +148,9 @@ FORM_ERROR_STYLE = "color: #bd4242;"
 ACCOUNT_ERROR_STYLE = "color: #ffb4ab; background-color: #3d2020; padding: 8px;"
 WAKE_SOURCE = Path.home() / ".local/share/okam-linux/vendor/device_wakeup_server.dart"
 ICON_NAME_PROPERTY = "iconName"
+CONTROL_WIDTH_PROPERTY = "controlWidth"
+CONTROL_ICON_SIZE = 28
+CONTROL_SPACING = 12
 ICON_DIRECTORY = Path(__file__).resolve().parent / "assets/icons"
 MAX_ACCOUNT_RESPONSE_BYTES = 1024 * 1024
 SECRET_APPLICATION_ATTRIBUTES = ("application", "okam-linux")
@@ -204,6 +208,7 @@ MAX_MPV_RESPONSE_BYTES = 65536
 OVERLAY_COLOR = QColor(24, 24, 24, 170)
 OVERLAY_MAX_RADIUS = 32
 OVERLAY_MARGIN = 16
+OVERLAY_MAX_WIDTH = 640
 VIDEO_ASPECT_WIDTH = 16
 VIDEO_ASPECT_HEIGHT = 9
 WM_NORMAL_HINTS_FIELDS = (
@@ -347,8 +352,9 @@ def set_button_icon(button: QPushButton, name: str, label: str, size: int = 44) 
     button.setText("")
     button.setProperty(ICON_NAME_PROPERTY, name)
     button.setIcon(QIcon(str(ICON_DIRECTORY / f"{name}.svg")))
-    button.setIconSize(QSize(28, 28))
+    button.setIconSize(QSize(CONTROL_ICON_SIZE, CONTROL_ICON_SIZE))
     button.setFixedSize(size, size)
+    button.setProperty(CONTROL_WIDTH_PROPERTY, size)
     button.setToolTip(label)
     button.setAccessibleName(label)
 
@@ -1237,6 +1243,53 @@ class ControlsOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
+    def fit_controls(self, width: int) -> None:
+        layout = self.layout()
+        if layout is None:
+            return
+        self._fit_layout(layout, width)
+        self.setMinimumSize(0, 0)
+        layout.invalidate()
+        layout.activate()
+
+    def _fit_layout(self, layout: QLayout, width: int) -> None:
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+        buttons = [layout.itemAt(index).widget() for index in range(layout.count())
+                   if isinstance(layout.itemAt(index).widget(), QPushButton)
+                   and not layout.itemAt(index).widget().isHidden()]
+        if isinstance(layout, QHBoxLayout) and buttons:
+            layout.setContentsMargins(0, 0, 0, 0)
+        margins = layout.contentsMargins()
+        available = max(1, width - margins.left() - margins.right())
+        if isinstance(layout, QHBoxLayout) and buttons:
+            widths = []
+            for button in buttons:
+                preferred = button.property(CONTROL_WIDTH_PROPERTY)
+                if preferred is None:
+                    preferred = button.width()
+                    button.setProperty(CONTROL_WIDTH_PROPERTY, preferred)
+                widths.append(preferred)
+            total = sum(widths)
+            spacing = min(CONTROL_SPACING, max(0, (available - total) // max(1, len(buttons) - 1)))
+            layout.setSpacing(spacing)
+            scale = min(1.0, available / max(1, total))
+            offset = 0
+            for button, preferred in zip(buttons, widths):
+                target = max(1, round((offset + preferred) * scale) - round(offset * scale))
+                button.setFixedWidth(target)
+                icon_size = min(CONTROL_ICON_SIZE, max(1, target - 8))
+                button.setIconSize(QSize(icon_size, icon_size))
+                offset += preferred
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            widget = item.widget()
+            child = item.layout()
+            if widget is not None and not widget.isHidden() and widget.layout() is not None:
+                widget.setMinimumSize(0, 0)
+                child = widget.layout()
+            if child is not None:
+                self._fit_layout(child, available)
+
     def paintEvent(self, event: object) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1325,7 +1378,7 @@ class VideoStatusOverlay(ControlsOverlay):
             self.hide()
             return
         self.label.setText(message)
-        self.label.setWordWrap(self.parentWidget().width() < 400)
+        self.label.setWordWrap(True)
         self.adjustSize()
         self.parentWidget().place_overlay()
         if self.parentWidget().isVisible():
@@ -2495,7 +2548,7 @@ class VideoWidget(QWidget):
         self.click_timer = QTimer(self)
         self.click_timer.setSingleShot(True)
         self.click_timer.timeout.connect(self.clicked.emit)
-        self.controls_overlay: QWidget | None = None
+        self.controls_overlay: ControlsOverlay | None = None
         self.recording_badge: QWidget | None = None
         self.status_overlay: QWidget | None = None
         self.x_display = xdisplay.Display() if QApplication.platformName() == "xcb" else None
@@ -2511,7 +2564,7 @@ class VideoWidget(QWidget):
     def set_status_overlay(self, overlay: QWidget) -> None:
         self.status_overlay = overlay
 
-    def set_controls_overlay(self, overlay: QWidget) -> None:
+    def set_controls_overlay(self, overlay: ControlsOverlay) -> None:
         self.controls_overlay = overlay
         if self.x_display is None:
             self.place_overlay()
@@ -2561,12 +2614,9 @@ class VideoWidget(QWidget):
             )
         if self.controls_overlay is None:
             return
-        overlay_layout = self.controls_overlay.layout()
-        if overlay_layout is not None:
-            overlay_layout.invalidate()
-            overlay_layout.activate()
+        width = min(max(1, self.width() - 2 * OVERLAY_MARGIN), OVERLAY_MAX_WIDTH)
+        self.controls_overlay.fit_controls(width)
         height = self.controls_overlay.sizeHint().height()
-        width = min(max(0, self.width() - 2 * OVERLAY_MARGIN), self.controls_overlay.sizeHint().width())
         position = self.mapToGlobal(
             QPoint(
                 (self.width() - width) // 2,
@@ -2871,7 +2921,6 @@ class ReplayControls(QWidget):
         self.save_button = QPushButton()
         self.zoom_out_button = QPushButton()
         self.zoom_in_button = QPushButton()
-        self.fullscreen_button = QPushButton()
         for button, icon_name, label in (
             (self.previous_button, "previous_detection", "Previous recording"),
             (self.play_button, "pause", "Pause"),
@@ -2881,7 +2930,6 @@ class ReplayControls(QWidget):
             (self.save_button, "download", "Save this recording"),
             (self.zoom_out_button, "zoom_out", "Show a longer period"),
             (self.zoom_in_button, "zoom_in", "Show a shorter period"),
-            (self.fullscreen_button, "fullscreen", "Full screen"),
         ):
             set_button_icon(button, icon_name, label)
         controls.addStretch(1)
@@ -2896,7 +2944,6 @@ class ReplayControls(QWidget):
             self.save_button,
             self.zoom_out_button,
             self.zoom_in_button,
-            self.fullscreen_button,
         ):
             controls.addWidget(button)
         controls.addStretch(1)
@@ -3769,10 +3816,6 @@ class CameraPreview(QWidget):
         if isinstance(camera, RtspCamera):
             self.ptz_button.hide()
         controls.addWidget(self.ptz_button)
-        self.fullscreen_button = QPushButton()
-        set_button_icon(self.fullscreen_button, "fullscreen", "Full screen")
-        self.fullscreen_button.clicked.connect(self.fullscreen_requested.emit)
-        controls.addWidget(self.fullscreen_button)
         controls.addStretch(1)
         self.video.set_controls_overlay(self.overlay)
         for button in self.overlay.findChildren(QPushButton):
@@ -3817,6 +3860,7 @@ class CameraPreview(QWidget):
     def start(self) -> None:
         if self.closing or self.worker is not None:
             return
+        self.retry_enabled = True
         if (isinstance(self.camera, RtspCamera) and self.camera.imou_device is not None
                 and self.camera.imou_device.privacy):
             self._on_failed(IMOU_PRIVACY_MESSAGE)
@@ -3929,8 +3973,11 @@ class CameraPreview(QWidget):
         self.setting_pending = False
         self.show_status(message, True)
         self.retry_enabled = message not in (
-            "The camera rejected the available credentials.", IMOU_PRIVACY_MESSAGE, IMOU_SECRET_MISSING_MESSAGE,
+            "The camera rejected the available credentials.", IMOU_PRIVACY_MESSAGE,
+            IMOU_SECRET_MISSING_MESSAGE, IMOU_TRAFFIC_MESSAGE,
         )
+        if not self.retry_enabled:
+            self.retry_timer.stop()
 
     def _on_finished(self) -> None:
         self.live = False
@@ -4403,15 +4450,7 @@ class LocalReplayPane(QWidget):
         layout.addWidget(self.frame, 1)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
-        self.overlay.setStyleSheet(
-            "#cameraControls QPushButton { color: white; background-color: transparent;"
-            " border: none; border-radius: 6px; padding: 4px; }"
-            "#cameraControls QPushButton:hover { background-color: rgba(255, 255, 255, 35); }"
-            "#cameraControls #pillButton { border: 2px solid white; border-radius: 8px;"
-            " font-weight: 600; margin: 6px 2px; }"
-            "#cameraControls QPushButton:disabled { color: rgba(255, 255, 255, 90); }"
-            + TOOLTIP_STYLE
-        )
+        self.overlay.setStyleSheet(CAMERA_CONTROLS_STYLE)
         controls_layout = QVBoxLayout(self.overlay)
         controls_layout.setContentsMargins(24, 10, 24, 10)
         self.controls = ReplayControls(self.overlay)
@@ -4426,7 +4465,6 @@ class LocalReplayPane(QWidget):
         self.controls.speed_button.clicked.connect(self.change_speed)
         self.controls.snapshot_button.clicked.connect(self.take_snapshot)
         self.controls.save_button.clicked.connect(self.save_clip)
-        self.controls.fullscreen_button.clicked.connect(self.fullscreen_requested.emit)
         self.timeline.seek_requested.connect(self.seek_time)
         self.controls.save_button.setEnabled(False)
         self.video.set_controls_overlay(self.overlay)
@@ -5157,9 +5195,6 @@ class MainWindow(QMainWindow):
         self.ptz_button = QPushButton("PTZ")
         self.ptz_button.clicked.connect(self.toggle_ptz_panel)
         controls.addWidget(self.ptz_button)
-        self.fullscreen_button = QPushButton("Full screen")
-        self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
-        controls.addWidget(self.fullscreen_button)
         controls.addStretch(1)
         for button, icon_name, label in (
             (self.replay_button, "replay", "Play back recordings"),
@@ -5170,7 +5205,6 @@ class MainWindow(QMainWindow):
             (self.zoom_out_button, "zoom_out", "Zoom out"),
             (self.zoom_in_button, "zoom_in", "Zoom in"),
             (self.ptz_button, "ptz", "Pan and tilt controls"),
-            (self.fullscreen_button, "fullscreen", "Full screen"),
         ):
             set_button_icon(button, icon_name, label)
         self.live_bar = QWidget(self.overlay)
@@ -5189,7 +5223,6 @@ class MainWindow(QMainWindow):
         self.replay_save_button = self.replay_controls.save_button
         self.timeline_zoom_out_button = self.replay_controls.zoom_out_button
         self.timeline_zoom_in_button = self.replay_controls.zoom_in_button
-        self.fullscreen_replay_button = self.replay_controls.fullscreen_button
         self.timeline = self.replay_controls.timeline
         set_button_icon(self.previous_detection_button, "previous_detection", "Previous detection")
         set_button_icon(self.next_detection_button, "next_detection", "Next detection")
@@ -5202,7 +5235,6 @@ class MainWindow(QMainWindow):
         self.replay_speed_button.clicked.connect(self.change_replay_speed)
         self.replay_snapshot_button.clicked.connect(self.take_snapshot)
         self.replay_save_button.clicked.connect(self.save_replay_clip)
-        self.fullscreen_replay_button.clicked.connect(self.toggle_fullscreen)
         overlay_layout.addWidget(self.replay_bar)
         overlay_layout.addWidget(self.timeline)
         self.replay_bar.hide()
@@ -6173,6 +6205,10 @@ class MainWindow(QMainWindow):
     def refresh_cameras(self) -> None:
         if self.account_worker is not None:
             return
+        for preview in self.previews.values():
+            if (isinstance(preview.camera, RtspCamera) and preview.camera.provider == IMOU_ACCOUNT_PROVIDER
+                    and preview.worker is None and not preview.retry_enabled):
+                preview.start()
         self.refresh_imou_accounts()
         self.account_queue = [
             (username, password)
@@ -6744,17 +6780,9 @@ class MainWindow(QMainWindow):
             self.showNormal()
             if self.normal_geometry is not None:
                 self.setGeometry(self.normal_geometry)
-            set_button_icon(self.fullscreen_button, "fullscreen", "Full screen")
         else:
             self.normal_geometry = self.geometry()
             self.showFullScreen()
-            set_button_icon(self.fullscreen_button, "exit_fullscreen", "Exit full screen")
-        for preview in self.previews.values():
-            set_button_icon(
-                preview.fullscreen_button,
-                "exit_fullscreen" if self.isFullScreen() else "fullscreen",
-                "Exit full screen" if self.isFullScreen() else "Full screen",
-            )
 
     def fit_video_aspect(self) -> None:
         if self.isFullScreen():
@@ -6986,8 +7014,11 @@ class MainWindow(QMainWindow):
     def on_stream_error(self, message: str) -> None:
         self.stream_error = True
         self.retry_pending = message not in (
-            "The camera rejected the available credentials.", IMOU_PRIVACY_MESSAGE, IMOU_SECRET_MISSING_MESSAGE,
+            "The camera rejected the available credentials.", IMOU_PRIVACY_MESSAGE,
+            IMOU_SECRET_MISSING_MESSAGE, IMOU_TRAFFIC_MESSAGE,
         )
+        if not self.retry_pending:
+            self.reconnect_timer.stop()
         self.stream_live = False
         self.control_pending = False
         self.rtsp_ptz_available = False

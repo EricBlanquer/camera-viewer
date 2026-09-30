@@ -22,6 +22,8 @@ IMOU_REGIONS = {
 IMOU_ACCOUNT_URL = "https://open.imoulife.com/consoleNew/myApp/appInfo"
 IMOU_PRIVACY_MESSAGE = "Privacy mode is enabled in Imou Life."
 IMOU_SECRET_MISSING_MESSAGE = "The Imou account key is unavailable in the desktop keyring."
+IMOU_TRAFFIC_MESSAGE = "Imou cloud traffic is exhausted. Add traffic in Imou Cloud, then refresh the camera list."
+IMOU_TRAFFIC_CODES = frozenset(("FL1004", "FL1005"))
 IMOU_RESPONSE_LIMIT = 4 * 1024 * 1024
 IMOU_REQUEST_TIMEOUT = 15
 IMOU_PAGE_SIZE = 50
@@ -164,6 +166,8 @@ class ImouClient:
         if code != "0":
             if code in IMOU_AUTH_CODES:
                 raise ImouError("Imou rejected the application credentials.", code)
+            if code in IMOU_TRAFFIC_CODES:
+                raise ImouError(IMOU_TRAFFIC_MESSAGE, code)
             raise ImouError(f"The Imou {method} request failed ({code or 'invalid response'}).", code)
         data = result.get("data", {})
         if not isinstance(data, dict):

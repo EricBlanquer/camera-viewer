@@ -51,6 +51,7 @@ Accelerated camera playback is silent; normal speed restores sound.
 Private upstream URLs and tokens remain in memory; player and recorder command lines contain only the loopback URL.
 Camera clip saving runs in the background, publishes the complete file atomically, and removes temporary downloads on cancellation.
 Cloud video consumes the account's Imou traffic allowance; continuous cloud recording requires an explicit opt-in in that account's form and the global continuous recording setting.
+When the Imou traffic allowance is exhausted, the camera displays an explanation and pauses automatic reconnection; after adding traffic in Imou Cloud, use **Refresh camera list** to reconnect.
 Use the account's submenu under **Cameras** to edit its region or recording choice, or remove the account and its keyring secret.
 Privacy mode is preserved: a masked camera displays its state and does not open a video connection.
 Use **Refresh camera list** after changing privacy mode in Imou Life or adding a camera.
@@ -73,7 +74,9 @@ With multiple cameras displayed, drag one video onto another with the left mouse
 The same gesture works during playback.
 Use the right mouse button to drag the zoomed image or move a supported camera while multiple cameras are displayed.
 The camera panes share the available space equally in a side-by-side layout.
-Each camera has its own local playback, photo, recording, zoom, and full-screen controls.
+Each camera has its own local playback, photo, recording, and zoom controls.
+Double-click a live or playback video to enter or leave full-screen view.
+Control overlays use the same width and height for equal-sized live videos, with spacing and button widths adapting to fit inside each video.
 All panes use the same inline movement panel and translucent controls, with directions and saved positions shown according to the connected camera's capabilities.
 Compatible RTSP panes also have sound and vertical tilt, native iCam365 panes have pan-and-tilt and their camera's saved positions, and O-KAM panes have pan-and-tilt, saved positions, and light when supported.
 Compatible iCam365 camera panes have a bulb button that switches white light between On and Automatic.
@@ -84,7 +87,6 @@ Selecting O-KAM microSD playback makes that camera the selected pane while the o
 Imou microSD playback stays in its camera pane while the other live feeds continue.
 The other camera views reconnect independently.
 Click either video to show or hide its own control bar; the bars are hidden initially and close after five seconds.
-Double-click either video to toggle full screen.
 Keep only one camera checked to display one video.
 Use **Refresh camera list** there after adding a camera to an existing account.
 Later launches show the video with controls available on click.

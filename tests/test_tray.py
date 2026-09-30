@@ -490,7 +490,7 @@ class TrayTest(unittest.TestCase):
         self.assertTrue(preview.sound_enabled)
         fullscreen: list[bool] = []
         preview.fullscreen_requested.connect(lambda: fullscreen.append(True))
-        preview.fullscreen_button.click()
+        preview.video.double_clicked.emit(10, 10)
         self.assertEqual(fullscreen, [True])
         preview.close()
 
@@ -696,8 +696,7 @@ class TrayTest(unittest.TestCase):
             self.window.sync_previews()
             self.window.video.double_clicked.emit(10, 10)
             self.window.previews[entrance.uid].video.double_clicked.emit(10, 10)
-            self.window.previews[entrance.uid].fullscreen_button.click()
-            self.assertEqual(fullscreen.call_count, 3)
+            self.assertEqual(fullscreen.call_count, 2)
         self.window.on_stream_status("Live video")
         self.assertEqual(self.window.windowTitle(), "Camera Viewer")
         self.assertEqual(self.window.video.camera_uid, garden.uid)
