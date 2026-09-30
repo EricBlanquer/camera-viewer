@@ -1,14 +1,14 @@
 # Camera Viewer
 
 Camera Viewer is a native Linux desktop viewer for security cameras.
-O-KAM Pro account cameras, local RTSP cameras, Imou Life cameras with local RTSP access, and configured iCam365 native connections are supported.
+O-KAM Pro and Imou Life account cameras, local RTSP cameras, Imou cameras with local RTSP access, and configured iCam365 native connections are supported.
 It uses Qt for the interface, mpv for H.264 and H.265 playback, and the MIT-licensed [O-KAM Native Bridge](https://github.com/oleandor/okam-ha-native) for O-KAM camera discovery, wake-up, and encrypted P2P transport.
 It does not require Home Assistant, Wine, Waydroid, or the phone while viewing.
 
 ## Install
 
 Requirements: Python 3.11 or newer, PyQt6, python3-xlib, mpv, ffmpeg with ffplay, Git, OpenCV, and NumPy.
-O-KAM accounts also require `secret-tool` with an unlocked desktop keyring and network access to O-KAM's services.
+O-KAM and Imou accounts also require `secret-tool` with an unlocked desktop keyring and network access to their account services.
 On this computer these programs are already installed.
 
 ```sh
@@ -24,7 +24,7 @@ It keeps the vendor wake configuration in `~/.local/share/okam-linux/vendor` wit
 ## Use
 
 Open **Camera Viewer** from the application menu or run `.venv/bin/python app.py` from this directory.
-On first launch, the window opens automatically and offers a choice of O-KAM account, RTSP camera, or local Imou Life camera.
+On first launch, the window opens automatically and offers a choice of O-KAM account, Imou Life account, RTSP camera, or local Imou camera.
 The O-KAM sign-in form stays open while the account is checked and displays connection errors beside the fields so the password can be corrected immediately.
 If a saved O-KAM login is rejected while the viewer is hidden, the window opens automatically and displays the error.
 Camera setup and sign-in dialogs open on the video window's screen and stay within its usable area.
@@ -34,6 +34,21 @@ Use **Add camera > O-KAM account...** in the tray menu to add another account.
 Use **Add camera > RTSP camera...** to add a camera by name, RTSP URL without embedded credentials, and UDP or TCP transport.
 Use **Add camera > Imou Life camera (local)...** to add an Imou camera by local IP address, RTSP port, channel, camera username, and device password or safety code.
 The device password is kept in the desktop keyring; saved camera settings and media-player command lines omit it.
+Use **Add camera > Imou Life account...** to discover the cameras owned by or shared with your Imou Life account.
+Sign into [Imou Open Platform](https://open.imoulife.com/consoleNew) with the same Imou Life account and complete its developer profile to obtain your own AppId and AppSecret.
+Enter these application credentials, your account email, and the server region in Camera Viewer.
+The AppSecret stays in the desktop keyring; account settings contain camera identities and names, and omit access tokens and temporary stream URLs.
+Account discovery runs in the background and displays authentication errors in the open setup form.
+The viewer authenticates with Imou's [HMAC-SHA256 request signature](https://open.imoulife.com/book/http/develop.html) and retrieves short-lived private cloud RTSP streams through the [official Imou API client's getStreamUrl operation](https://github.com/Imou-OpenPlatform/Py-Imou-Open-Api/blob/main/pyimouapi/device.py).
+This connection uses the account credentials and does not require the camera's device password or the phone.
+Live view, photos, manual video recording, zoom, and playback of local recordings use the same controls as local RTSP cameras.
+Cloud Imou streams use video only: the tested camera's cloud AAC tracks fail to decode with FFmpeg and keep mpv's audio clock at zero when selected.
+Audio remains available on compatible local RTSP connections.
+Cloud playback and local recordings use packet arrival timestamps to keep their video clock advancing at the received rate.
+Cloud video consumes the account's Imou traffic allowance; continuous cloud recording requires an explicit opt-in in that account's form and the global continuous recording setting.
+Use the account's submenu under **Cameras** to edit its region or recording choice, or remove the account and its keyring secret.
+Privacy mode is preserved: a masked camera displays its state and does not open a video connection.
+Use **Refresh camera list** after changing privacy mode in Imou Life or adding a camera.
 The **Cameras** submenu lists O-KAM cameras by account and RTSP, Imou, or configured native iCam365 cameras by name and source.
 Each checkbox independently shows or hides its camera, and the choice is remembered across application restarts.
 Checked cameras appear together in a grid; all cameras are checked by default.
@@ -45,6 +60,7 @@ Use **Camera layout > Side by side** or **Stacked** to place the feeds horizonta
 Use **Camera layout > Grid 2 × 2** for two columns and at least two rows, with empty cells transparent to the desktop.
 With three cameras, the fourth cell stays empty; additional cameras extend the grid by rows.
 Adjacent empty cells form one transparent area without separators.
+Full-screen view displays empty cells on a black background; leaving full screen restores their transparency.
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 The grid keeps its saved layout when docked.
 Drag one camera title onto another to exchange their positions; the order is remembered without restarting either stream.
@@ -60,7 +76,7 @@ The other camera views reconnect independently.
 Click either video to show or hide its own control bar; the bars are hidden initially and close after five seconds.
 Double-click either video to toggle full screen.
 Keep only one camera checked to display one video.
-Use **Refresh camera list** there after adding a camera to an existing O-KAM account.
+Use **Refresh camera list** there after adding a camera to an existing account.
 Later launches show the video with controls available on click.
 Run `.venv/bin/python app.py --forget-account` to remove all saved O-KAM accounts.
 
@@ -112,7 +128,8 @@ This connection does not provide camera microSD playback or talkback.
 The Imou form uses the [Dahua main-stream RTSP path](https://www.dahuasecurity.com/asset/upload/download/DS-PSD8802-A180_Operation_Manual__201709251.pdf) `/cam/realmonitor?channel=<channel>&subtype=0` and TCP port 554 by default.
 The camera must expose that RTSP stream on the local network; model support depends on the camera and its settings.
 Use the camera's device password or safety code, which may differ from the Imou Life account password.
-Imou cameras have the RTSP live-view and local recording controls described above; Imou Life account discovery, cloud relay, microSD playback, talkback, and remote movement are not integrated.
+Local Imou cameras have the RTSP live-view and local recording controls described above.
+Imou camera microSD playback, talkback, and remote movement are unavailable in the viewer.
 For access away from the camera's network, the computer needs a route to its local IP address, such as a VPN.
 
 Each camera keeps its 16:9 ratio in single-camera and multi-camera views, including when the window is resized.

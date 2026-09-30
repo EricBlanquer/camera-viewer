@@ -50,7 +50,7 @@ class OnboardingTest(unittest.TestCase):
             sources = dialog.findChild(QComboBox)
             self.assertIsNotNone(sources)
             self.assertEqual([sources.itemText(index) for index in range(sources.count())], [
-                "O-KAM account", "RTSP camera", "Imou Life camera (local)",
+                "O-KAM account", "RTSP camera", "Imou Life camera (local)", "Imou Life account",
             ])
             self.assertTrue(self.window.isVisible())
             sources.setCurrentIndex(1)

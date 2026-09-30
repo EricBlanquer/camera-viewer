@@ -27,7 +27,7 @@ import urllib.request
 import uuid
 from collections import deque
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import BinaryIO, Callable
 from datetime import datetime, timedelta, timezone
 
@@ -52,6 +52,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -96,6 +97,10 @@ from okam_native.p2p import (
 )
 from okam_native.wakeup import WakeError, load_wake_credentials, wake_camera
 from icam365 import PTZ_COMMAND, PTZ_POSITION_COMMAND, close_bridge, get_bridge, load_config as load_icam365_config
+from imou import (
+    IMOU_ACCOUNT_URL, IMOU_PRIVACY_MESSAGE, IMOU_REGIONS, IMOU_SECRET_MISSING_MESSAGE,
+    ImouAccount, ImouClient, ImouDevice, ImouError,
+)
 from local_detection import (
     DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, organize_events, prune_events,
 )
@@ -109,6 +114,11 @@ RTSP_ACCOUNT = "rtsp"
 RTSP_CAMERAS_SETTING = "cameras/rtsp"
 RTSP_SOUND_SETTING = "audio/rtsp_sound"
 IMOU_PROVIDER = "imou"
+IMOU_ACCOUNT_PROVIDER = "imou_account"
+IMOU_ACCOUNTS_SETTING = "accounts/imou"
+IMOU_CAMERAS_SETTING = "cameras/imou"
+IMOU_LOADING_MESSAGE = "An Imou account is already loading."
+IMOU_INPUT_CLOCK = "use_wallclock_as_timestamps=1"
 IMOU_RTSP_PATH = "/cam/realmonitor"
 MULTIVIEW_SETTING = "view/show_all_cameras"
 CAMERA_VISIBLE_SETTING = "view/camera_visible"
@@ -132,7 +142,7 @@ SHOW_WINDOW_REQUEST = b"show"
 ACCOUNT_REJECTED_MESSAGE = "O-KAM account login was rejected."
 ACCOUNT_INPUT_MESSAGE = "Enter your O-KAM account and password."
 ACCOUNT_LOADING_MESSAGE = "An account is already loading."
-CAMERA_SOURCE_LABELS = ("O-KAM account", "RTSP camera", "Imou Life camera (local)")
+CAMERA_SOURCE_LABELS = ("O-KAM account", "RTSP camera", "Imou Life camera (local)", "Imou Life account")
 CAMERA_LAYOUTS = (("horizontal", "Side by side"), ("vertical", "Stacked"), ("grid", "Grid 2 × 2"))
 CAMERA_LAYOUT_VALUES = tuple(value for value, label in CAMERA_LAYOUTS)
 CAMERA_GRID_COLUMNS = 2
@@ -555,6 +565,34 @@ class AccountWorker(QThread):
             self.password = ""
 
 
+class ImouAccountWorker(QThread):
+    devices_found = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, account: ImouAccount, secret: str | None = None) -> None:
+        super().__init__()
+        self.account = account
+        self.secret = secret
+
+    def run(self) -> None:
+        try:
+            secret = self.secret or stored_secret(IMOU_ACCOUNT_PROVIDER, self.account.app_id)
+            devices = ImouClient(self.account, secret or "").devices()
+            if self.isInterruptionRequested():
+                return
+            if self.secret and not save_device_secret(
+                IMOU_ACCOUNT_PROVIDER, self.account.app_id, self.secret, "Camera Viewer Imou Life account",
+            ):
+                raise ImouError("Unable to save the Imou application key in the desktop keyring.")
+            self.devices_found.emit(devices)
+        except ImouError as ex:
+            self.failed.emit(str(ex))
+        except Exception:
+            self.failed.emit("Unable to load the Imou Life account.")
+        finally:
+            self.secret = None
+
+
 class CameraFrameReader:
     def __init__(self) -> None:
         self.pending_frame: tuple[int, int] | None = None
@@ -656,7 +694,11 @@ def mpv_rtsp_command(
     command.insert(-1, "--mute=no" if sound_enabled else "--mute=yes")
     command.insert(-1, RTSP_AUDIO_FILTER)
     command.insert(-1, RTSP_DENOISE_FILTER)
-    if camera.provider == IMOU_PROVIDER:
+    if camera.provider == IMOU_ACCOUNT_PROVIDER:
+        command[-1] = "--idle=yes"
+        command.insert(-1, "--no-audio")
+        command.insert(-1, f"--demuxer-lavf-o-add={IMOU_INPUT_CLOCK}")
+    elif camera.provider == IMOU_PROVIDER:
         if playlist_fd is None:
             raise ValueError("A private Imou stream playlist is required.")
         command[-1] = f"--playlist=/proc/self/fd/{playlist_fd}"
@@ -703,6 +745,50 @@ class RtspCamera:
     transport: str = "tcp"
     provider: str = "rtsp"
     username: str = ""
+    imou_account: ImouAccount | None = None
+    imou_device: ImouDevice | None = None
+
+
+def imou_account_camera(account: ImouAccount, device: ImouDevice) -> RtspCamera:
+    return RtspCamera(device.uid(account.app_id), device.name, "", "tcp", IMOU_ACCOUNT_PROVIDER,
+                      account.email, account, device)
+
+
+def load_imou_accounts(settings: QSettings) -> list[ImouAccount]:
+    try:
+        records = json.loads(settings.value(IMOU_ACCOUNTS_SETTING, "[]", str))
+    except (ValueError, TypeError):
+        return []
+    accounts = {}
+    for record in records if isinstance(records, list) else []:
+        try:
+            account = ImouAccount(**record)
+            accounts[account.app_id] = account
+        except (TypeError, ValueError):
+            continue
+    return list(accounts.values())
+
+
+def load_imou_cameras(settings: QSettings, accounts: list[ImouAccount]) -> list[RtspCamera]:
+    try:
+        records = json.loads(settings.value(IMOU_CAMERAS_SETTING, "[]", str))
+    except (ValueError, TypeError):
+        return []
+    cameras = {}
+    by_id = {account.app_id: account for account in accounts}
+    for record in records if isinstance(records, list) else []:
+        try:
+            account = by_id[record["app_id"]]
+            camera = imou_account_camera(account, ImouDevice(**record["device"]))
+            cameras[camera.uid] = camera
+        except (TypeError, ValueError, KeyError):
+            continue
+    return list(cameras.values())
+
+
+def camera_continuous_allowed(camera: AccountDevice | RtspCamera) -> bool:
+    return (not isinstance(camera, RtspCamera) or camera.provider != IMOU_ACCOUNT_PROVIDER
+            or camera.imou_account is not None and camera.imou_account.cloud_recording)
 
 
 class CameraCredentialError(OSError):
@@ -753,8 +839,14 @@ def imou_mpv_playlist(camera: RtspCamera) -> int:
 
 
 def imou_ffmpeg_playlist(camera: RtspCamera) -> int:
-    url = camera_stream_url(camera).replace("'", "'\\''")
-    contents = f"ffconcat version 1.0\nfile '{url}'\noption rtsp_transport {camera.transport}\n"
+    return private_ffmpeg_playlist(camera_stream_url(camera), camera.transport)
+
+
+def private_ffmpeg_playlist(url: str, transport: str, wallclock: bool = False) -> int:
+    url = url.replace("'", "'\\''")
+    contents = f"ffconcat version 1.0\nfile '{url}'\noption rtsp_transport {transport}\n"
+    if wallclock:
+        contents += f"option {IMOU_INPUT_CLOCK.replace('=', ' ')}\n"
     return private_stream_descriptor(contents)
 
 
@@ -3147,9 +3239,11 @@ class RtspStreamWorker(QThread):
         self.ptz_lock = threading.Lock()
         self.ptz_request: str | None = None
         self.native_bridge = None
+        self.imou_stream_url = ""
+        self.imou_client: ImouClient | None = None
 
     def set_continuous(self, enabled: bool) -> None:
-        if enabled:
+        if enabled and camera_continuous_allowed(self.camera):
             self.continuous_enabled.set()
         else:
             self.continuous_enabled.clear()
@@ -3185,19 +3279,47 @@ class RtspStreamWorker(QThread):
     def _local_detection_source(self) -> tuple[list[str], int | None, bool]:
         if self.native_bridge is not None:
             return ["-i", self.native_bridge.url], None, False
-        if self.camera.provider == IMOU_PROVIDER:
-            descriptor = imou_ffmpeg_playlist(self.camera)
+        if self.camera.provider in (IMOU_PROVIDER, IMOU_ACCOUNT_PROVIDER):
+            descriptor = self._private_playlist()
             return [
                 "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe,rtsp,tcp,udp,rtp",
                 "-i", f"/proc/self/fd/{descriptor}",
             ], descriptor, False
         return ["-rtsp_transport", self.camera.transport, "-i", self.camera.url], None, False
 
+    def _private_playlist(self) -> int:
+        if self.camera.provider == IMOU_PROVIDER:
+            return imou_ffmpeg_playlist(self.camera)
+        if self.imou_client is None or self.camera.imou_device is None:
+            raise ImouError("The private Imou stream is not connected.")
+        return private_ffmpeg_playlist(self.imou_client.stream_url(self.camera.imou_device), self.camera.transport, True)
+
+    def _load_imou_stream(self) -> None:
+        account = self.camera.imou_account
+        device = self.camera.imou_device
+        if account is None or device is None:
+            raise ImouError("The Imou camera account configuration is invalid.")
+        if device.privacy:
+            raise ImouError(IMOU_PRIVACY_MESSAGE)
+        self.imou_client = ImouClient(account, stored_secret(IMOU_ACCOUNT_PROVIDER, account.app_id) or "")
+        self.imou_stream_url = self.imou_client.stream_url(device)
+        deadline = time.monotonic() + 10
+        while not self.stop_requested.is_set():
+            if self.player.poll() is not None:
+                raise ImouError("The camera video player stopped.")
+            if self.socket_path.exists():
+                if not mpv_request(self.socket_path, ["loadfile", self.imou_stream_url, "replace"])[0]:
+                    raise ImouError("Unable to open the private Imou stream in the video player.")
+                return
+            if time.monotonic() >= deadline:
+                raise ImouError("The camera video player did not start.")
+            self.stop_requested.wait(0.1)
+
     def _ffmpeg(self, output: Path, segmented: bool) -> subprocess.Popen[bytes]:
         playlist_fd = None
         command = ["ffmpeg", "-nostats", "-loglevel", "error"]
-        if self.camera.provider == IMOU_PROVIDER:
-            playlist_fd = imou_ffmpeg_playlist(self.camera)
+        if self.camera.provider in (IMOU_PROVIDER, IMOU_ACCOUNT_PROVIDER):
+            playlist_fd = self._private_playlist()
             command += [
                 "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe,rtsp,tcp,udp,rtp",
                 "-i", f"/proc/self/fd/{playlist_fd}",
@@ -3205,7 +3327,10 @@ class RtspStreamWorker(QThread):
         else:
             bridge = get_bridge(self.camera.uid)
             command += (["-i", bridge.url] if bridge is not None else ["-rtsp_transport", self.camera.transport, "-i", self.camera.url])
-        command += ["-map", "0:v:0", "-map", "0:a?", "-c", "copy"]
+        command += ["-map", "0:v:0"]
+        if self.camera.provider != IMOU_ACCOUNT_PROVIDER:
+            command += ["-map", "0:a?"]
+        command += ["-c", "copy"]
         if segmented:
             command += [
                 "-f", "segment", "-segment_format", "matroska",
@@ -3250,7 +3375,10 @@ class RtspStreamWorker(QThread):
 
     def run(self) -> None:
         try:
-            self.native_bridge = get_bridge(self.camera.uid)
+            if self.camera.provider == IMOU_ACCOUNT_PROVIDER:
+                self._load_imou_stream()
+            else:
+                self.native_bridge = get_bridge(self.camera.uid)
             deadline = time.monotonic() + (60 if self.native_bridge is not None else 30)
             while not self.stop_requested.is_set():
                 if self.native_bridge is not None and self.native_bridge.error:
@@ -3258,7 +3386,9 @@ class RtspStreamWorker(QThread):
                 if self.player.poll() is not None:
                     raise OSError("The camera video player stopped.")
                 ready, configured = mpv_request(self.socket_path, ["get_property", "vo-configured"])
-                if ready and configured is True:
+                frame_ready = (self.camera.provider != IMOU_ACCOUNT_PROVIDER
+                               or isinstance(mpv_request(self.socket_path, ["get_property", "video-params"])[1], dict))
+                if ready and configured is True and frame_ready:
                     break
                 if time.monotonic() >= deadline:
                     raise OSError("The RTSP camera did not provide video.")
@@ -3267,7 +3397,7 @@ class RtspStreamWorker(QThread):
                 return
             self.status_changed.emit("Live video")
             tracks_ready, tracks = mpv_request(self.socket_path, ["get_property", "track-list"])
-            if tracks_ready and isinstance(tracks, list) and any(
+            if self.camera.provider != IMOU_ACCOUNT_PROVIDER and tracks_ready and isinstance(tracks, list) and any(
                 isinstance(track, dict) and track.get("type") == "audio" for track in tracks
             ):
                 self.audio_available.emit()
@@ -3397,6 +3527,8 @@ class RtspStreamWorker(QThread):
                 LOG.info("RTSP camera stream stopped: %s", ex)
                 self.failed.emit(str(ex))
         finally:
+            self.imou_stream_url = ""
+            self.imou_client = None
             self._stop_recording()
             if self.continuous is not None:
                 self._finish(self.continuous)
@@ -3617,6 +3749,10 @@ class CameraPreview(QWidget):
     def start(self) -> None:
         if self.closing or self.worker is not None:
             return
+        if (isinstance(self.camera, RtspCamera) and self.camera.imou_device is not None
+                and self.camera.imou_device.privacy):
+            self._on_failed(IMOU_PRIVACY_MESSAGE)
+            return
         if isinstance(self.camera, RtspCamera):
             self.sound_enabled = rtsp_sound_enabled(self.settings, self.camera)
             self.sound_button.hide()
@@ -3723,7 +3859,9 @@ class CameraPreview(QWidget):
         self.control_pending = False
         self.setting_pending = False
         self.label.setText(f"{self.camera.name} · {message}")
-        self.retry_enabled = message != "The camera rejected the available credentials."
+        self.retry_enabled = message not in (
+            "The camera rejected the available credentials.", IMOU_PRIVACY_MESSAGE, IMOU_SECRET_MISSING_MESSAGE,
+        )
 
     def _on_finished(self) -> None:
         self.live = False
@@ -4413,6 +4551,79 @@ class AccountDialog(QDialog):
         self.password.selectAll()
 
 
+class ImouAccountDialog(QDialog):
+    credentials_submitted = pyqtSignal(object, str)
+
+    def __init__(self, parent: QWidget, account: ImouAccount | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Imou Life account")
+        self.setMinimumWidth(440)
+        layout = QVBoxLayout(self)
+        description = QLabel(
+            "Use the AppId and AppSecret of your own Imou Life account.\n"
+            "Cloud video uses your Imou traffic allowance."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        portal = QPushButton("Open Imou account activation")
+        portal.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(IMOU_ACCOUNT_URL)))
+        layout.addWidget(portal)
+        form = QFormLayout()
+        self.email = QLineEdit(account.email if account else "")
+        self.email.setPlaceholderText("Imou Life account email")
+        self.app_id = QLineEdit(account.app_id if account else "")
+        self.app_id.setPlaceholderText("AppId")
+        self.secret = QLineEdit()
+        self.secret.setEchoMode(QLineEdit.EchoMode.Password)
+        self.secret.setPlaceholderText("AppSecret" if account is None else "Leave empty to keep the saved key")
+        self.region = QComboBox()
+        self.region.addItems(IMOU_REGIONS)
+        self.region.setCurrentText(account.region if account else "Europe")
+        form.addRow("Account email", self.email)
+        form.addRow("AppId", self.app_id)
+        form.addRow("AppSecret", self.secret)
+        form.addRow("Server region", self.region)
+        layout.addLayout(form)
+        self.original_account = account
+        self.cloud_recording = QCheckBox("Allow continuous cloud recording (uses Imou traffic)")
+        self.cloud_recording.setChecked(account.cloud_recording if account else False)
+        layout.addWidget(self.cloud_recording)
+        self.error = QLabel()
+        self.error.setWordWrap(True)
+        self.error.setStyleSheet(FORM_ERROR_STYLE)
+        layout.addWidget(self.error)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.submit)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def submit(self) -> None:
+        try:
+            account = ImouAccount(self.email.text().strip(), self.app_id.text().strip(),
+                                  self.region.currentText(), self.cloud_recording.isChecked())
+        except ValueError as ex:
+            self.show_error(str(ex))
+            (self.email if not self.email.text().strip() else self.app_id).setFocus()
+            return
+        if not self.secret.text() and (self.original_account is None or account.app_id != self.original_account.app_id):
+            self.show_error("Enter the AppSecret of your own Imou application.")
+            self.secret.setFocus()
+            return
+        self.error.clear()
+        self.set_loading(True)
+        self.credentials_submitted.emit(account, self.secret.text())
+
+    def set_loading(self, loading: bool) -> None:
+        for field in (self.email, self.app_id, self.secret, self.region, self.cloud_recording):
+            field.setEnabled(not loading)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not loading)
+
+    def show_error(self, message: str) -> None:
+        self.set_loading(False)
+        self.error.setText(message)
+        self.secret.setFocus()
+
+
 class DialogPlacement(QObject):
     def __init__(self, parent: QWidget, dialog: QDialog, reposition: Callable[[], None]) -> None:
         super().__init__(dialog)
@@ -4486,6 +4697,9 @@ class MainWindow(QMainWindow):
         self.account_queue: list[tuple[str, str]] = []
         self.account_worker: AccountWorker | None = None
         self.account_dialog: AccountDialog | None = None
+        self.imou_worker: ImouAccountWorker | None = None
+        self.imou_dialog: ImouAccountDialog | None = None
+        self.imou_queue: list[ImouAccount] = []
         self.stream_worker: StreamWorker | RtspStreamWorker | None = None
         self.control_pending = False
         self.player: subprocess.Popen[bytes] | None = None
@@ -4530,8 +4744,10 @@ class MainWindow(QMainWindow):
         self.overlay_timer.timeout.connect(self.hide_overlay)
         self.settings = QSettings(STORAGE_NAME, STORAGE_NAME)
         self.rtsp_cameras = load_rtsp_cameras(self.settings)
-        self.devices.extend(self.rtsp_cameras)
-        self.device_accounts.update({camera.uid: RTSP_ACCOUNT for camera in self.rtsp_cameras})
+        self.imou_accounts = load_imou_accounts(self.settings)
+        self.imou_cameras = load_imou_cameras(self.settings, self.imou_accounts)
+        self.devices.extend(self.rtsp_cameras + self.imou_cameras)
+        self.device_accounts.update({camera.uid: RTSP_ACCOUNT for camera in self.devices})
         self.account_username = self.settings.value("account/username", "", str)
         self.account_secret: str | None = None
         self.accounts = self.settings.value("accounts/okam", [], list)
@@ -4717,7 +4933,7 @@ class MainWindow(QMainWindow):
         if QApplication.platformName() == "xcb":
             self.window_hints = X11WindowHints(self, self.tray is not None)
         self.set_status("Connecting to camera...")
-        if self.accounts or self.rtsp_cameras:
+        if self.accounts or self.rtsp_cameras or self.imou_accounts:
             QTimer.singleShot(0, self.find_cameras)
         else:
             QTimer.singleShot(0, self.setup_cameras)
@@ -4794,6 +5010,8 @@ class MainWindow(QMainWindow):
             username = self.device_accounts[device.uid]
             if isinstance(device, RtspCamera):
                 source = "Imou Life (local)" if device.provider == IMOU_PROVIDER else "RTSP (local)"
+                if device.provider == IMOU_ACCOUNT_PROVIDER:
+                    source = f"Imou Life ({device.username})"
                 if device.provider == "rtsp":
                     try:
                         if load_icam365_config(device.uid) is not None:
@@ -4813,9 +5031,20 @@ class MainWindow(QMainWindow):
             self.cameras_menu.addAction("No cameras available").setEnabled(False)
         self.cameras_menu.addSeparator()
         refresh = self.cameras_menu.addAction("Refresh camera list")
-        refresh.setEnabled(self.account_worker is None and bool(self.accounts))
+        refresh.setEnabled(self.account_worker is None and self.imou_worker is None
+                           and bool(self.accounts or self.imou_accounts))
         refresh.triggered.connect(self.refresh_cameras)
-        if isinstance(getattr(self, "selected_device", None), RtspCamera):
+        for account in self.imou_accounts:
+            account_menu = self.cameras_menu.addMenu(f"Imou Life account · {account.email}")
+            account_menu.setEnabled(self.imou_worker is None)
+            account_menu.addAction("Edit account...").triggered.connect(
+                lambda checked=False, value=account: self.add_imou_account(value)
+            )
+            account_menu.addAction("Remove account").triggered.connect(
+                lambda checked=False, value=account: self.remove_imou_account(value)
+            )
+        if (isinstance(getattr(self, "selected_device", None), RtspCamera)
+                and self.selected_device.provider != IMOU_ACCOUNT_PROVIDER):
             source = "Imou Life" if self.selected_device.provider == IMOU_PROVIDER else "RTSP"
             self.cameras_menu.addAction(f"Remove selected {source} camera").triggered.connect(self.remove_selected_rtsp_camera)
 
@@ -5154,7 +5383,7 @@ class MainWindow(QMainWindow):
 
     def update_camera_mask(self) -> None:
         count = len(self.visible_devices())
-        if self.effective_camera_layout() != "grid" or not count:
+        if self.isFullScreen() or self.effective_camera_layout() != "grid" or not count:
             self.clearMask()
             return
         columns, rows = self.camera_grid_dimensions()
@@ -5422,7 +5651,135 @@ class MainWindow(QMainWindow):
             self.set_status(NO_VISIBLE_CAMERAS_MESSAGE if self.devices else "No cameras available.")
 
     def camera_source_actions(self) -> tuple[Callable[[], None], ...]:
-        return self.change_account, self.add_rtsp_camera, self.add_imou_camera
+        return self.change_account, self.add_rtsp_camera, self.add_imou_camera, self.add_imou_account
+
+    def save_imou_accounts(self) -> None:
+        self.settings.setValue(IMOU_ACCOUNTS_SETTING, json.dumps([asdict(account) for account in self.imou_accounts]))
+        self.settings.setValue(IMOU_CAMERAS_SETTING, json.dumps([
+            {"app_id": camera.imou_account.app_id, "device": asdict(camera.imou_device)}
+            for camera in self.imou_cameras
+        ]))
+        self.settings.sync()
+
+    def add_imou_account(self, account: ImouAccount | bool | None = None) -> None:
+        if self.imou_dialog is not None:
+            self.imou_dialog.raise_()
+            self.imou_dialog.activateWindow()
+            return
+        if self.imou_worker is not None:
+            self.show_notice(IMOU_LOADING_MESSAGE)
+            return
+        self.show_window_without_stream()
+        dialog = ImouAccountDialog(self, account if isinstance(account, ImouAccount) else None)
+        self.imou_dialog = dialog
+        dialog.credentials_submitted.connect(self.start_imou_lookup)
+        try:
+            self.exec_camera_dialog(dialog)
+        finally:
+            self.imou_dialog = None
+            dialog.secret.clear()
+            dialog.deleteLater()
+
+    def start_imou_lookup(self, account: ImouAccount, secret: str = "") -> None:
+        if self.imou_worker is not None:
+            if self.imou_dialog is not None:
+                self.imou_dialog.show_error(IMOU_LOADING_MESSAGE)
+            return
+        self.imou_worker = ImouAccountWorker(account, secret or None)
+        self.imou_worker.devices_found.connect(self.on_imou_devices_found)
+        self.imou_worker.failed.connect(self.on_imou_failed)
+        self.imou_worker.finished.connect(self.on_imou_finished)
+        self.imou_worker.start()
+
+    def on_imou_devices_found(self, devices: list[ImouDevice]) -> None:
+        if self.close_pending or self.quit_requested:
+            return
+        account = self.imou_worker.account
+        self.imou_accounts = [value for value in self.imou_accounts if value.app_id != account.app_id] + [account]
+        cameras = [imou_account_camera(account, device) for device in devices]
+        self.replace_imou_cameras(account, cameras)
+        self.save_imou_accounts()
+        if self.imou_dialog is not None:
+            self.imou_dialog.accept()
+        self.show_notice(f"Found {len(cameras)} Imou camera(s).")
+
+    def replace_imou_cameras(self, account: ImouAccount, cameras: list[RtspCamera]) -> None:
+        previous = {camera.uid: camera for camera in self.imou_cameras if camera.imou_account.app_id == account.app_id}
+        current = {camera.uid: camera for camera in cameras}
+        changed = {uid for uid, camera in previous.items() if current.get(uid) != camera}
+        for uid in changed:
+            self.close_local_replay(uid)
+            if uid in self.previews:
+                self._retire_preview(self.previews.pop(uid))
+        self.imou_cameras = [camera for camera in self.imou_cameras if camera.uid not in previous] + cameras
+        self.devices = [camera for camera in self.devices if camera.uid not in previous] + cameras
+        for uid in previous:
+            self.device_accounts.pop(uid, None)
+        self.device_accounts.update({camera.uid: RTSP_ACCOUNT for camera in cameras})
+        selected = getattr(self, "selected_device", None)
+        if selected is not None and selected.uid in changed:
+            replacement = current.get(selected.uid) or next(iter(self.visible_devices()), None)
+            if replacement is not None:
+                self.pending_camera = (self.device_accounts[replacement.uid], replacement.uid)
+            self.stop_stream()
+            if self.stream_worker is None:
+                if self.pending_camera is not None:
+                    self.apply_pending_camera()
+                elif not self.devices:
+                    del self.selected_device
+        elif selected is not None and selected.uid in current:
+            self.selected_device = current[selected.uid]
+
+    def on_imou_failed(self, message: str) -> None:
+        if self.close_pending or self.quit_requested:
+            return
+        if self.imou_dialog is not None:
+            self.imou_dialog.show_error(message)
+        else:
+            self.show_notice(message)
+
+    def on_imou_finished(self) -> None:
+        worker = self.imou_worker
+        self.imou_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if self.close_pending:
+            self.close()
+        elif self.imou_queue:
+            self.start_imou_lookup(self.imou_queue.pop(0))
+        elif self.account_worker is None:
+            if self.devices:
+                selected = getattr(self, "selected_device", None)
+                if selected is None or selected.uid not in self.device_accounts:
+                    self.on_account_finished()
+                else:
+                    self.sync_previews()
+                    if self.stream_worker is None:
+                        self.watch_live()
+            else:
+                self.set_status("No cameras available.")
+
+    def refresh_imou_accounts(self) -> None:
+        if self.imou_worker is None and self.imou_accounts:
+            self.imou_queue = list(self.imou_accounts)
+            self.start_imou_lookup(self.imou_queue.pop(0))
+
+    def remove_imou_account(self, account: ImouAccount) -> None:
+        if self.imou_worker is not None:
+            self.show_notice(IMOU_LOADING_MESSAGE)
+            return
+        if (stored_secret(IMOU_ACCOUNT_PROVIDER, account.app_id) is not None
+                and not clear_device_secret(IMOU_ACCOUNT_PROVIDER, account.app_id)):
+            self.show_notice("Unable to remove the Imou account key from the desktop keyring.")
+            return
+        removed = [camera for camera in self.imou_cameras if camera.imou_account.app_id == account.app_id]
+        self.replace_imou_cameras(account, [])
+        self.imou_accounts = [value for value in self.imou_accounts if value.app_id != account.app_id]
+        for camera in removed:
+            self.settings.remove(f"{RTSP_SOUND_SETTING}/{camera.uid}")
+            self.settings.remove(f"{CAMERA_VISIBLE_SETTING}/{camera.uid}")
+        self.save_imou_accounts()
+        self.sync_previews()
 
     def center_camera_dialog(self, dialog: QDialog) -> None:
         parent_frame = self.frameGeometry()
@@ -5483,13 +5840,14 @@ class MainWindow(QMainWindow):
     def find_cameras(self) -> None:
         if self.account_worker is not None:
             return
-        self.devices = list(self.rtsp_cameras)
-        self.device_accounts = {camera.uid: RTSP_ACCOUNT for camera in self.rtsp_cameras}
+        self.devices = list(self.rtsp_cameras + self.imou_cameras)
+        self.device_accounts = {camera.uid: RTSP_ACCOUNT for camera in self.devices}
         self.refresh_cameras()
 
     def refresh_cameras(self) -> None:
         if self.account_worker is not None:
             return
+        self.refresh_imou_accounts()
         self.account_queue = [
             (username, password)
             for username in self.accounts
@@ -5498,6 +5856,8 @@ class MainWindow(QMainWindow):
         if not self.account_queue:
             if self.devices:
                 self.on_account_finished()
+            elif self.imou_worker is not None:
+                self.set_status("Finding Imou cameras...")
             elif self.accounts:
                 self.change_account()
             else:
@@ -5762,6 +6122,10 @@ class MainWindow(QMainWindow):
             return
         if not self.camera_visible(self.selected_device.uid):
             self.set_status(NO_VISIBLE_CAMERAS_MESSAGE)
+            return
+        if (isinstance(self.selected_device, RtspCamera) and self.selected_device.imou_device is not None
+                and self.selected_device.imou_device.privacy):
+            self.set_status(IMOU_PRIVACY_MESSAGE)
             return
         self.reconnect_timer.stop()
         self.retry_pending = False
@@ -6112,6 +6476,9 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event: QEvent) -> None:
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
+            self.centralWidget().setStyleSheet("background-color: black;" if self.isFullScreen()
+                                              else "background-color: #171717;")
+            self.camera_mask_timer.start(0)
             if self.isMinimized():
                 self.overlay_timer.stop()
                 self.hide_overlay()
@@ -6331,7 +6698,9 @@ class MainWindow(QMainWindow):
 
     def on_stream_error(self, message: str) -> None:
         self.stream_error = True
-        self.retry_pending = message != "The camera rejected the available credentials."
+        self.retry_pending = message not in (
+            "The camera rejected the available credentials.", IMOU_PRIVACY_MESSAGE, IMOU_SECRET_MISSING_MESSAGE,
+        )
         self.stream_live = False
         self.control_pending = False
         self.rtsp_ptz_available = False
@@ -6395,6 +6764,9 @@ class MainWindow(QMainWindow):
         self.layout_refresh_timer.stop()
         self.camera_mask_timer.stop()
         self.retry_pending = False
+        self.imou_queue.clear()
+        if self.imou_worker is not None:
+            self.imou_worker.requestInterruption()
         for uid in list(self.local_replays):
             self.close_local_replay(uid)
         for uid, preview in list(self.previews.items()):
@@ -6402,6 +6774,7 @@ class MainWindow(QMainWindow):
             self._retire_preview(preview)
         if (
             self.account_worker is not None
+            or self.imou_worker is not None
             or self.stream_worker is not None
             or self.detection_worker is not None
             or self.retired_previews

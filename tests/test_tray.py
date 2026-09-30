@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PyQt6.QtCore import QObject, QPoint, QSettings, Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QApplication, QPushButton, QSystemTrayIcon, QWidget
 
 from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
@@ -332,6 +333,31 @@ class TrayTest(unittest.TestCase):
             self.assertTrue(self.window.mask().isEmpty())
             self.assertIs(self.window.video_grid.itemAtPosition(1, 1).widget(), self.window.previews[fourth.uid])
             self.assertEqual(start.call_count, 3)
+
+    def test_fullscreen_grid_has_a_black_empty_cell_and_restores_transparency(self) -> None:
+        cameras = [
+            SimpleNamespace(name="Garden", uid="garden"),
+            RtspCamera("rtsp:entrance", "Entrance", "rtsp://192.0.2.10/stream"),
+            RtspCamera("rtsp:kitchen", "Kitchen", "rtsp://192.0.2.11/stream"),
+        ]
+        self.window.devices = cameras
+        self.window.selected_device = cameras[0]
+        with patch.object(CameraPreview, "start"), patch.object(self.window, "fit_video_aspect"):
+            self.window.set_camera_layout("grid")
+            self.window.show()
+            self.application.processEvents()
+            self.window.update_camera_mask()
+            self.assertFalse(self.window.mask().isEmpty())
+            self.window.toggle_fullscreen()
+            self.application.processEvents()
+            self.window.update_camera_mask()
+            self.assertTrue(self.window.mask().isEmpty())
+            empty = self.window.video_grid.cellRect(1, 1)
+            self.assertEqual(self.window.centralWidget().grab().toImage().pixelColor(empty.center()), QColor("black"))
+            self.window.toggle_fullscreen()
+            self.application.processEvents()
+            self.window.update_camera_mask()
+            self.assertFalse(self.window.mask().isEmpty())
 
     def test_grid_reserves_empty_cells_and_clears_transparency_without_cameras(self) -> None:
         camera = SimpleNamespace(name="Garden", uid="garden")
