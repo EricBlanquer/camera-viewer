@@ -78,6 +78,7 @@ Full-screen view displays empty cells on a black background; leaving full screen
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 The grid keeps its saved layout when docked.
 Camera videos appear without names, title bars, borders, or gaps between their panes.
+Embedded video players synchronize with their pane size after mapping and resizing, while preserving the selected zoom and pan.
 With multiple cameras displayed, drag one video onto another with the left mouse button to exchange their positions; the order is remembered without restarting either stream.
 The same gesture works during playback.
 Use the right mouse button to drag the zoomed image or move a supported camera while multiple cameras are displayed.

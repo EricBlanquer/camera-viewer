@@ -108,6 +108,7 @@ from local_detection import (
     DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, organize_events, prune_events,
 )
 from Xlib import X as X11, Xutil, display as xdisplay
+from Xlib.protocol import event as xevent
 
 
 APPLICATION_NAME = "Camera Viewer"
@@ -2636,6 +2637,9 @@ class VideoWidget(QWidget):
         self.input_window = None
         self.input_timer = QTimer(self)
         self.input_timer.timeout.connect(self.read_mouse_events)
+        self.geometry_timer = QTimer(self)
+        self.geometry_timer.setSingleShot(True)
+        self.geometry_timer.timeout.connect(self.sync_player_geometry)
         if self.x_display is not None:
             self.input_timer.start(20)
 
@@ -2715,7 +2719,20 @@ class VideoWidget(QWidget):
         if self.input_window is not None:
             self.input_window.configure(width=self.width(), height=self.height())
             self.x_display.flush()
+        self.geometry_timer.start(0)
         self.place_overlay()
+
+    def sync_player_geometry(self) -> None:
+        if self.x_display is None or not self.isVisible():
+            return
+        parent = self.x_display.create_resource_object("window", int(self.winId()))
+        geometry = parent.get_geometry()
+        parent.send_event(xevent.ConfigureNotify(
+            event=parent, window=parent, above_sibling=X11.NONE,
+            x=geometry.x, y=geometry.y, width=geometry.width, height=geometry.height,
+            border_width=geometry.border_width, override=False,
+        ), event_mask=X11.StructureNotifyMask)
+        self.x_display.flush()
 
     def retain_player_frame(self, socket_path: Path | None) -> None:
         self.frame_ready_timer.stop()
@@ -2845,6 +2862,7 @@ class VideoWidget(QWidget):
             if self.input_window is None:
                 continue
             if event.type == X11.MapNotify and event.window != self.input_window:
+                self.geometry_timer.start(0)
                 self.raise_interaction_layer()
                 continue
             if event.type == X11.MotionNotify:
@@ -2868,6 +2886,7 @@ class VideoWidget(QWidget):
 
     def closeEvent(self, event: object) -> None:
         self.input_timer.stop()
+        self.geometry_timer.stop()
         self.clear_retained_frame()
         if self.x_display is not None:
             self.x_display.close()
