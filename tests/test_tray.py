@@ -12,6 +12,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PyQt6.QtCore import QObject, QPoint, QSettings, Qt, pyqtSignal
 from PyQt6.QtGui import QColor
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QPushButton, QSystemTrayIcon, QWidget
 
 from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
@@ -733,6 +734,8 @@ class TrayTest(unittest.TestCase):
         self.window.selected_device = camera
         self.window.player = SimpleNamespace(stdin=io.BytesIO())
         self.window.show()
+        self.window.activateWindow()
+        QTest.qWait(10)
         with patch("app.ReplayController", Replay), patch.object(self.window, "start_player", return_value=True), patch(
             "app.stored_camera_password", return_value=""
         ):
@@ -784,6 +787,8 @@ class TrayTest(unittest.TestCase):
 
     def test_recording_badge_shows_elapsed_time(self) -> None:
         self.window.show()
+        self.window.activateWindow()
+        QTest.qWait(10)
         self.window.recording_path = Path("badge-test.mkv")
         self.window.on_recording_started()
         self.window.recording_started_at = time.monotonic() - 3661

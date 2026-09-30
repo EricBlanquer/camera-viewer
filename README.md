@@ -52,6 +52,13 @@ Private upstream URLs and tokens remain in memory; player and recorder command l
 Camera clip saving runs in the background, publishes the complete file atomically, and removes temporary downloads on cancellation.
 Cloud video consumes the account's Imou traffic allowance; continuous cloud recording requires an explicit opt-in in that account's form and the global continuous recording setting.
 When the Imou traffic allowance is exhausted, the camera displays an explanation and pauses automatic reconnection; after adding traffic in Imou Cloud, use **Refresh camera list** to reconnect.
+Use **Cameras > Imou Life account > Local video access > camera** to route live video, photos, local recording, and detection directly to that camera's RTSP service.
+Enter its LAN address, camera username, and device password or the security code shown by Imou Life under the camera's device label.
+Outside the home, connect to the home VPN before opening these cameras; a local connection failure never falls back to cloud video.
+For cameras with TLS enabled, the viewer pins the camera certificate during configuration and provides the encrypted stream to the existing player through an authenticated loopback connection.
+One camera connection supplies live video, local recording, and detection through the same loopback media broadcaster used for native iCam365 video.
+The camera remains in its Imou account with the same identity, visibility, controls, and recording history; movement controls and microSD playback continue using the account API, and cloud microSD playback still consumes its traffic allowance.
+Local continuous recording uses the global recording setting and does not consume Imou video traffic.
 Use the account's submenu under **Cameras** to edit its region or recording choice, or remove the account and its keyring secret.
 Privacy mode is preserved: a masked camera displays its state and does not open a video connection.
 Use **Refresh camera list** after changing privacy mode in Imou Life or adding a camera.
@@ -172,6 +179,7 @@ Opening Camera Viewer again from the application menu shows the running instance
 Closing the window hides it; live video keeps running in the background so continuous recording and detection checks continue.
 Clicking the tray icon brings a window behind other applications to the front; clicking it while Camera Viewer is active hides it.
 Camera selection, connection retries, and account errors preserve the window's visibility, minimization, and focus.
+Video controls and status messages remain hidden while Camera Viewer is behind another application, minimized, or hidden; current messages reappear when its window becomes active.
 The tray menu enables local detection of people, cats, dogs, and birds while continuous recording is on.
 It analyzes one 640 × 360 frame per second with the SHA-256-verified OpenCV Zoo YOLOX-s model and confirms an event when the same object appears twice within two seconds.
 Nearby detections of the same animal retain a cat classification when the model briefly calls that animal a dog or bird; spatially separate animals retain their own types.

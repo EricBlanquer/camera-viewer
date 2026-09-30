@@ -99,7 +99,10 @@ from imou import (
     IMOU_ACCOUNT_URL, IMOU_PRIVACY_MESSAGE, IMOU_REGIONS, IMOU_SECRET_MISSING_MESSAGE, IMOU_TRAFFIC_MESSAGE,
     ImouAccount, ImouClient, ImouDevice, ImouError, ImouRecording,
 )
-from rtsp_tunnel import ImouReplayTunnel, RtspWebSocketTunnel
+from rtsp_tunnel import (
+    ImouReplayTunnel, LocalRtspConnection, LocalRtspMediaBridge, LocalRtspTunnel,
+    RtspWebSocketTunnel, rtsp_certificate_sha256,
+)
 from local_detection import (
     DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, organize_events, prune_events,
 )
@@ -116,6 +119,7 @@ IMOU_PROVIDER = "imou"
 IMOU_ACCOUNT_PROVIDER = "imou_account"
 IMOU_ACCOUNTS_SETTING = "accounts/imou"
 IMOU_CAMERAS_SETTING = "cameras/imou"
+IMOU_LOCAL_CONNECTIONS_SETTING = "cameras/imou_local_connections"
 IMOU_LOADING_MESSAGE = "An Imou account is already loading."
 IMOU_INPUT_CLOCK = "use_wallclock_as_timestamps=1"
 IMOU_RTSP_PATH = "/cam/realmonitor"
@@ -736,11 +740,25 @@ class RtspCamera:
     username: str = ""
     imou_account: ImouAccount | None = None
     imou_device: ImouDevice | None = None
+    local_connection: LocalRtspConnection | None = None
 
 
-def imou_account_camera(account: ImouAccount, device: ImouDevice) -> RtspCamera:
+def imou_account_camera(account: ImouAccount, device: ImouDevice, settings: QSettings | None = None) -> RtspCamera:
+    connection = None
+    if settings is not None:
+        try:
+            records = json.loads(settings.value(IMOU_LOCAL_CONNECTIONS_SETTING, "{}", str))
+            if not isinstance(records, dict):
+                raise ValueError()
+            record = records.get(device.uid(account.app_id))
+            if record is not None:
+                if not isinstance(record, dict):
+                    raise ValueError()
+                connection = LocalRtspConnection(**record)
+        except (TypeError, ValueError):
+            raise ValueError("The local Imou camera configuration is invalid.") from None
     return RtspCamera(device.uid(account.app_id), device.name, "", "tcp", IMOU_ACCOUNT_PROVIDER,
-                      account.email, account, device)
+                      account.email, account, device, connection)
 
 
 def load_imou_accounts(settings: QSettings) -> list[ImouAccount]:
@@ -768,7 +786,7 @@ def load_imou_cameras(settings: QSettings, accounts: list[ImouAccount]) -> list[
     for record in records if isinstance(records, list) else []:
         try:
             account = by_id[record["app_id"]]
-            camera = imou_account_camera(account, ImouDevice(**record["device"]))
+            camera = imou_account_camera(account, ImouDevice(**record["device"]), settings)
             cameras[camera.uid] = camera
         except (TypeError, ValueError, KeyError):
             continue
@@ -777,6 +795,7 @@ def load_imou_cameras(settings: QSettings, accounts: list[ImouAccount]) -> list[
 
 def camera_continuous_allowed(camera: AccountDevice | RtspCamera) -> bool:
     return (not isinstance(camera, RtspCamera) or camera.provider != IMOU_ACCOUNT_PROVIDER
+            or camera.local_connection is not None
             or camera.imou_account is not None and camera.imou_account.cloud_recording)
 
 
@@ -809,14 +828,47 @@ def imou_rtsp_url(address: str, port: int = 554, channel: int = 1) -> str:
     return f"rtsp://{authority}:{port}{IMOU_RTSP_PATH}?channel={channel}&subtype=0"
 
 
+class ImouCameraForm(QFormLayout):
+    def __init__(self, camera: RtspCamera | None = None) -> None:
+        super().__init__()
+        connection = camera.local_connection if camera is not None else None
+        parsed = urllib.parse.urlsplit(connection.url if connection is not None else camera.url if camera else "")
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        default_channel = int(camera.imou_device.channel_id) + 1 if camera and camera.imou_device else 1
+        self.name = QLineEdit(camera.name if camera else "")
+        self.name.setPlaceholderText("Driveway")
+        self.address = QLineEdit(parsed.hostname or "")
+        self.address.setPlaceholderText("192.168.1.100")
+        self.port = QSpinBox()
+        self.port.setRange(1, 65535)
+        self.port.setValue(parsed.port or 554)
+        self.channel = QSpinBox()
+        self.channel.setRange(1, 128)
+        self.channel.setValue(int(query.get("channel", default_channel)))
+        self.username = QLineEdit(connection.username if connection else "admin")
+        self.password = QLineEdit(stored_secret(IMOU_PROVIDER, camera.uid) or "" if camera else "")
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setPlaceholderText("Camera safety code or device password")
+        for label, field in (("Name", self.name), ("Local IP address", self.address), ("RTSP port", self.port),
+                             ("Channel", self.channel), ("Camera username", self.username), ("Device password", self.password)):
+            self.addRow(label, field)
+
+    def local_url(self) -> str:
+        return imou_rtsp_url(self.address.text().strip(), self.port.value(), self.channel.value())
+
+
 def camera_stream_url(camera: RtspCamera) -> str:
     if camera.provider != IMOU_PROVIDER:
         return camera.url
+    return authenticated_imou_url(camera, camera.url, camera.username)
+
+
+def authenticated_imou_url(camera: RtspCamera, url: str, username: str) -> str:
     password = stored_secret(IMOU_PROVIDER, camera.uid)
     if not password:
         raise CameraCredentialError("The Imou camera password is unavailable in the desktop keyring.")
-    parsed = urllib.parse.urlsplit(camera.url)
-    username = urllib.parse.quote(camera.username, safe="")
+    parsed = urllib.parse.urlsplit(url)
+    username = urllib.parse.quote(username, safe="")
     password = urllib.parse.quote(password, safe="")
     url = urllib.parse.urlunsplit((
         parsed.scheme, f"{username}:{password}@{parsed.netloc}", parsed.path, parsed.query, parsed.fragment,
@@ -847,11 +899,13 @@ def imou_ffmpeg_playlist(camera: RtspCamera) -> int:
     return private_ffmpeg_playlist(camera_stream_url(camera), camera.transport)
 
 
-def private_ffmpeg_playlist(url: str, transport: str, wallclock: bool = False) -> int:
+def private_ffmpeg_playlist(url: str, transport: str, wallclock: bool = False, low_latency: bool = False) -> int:
     url = url.replace("'", "'\\''")
     contents = f"ffconcat version 1.0\nfile '{url}'\noption rtsp_transport {transport}\n"
     if wallclock:
         contents += f"option {IMOU_INPUT_CLOCK.replace('=', ' ')}\n"
+    if low_latency:
+        contents += "option analyzeduration 1000000\noption probesize 32768\noption fpsprobesize 0\n"
     return private_stream_descriptor(contents)
 
 
@@ -1224,6 +1278,38 @@ class ControlsOverlay(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.requested_visible = False
+        self.owner_window: QWidget | None = None
+        QApplication.instance().focusWindowChanged.connect(self.schedule_visibility_refresh)
+
+    def schedule_visibility_refresh(self) -> None:
+        QTimer.singleShot(0, self.refresh_visibility)
+
+    def setVisible(self, visible: bool) -> None:
+        self.requested_visible = visible
+        self.refresh_visibility()
+
+    def refresh_visibility(self) -> None:
+        owner = self.parentWidget().window()
+        if self.owner_window is not owner:
+            if self.owner_window is not None:
+                self.owner_window.removeEventFilter(self)
+            self.owner_window = owner
+            owner.installEventFilter(self)
+        active = QApplication.activeWindow()
+        active_tool = (active is not None and active.parentWidget() is not None
+                       and active.windowType() == Qt.WindowType.Tool and active.parentWidget().window() is owner)
+        super().setVisible(self.requested_visible and owner.isVisible()
+                           and (owner.isActiveWindow() or active_tool) and not owner.isMinimized())
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.owner_window:
+            if event.type() == QEvent.Type.Hide:
+                super().setVisible(False)
+            elif event.type() in (QEvent.Type.WindowActivate, QEvent.Type.WindowDeactivate,
+                                   QEvent.Type.Show, QEvent.Type.WindowStateChange):
+                self.schedule_visibility_refresh()
+        return super().eventFilter(watched, event)
 
     def fit_controls(self, width: int) -> None:
         layout = self.layout()
@@ -3279,7 +3365,7 @@ class RtspStreamWorker(QThread):
         self.ptz_request: str | None = None
         self.native_bridge = None
         self.imou_stream_url = ""
-        self.imou_tunnel: RtspWebSocketTunnel | None = None
+        self.imou_tunnel: RtspWebSocketTunnel | LocalRtspMediaBridge | None = None
         self.recording_tunnels: dict[subprocess.Popen[bytes], RtspWebSocketTunnel] = {}
         self.imou_client: ImouClient | None = None
         self.imou_collections: dict[str, str] = {}
@@ -3331,6 +3417,8 @@ class RtspStreamWorker(QThread):
     def _local_detection_source(self) -> tuple[list[str], int | None, bool]:
         if self.native_bridge is not None:
             return ["-i", self.native_bridge.url], None, False
+        if self.camera.local_connection is not None:
+            return ["-i", self._shared_imou_url()], None, False
         if self.camera.provider in (IMOU_PROVIDER, IMOU_ACCOUNT_PROVIDER):
             descriptor = self._private_playlist()
             return [
@@ -3342,6 +3430,8 @@ class RtspStreamWorker(QThread):
     def _private_playlist(self) -> int:
         if self.camera.provider == IMOU_PROVIDER:
             return imou_ffmpeg_playlist(self.camera)
+        if self.camera.local_connection is not None:
+            return private_stream_descriptor(f"ffconcat version 1.0\nfile '{self._shared_imou_url()}'\n")
         if self.imou_client is None or self.camera.imou_device is None:
             raise ImouError("The private Imou stream is not connected.")
         return private_ffmpeg_playlist(self.imou_client.stream_url(self.camera.imou_device), self.camera.transport, True)
@@ -3368,7 +3458,35 @@ class RtspStreamWorker(QThread):
                 raise ImouError("The camera video player did not start.")
             self.stop_requested.wait(0.1)
 
-    def _open_imou_tunnel(self, quality: str) -> RtspWebSocketTunnel:
+    def _shared_imou_url(self) -> str:
+        if self.imou_tunnel is None:
+            raise ImouError("The local Imou video is not connected.")
+        return self.imou_tunnel.url
+
+    def _imou_private_playlist(self, tunnel: LocalRtspTunnel) -> int:
+        try:
+            url = authenticated_imou_url(self.camera, tunnel.url, self.camera.local_connection.username)
+            return private_ffmpeg_playlist(url, self.camera.transport, low_latency=True)
+        except OSError:
+            tunnel.close()
+            raise
+
+    def _open_imou_tunnel(self, quality: str) -> RtspWebSocketTunnel | LocalRtspMediaBridge:
+        if self.camera.local_connection is not None:
+            connection = self.camera.local_connection
+            parsed = urllib.parse.urlsplit(connection.url)
+            query = dict(urllib.parse.parse_qsl(parsed.query))
+            query["subtype"] = "0" if quality == "HD" else "1"
+            url = urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
+            tunnel = LocalRtspTunnel(replace(connection, url=url))
+            descriptor = self._imou_private_playlist(tunnel)
+            try:
+                return LocalRtspMediaBridge(tunnel, descriptor)
+            except OSError:
+                tunnel.close()
+                raise
+            finally:
+                os.close(descriptor)
         if self.imou_client is None or self.camera.imou_device is None:
             raise ImouError("The private Imou stream is not connected.")
         return RtspWebSocketTunnel(self.imou_client.secure_stream_url(
@@ -3377,12 +3495,13 @@ class RtspStreamWorker(QThread):
 
     def _change_imou_quality(self, quality: str) -> None:
         tunnel = self._open_imou_tunnel(quality)
-        if not mpv_request(self.socket_path, ["loadfile", tunnel.url, "replace"])[0]:
+        url = tunnel.url
+        if not mpv_request(self.socket_path, ["loadfile", url, "replace"])[0]:
             tunnel.close()
             raise ImouError("Unable to change the camera video quality.")
         previous = self.imou_tunnel
         self.imou_tunnel = tunnel
-        self.imou_stream_url = tunnel.url
+        self.imou_stream_url = url
         self.quality = quality
         if previous is not None:
             previous.close()
@@ -3391,7 +3510,9 @@ class RtspStreamWorker(QThread):
         playlist_fd = None
         tunnel = None
         command = ["ffmpeg", "-nostats", "-loglevel", "error"]
-        if self.camera.provider == IMOU_ACCOUNT_PROVIDER:
+        if self.camera.local_connection is not None:
+            command += ["-i", self._shared_imou_url()]
+        elif self.camera.provider == IMOU_ACCOUNT_PROVIDER:
             tunnel = self._open_imou_tunnel(self.quality)
             command += ["-analyzeduration", "1", "-probesize", "32768", "-fpsprobesize", "0",
                         "-rtsp_transport", "tcp", "-i", tunnel.url]
@@ -5323,7 +5444,7 @@ class MainWindow(QMainWindow):
             if isinstance(device, RtspCamera):
                 source = "Imou Life (local)" if device.provider == IMOU_PROVIDER else "RTSP (local)"
                 if device.provider == IMOU_ACCOUNT_PROVIDER:
-                    source = f"Imou Life ({device.username})"
+                    source = f"Imou Life (local · {device.username})" if device.local_connection is not None else f"Imou Life ({device.username})"
                 if device.provider == "rtsp":
                     try:
                         if load_icam365_config(device.uid) is not None:
@@ -5349,6 +5470,12 @@ class MainWindow(QMainWindow):
         for account in self.imou_accounts:
             account_menu = self.cameras_menu.addMenu(f"Imou Life account · {account.email}")
             account_menu.setEnabled(self.imou_worker is None)
+            local_menu = account_menu.addMenu("Local video access")
+            for camera in self.imou_cameras:
+                if camera.imou_account.app_id == account.app_id:
+                    local_menu.addAction(f"{camera.name}...").triggered.connect(
+                        lambda checked=False, value=camera: self.configure_imou_local(value)
+                    )
             account_menu.addAction("Edit account...").triggered.connect(
                 lambda checked=False, value=account: self.add_imou_account(value)
             )
@@ -5899,26 +6026,10 @@ class MainWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Add Imou Life camera (local)")
         layout = QVBoxLayout(dialog)
-        form = QFormLayout()
-        name = QLineEdit()
-        name.setPlaceholderText("Driveway")
-        address = QLineEdit()
-        address.setPlaceholderText("192.168.1.100")
-        port = QSpinBox()
-        port.setRange(1, 65535)
-        port.setValue(554)
-        channel = QSpinBox()
-        channel.setRange(1, 128)
-        username = QLineEdit("admin")
-        password = QLineEdit()
-        password.setEchoMode(QLineEdit.EchoMode.Password)
-        password.setPlaceholderText("Camera safety code or device password")
-        form.addRow("Name", name)
-        form.addRow("Local IP address", address)
-        form.addRow("RTSP port", port)
-        form.addRow("Channel", channel)
-        form.addRow("Camera username", username)
-        form.addRow("Device password", password)
+        form = ImouCameraForm()
+        name, address, port, channel, username, password = (
+            form.name, form.address, form.port, form.channel, form.username, form.password,
+        )
         layout.addLayout(form)
         error = QLabel()
         error.setStyleSheet("color: #bd4242;")
@@ -5956,6 +6067,63 @@ class MainWindow(QMainWindow):
             "tcp", IMOU_PROVIDER, username.text().strip(),
         )
         self.register_rtsp_camera(camera)
+
+    def configure_imou_local(self, camera: RtspCamera) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Local video access · {camera.name}")
+        layout = QVBoxLayout(dialog)
+        enabled = QCheckBox("Use local video instead of Imou cloud video")
+        enabled.setChecked(True)
+        layout.addWidget(enabled)
+        form = ImouCameraForm(camera)
+        form.name.setReadOnly(True)
+        layout.addLayout(form)
+        encrypted = QCheckBox("TLS encryption is enabled on the camera")
+        encrypted.setChecked(camera.local_connection is None or bool(camera.local_connection.certificate_sha256))
+        layout.addWidget(encrypted)
+        error = QLabel()
+        error.setWordWrap(True)
+        error.setStyleSheet("color: #bd4242;")
+        layout.addWidget(error)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def accept_connection() -> None:
+            try:
+                records = json.loads(self.settings.value(IMOU_LOCAL_CONNECTIONS_SETTING, "{}", str))
+                if not isinstance(records, dict):
+                    raise ValueError("The saved local camera configuration is invalid.")
+                if enabled.isChecked():
+                    url = form.local_url()
+                    if not form.username.text().strip() or not form.password.text():
+                        error.setText("Enter the camera username and device password.")
+                        (form.username if not form.username.text().strip() else form.password).setFocus()
+                        return
+                    certificate = rtsp_certificate_sha256(url) if encrypted.isChecked() else ""
+                    connection = LocalRtspConnection(url, form.username.text().strip(), certificate)
+                    if not save_device_secret(IMOU_PROVIDER, camera.uid, form.password.text(), "Imou camera device password"):
+                        raise OSError("Unable to save the camera password in the desktop keyring.")
+                    records[camera.uid] = asdict(connection)
+                else:
+                    records.pop(camera.uid, None)
+                self.settings.setValue(IMOU_LOCAL_CONNECTIONS_SETTING, json.dumps(records))
+                self.settings.sync()
+                dialog.accept()
+            except (OSError, TypeError, ValueError) as ex:
+                error.setText(str(ex))
+                form.address.setFocus()
+
+        buttons.accepted.connect(accept_connection)
+        if self.exec_camera_dialog(dialog) != QDialog.DialogCode.Accepted:
+            return
+        account = camera.imou_account
+        cameras = [imou_account_camera(account, value.imou_device, self.settings)
+                   for value in self.imou_cameras if value.imou_account.app_id == account.app_id]
+        self.replace_imou_cameras(account, cameras)
+        self.save_imou_accounts()
+        self.sync_previews()
+        self.resume_live_if_idle()
 
     def register_rtsp_camera(self, camera: RtspCamera) -> None:
         self.rtsp_cameras.append(camera)
@@ -6040,7 +6208,11 @@ class MainWindow(QMainWindow):
             return
         account = self.imou_worker.account
         self.imou_accounts = [value for value in self.imou_accounts if value.app_id != account.app_id] + [account]
-        cameras = [imou_account_camera(account, device) for device in devices]
+        try:
+            cameras = [imou_account_camera(account, device, self.settings) for device in devices]
+        except ValueError as ex:
+            self.on_imou_failed(str(ex))
+            return
         self.replace_imou_cameras(account, cameras)
         self.save_imou_accounts()
         if self.imou_dialog is not None:
@@ -6112,11 +6284,30 @@ class MainWindow(QMainWindow):
         if self.imou_worker is not None:
             self.show_notice(IMOU_LOADING_MESSAGE)
             return
-        if (stored_secret(IMOU_ACCOUNT_PROVIDER, account.app_id) is not None
-                and not clear_device_secret(IMOU_ACCOUNT_PROVIDER, account.app_id)):
-            self.show_notice("Unable to remove the Imou account key from the desktop keyring.")
-            return
         removed = [camera for camera in self.imou_cameras if camera.imou_account.app_id == account.app_id]
+        try:
+            records = json.loads(self.settings.value(IMOU_LOCAL_CONNECTIONS_SETTING, "{}", str))
+            if not isinstance(records, dict):
+                raise ValueError()
+        except (TypeError, ValueError):
+            self.show_notice("The saved local camera configuration is invalid.")
+            return
+        identifiers = [(IMOU_ACCOUNT_PROVIDER, account.app_id)] + [(IMOU_PROVIDER, camera.uid) for camera in removed]
+        cleared = []
+        for category, identifier in identifiers:
+            secret = stored_secret(category, identifier)
+            if secret is None:
+                continue
+            if not clear_device_secret(category, identifier):
+                restored = all([save_device_secret(provider, uid, value, "Imou camera credential")
+                                for provider, uid, value in cleared])
+                self.show_notice("Unable to remove the Imou credentials from the desktop keyring." if restored
+                                 else "Unable to restore the Imou credentials. Configure the account and local access again.")
+                return
+            cleared.append((category, identifier, secret))
+        for camera in removed:
+            records.pop(camera.uid, None)
+        self.settings.setValue(IMOU_LOCAL_CONNECTIONS_SETTING, json.dumps(records))
         self.replace_imou_cameras(account, [])
         self.imou_accounts = [value for value in self.imou_accounts if value.app_id != account.app_id]
         for camera in removed:

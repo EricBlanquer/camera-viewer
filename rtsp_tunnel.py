@@ -1,21 +1,214 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import ipaddress
 import queue
 import re
+import select
 import socket
+import ssl
+import subprocess
 import threading
 import time
 import urllib.parse
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 
 import websocket
+
+from icam365 import broadcast_media, start_media_server
 
 
 RTSP_HEADER_END = b"\r\n\r\n"
 RTSP_MESSAGE_LIMIT = 4 * 1024 * 1024
 RTSP_TUNNEL_TIMEOUT = 15
 IMOU_REPLAY_TIME_FORMAT = "%Y_%m_%d_%H_%M_%S"
+
+
+@dataclass(frozen=True)
+class LocalRtspConnection:
+    url: str
+    username: str = "admin"
+    certificate_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        parsed = urllib.parse.urlsplit(self.url)
+        host = ipaddress.ip_address(parsed.hostname or "")
+        if (parsed.scheme != "rtsp" or not host.is_private or host.is_loopback
+                or host.is_multicast or host.is_unspecified or parsed.username or parsed.password
+                or not 1 <= (parsed.port if parsed.port is not None else 554) <= 65535 or not self.username.strip()
+                or parsed.fragment
+                or any(character in self.url + self.username for character in ("\r", "\n", "\x00"))
+                or self.certificate_sha256 and not re.fullmatch(r"[a-f0-9]{64}", self.certificate_sha256)):
+            raise ValueError("Enter a valid local RTSP camera connection.")
+
+
+def local_tls_context() -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def rtsp_certificate_sha256(url: str) -> str:
+    parsed = urllib.parse.urlsplit(LocalRtspConnection(url).url)
+    with socket.create_connection((parsed.hostname, parsed.port or 554), timeout=RTSP_TUNNEL_TIMEOUT) as connection:
+        with local_tls_context().wrap_socket(connection, server_hostname=parsed.hostname) as secure:
+            return hashlib.sha256(secure.getpeercert(binary_form=True)).hexdigest()
+
+
+def loopback_media_listener() -> socket.socket:
+    listener = socket.socket()
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(0.5)
+        return listener
+    except OSError:
+        listener.close()
+        raise
+
+
+class LocalRtspTunnel:
+    def __init__(self, configuration: LocalRtspConnection) -> None:
+        self.configuration = configuration
+        self.listener = loopback_media_listener()
+        parsed = urllib.parse.urlsplit(configuration.url)
+        self.url = urllib.parse.urlunsplit((
+            "rtsp", f"127.0.0.1:{self.listener.getsockname()[1]}", parsed.path, parsed.query, "",
+        ))
+        self.stopped = threading.Event()
+        self.client: socket.socket | None = None
+        self.connection: socket.socket | None = None
+        self.error = ""
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _connect(self) -> None:
+        parsed = urllib.parse.urlsplit(self.configuration.url)
+        self.connection = socket.create_connection((parsed.hostname, parsed.port or 554), timeout=RTSP_TUNNEL_TIMEOUT)
+        if self.configuration.certificate_sha256:
+            self.connection = local_tls_context().wrap_socket(self.connection, server_hostname=parsed.hostname)
+            fingerprint = hashlib.sha256(self.connection.getpeercert(binary_form=True)).hexdigest()
+            if not hmac.compare_digest(fingerprint, self.configuration.certificate_sha256):
+                self.error = "The local camera certificate changed. Configure its local access again."
+                raise OSError(self.error)
+        self.connection.setblocking(False)
+        self.client.setblocking(False)
+
+    def _run(self) -> None:
+        try:
+            while not self.stopped.is_set():
+                try:
+                    self.client, _ = self.listener.accept()
+                    break
+                except TimeoutError:
+                    continue
+            if self.client is None or self.stopped.is_set():
+                return
+            self._connect()
+            pending = {self.client: bytearray(), self.connection: bytearray()}
+            draining = False
+            while not self.stopped.is_set():
+                readable = [] if draining else [source for source in pending
+                    if len(pending[self.connection if source is self.client else self.client]) < RTSP_MESSAGE_LIMIT]
+                writable = [target for target, data in pending.items() if data]
+                if draining and not writable:
+                    return
+                readers, writers, _ = select.select(readable, writable, [], 0.2)
+                if (self.connection in readable and isinstance(self.connection, ssl.SSLSocket)
+                        and self.connection.pending() and self.connection not in readers):
+                    readers.append(self.connection)
+                for source in readers:
+                    target = self.connection if source is self.client else self.client
+                    try:
+                        data = source.recv(min(65536, RTSP_MESSAGE_LIMIT - len(pending[target])))
+                    except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                        continue
+                    if not data:
+                        draining = True
+                        continue
+                    pending[target].extend(data)
+                for target in writers:
+                    try:
+                        written = target.send(pending[target])
+                    except (ssl.SSLWantWriteError, ssl.SSLWantReadError, BlockingIOError):
+                        continue
+                    del pending[target][:written]
+        except (OSError, ValueError):
+            if not self.stopped.is_set() and not self.error:
+                self.error = "The local camera connection failed. Check the camera network or VPN."
+        finally:
+            self._close_sockets()
+
+    def _close_sockets(self) -> None:
+        self.stopped.set()
+        for connection in (self.connection, self.client, self.listener):
+            if connection is not None:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        self._close_sockets()
+        self.thread.join(timeout=RTSP_TUNNEL_TIMEOUT + 2)
+
+
+class LocalRtspMediaBridge:
+    def __init__(self, tunnel: LocalRtspTunnel, playlist_fd: int) -> None:
+        self.tunnel = tunnel
+        self.stopped = threading.Event()
+        self.failure = ""
+        self.subscribers: set[queue.Queue] = set()
+        self.subscriber_lock = threading.Lock()
+        self.server, self.server_thread, self.url = start_media_server(self)
+        try:
+            self.process = subprocess.Popen([
+                "ffmpeg", "-nostdin", "-nostats", "-loglevel", "error",
+                "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe,rtsp,tcp,udp,rtp",
+                "-i", f"/proc/self/fd/{playlist_fd}", "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+                "-f", "mpegts", "-mpegts_flags", "+resend_headers", "-muxdelay", "0", "-muxpreload", "0",
+                "-flush_packets", "1", "pipe:1",
+            ], pass_fds=(playlist_fd,), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0)
+        except OSError:
+            self.stopped.set()
+            self.server.shutdown()
+            self.server.server_close()
+            self.server_thread.join(timeout=2)
+            tunnel.close()
+            raise
+        self.thread = threading.Thread(target=self._broadcast, daemon=True)
+        self.thread.start()
+
+    @property
+    def error(self) -> str:
+        return self.tunnel.error or self.failure
+
+    def _broadcast(self) -> None:
+        broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock)
+        if not self.stopped.is_set():
+            self.failure = "The local camera media stream stopped. Check the camera network or VPN."
+            self.stopped.set()
+
+    def close(self) -> None:
+        self.stopped.set()
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=3)
+        self.tunnel.close()
+        self.thread.join(timeout=3)
+        self.process.stdout.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(timeout=2)
 
 
 def rewrite_rtsp_message(message: bytes, source: bytes, target: bytes) -> bytes:
@@ -69,10 +262,7 @@ class WebSocketMediaTunnel:
             raise OSError("The camera returned an invalid secure RTSP gateway.") from None
         self.upstream = upstream.encode()
         self.gateway = f"wss://{parsed.netloc}{self.gateway_path}"
-        self.listener = socket.socket()
-        self.listener.bind(("127.0.0.1", 0))
-        self.listener.listen(1)
-        self.listener.settimeout(0.5)
+        self.listener = loopback_media_listener()
         self.url = f"{self.player_scheme}://127.0.0.1:{self.listener.getsockname()[1]}/recording"
         self.stopped = threading.Event()
         self.client: socket.socket | None = None

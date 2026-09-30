@@ -8,7 +8,8 @@ from unittest.mock import patch
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PyQt6.QtCore import QRect, QSettings
-from PyQt6.QtWidgets import QApplication, QPushButton
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication, QPushButton, QWidget
 
 from app import CameraPreview, IMOU_ACCOUNT_PROVIDER, MainWindow, ReplayControls, RtspCamera
 from imou import IMOU_TRAFFIC_MESSAGE
@@ -104,6 +105,37 @@ class OverlayLayoutTest(unittest.TestCase):
                     self.assertTrue(video_area.contains(status.geometry()))
                     label = status.label
                     self.assertGreaterEqual(label.height(), label.heightForWidth(label.width()))
+
+    def test_background_errors_stay_hidden_and_reappear_only_with_the_owner_window(self) -> None:
+        other = QWidget()
+        status = next(iter(self.window.previews.values())).video.status_overlay
+        try:
+            self.window.activateWindow()
+            self.application.processEvents()
+            status.display("The camera stopped sending video.", True)
+            self.application.processEvents()
+            self.assertTrue(status.isVisible())
+            other.show()
+            other.activateWindow()
+            QTest.qWait(10)
+            self.assertFalse(self.window.isActiveWindow())
+            self.assertFalse(status.isVisible())
+            status.display("Reconnecting to live video.", True)
+            self.application.processEvents()
+            self.assertFalse(status.isVisible())
+            self.assertIs(QApplication.activeWindow(), other)
+            self.window.activateWindow()
+            QTest.qWait(10)
+            self.assertTrue(status.isVisible())
+            self.assertEqual(status.label.text(), "Reconnecting to live video.")
+            status.hide()
+            other.activateWindow()
+            self.application.processEvents()
+            self.window.activateWindow()
+            self.application.processEvents()
+            self.assertFalse(status.isVisible())
+        finally:
+            other.close()
 
 
 if __name__ == "__main__":

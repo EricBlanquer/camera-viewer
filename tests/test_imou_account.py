@@ -616,7 +616,8 @@ class ImouAccountUiTest(unittest.TestCase):
         ):
             self.window.remove_imou_account(ACCOUNT)
         self.assertEqual(self.window.imou_cameras, [camera])
-        with patch("app.stored_secret", return_value="saved-key"), patch(
+        with patch("app.stored_secret", side_effect=lambda category, identifier:
+                   "saved-key" if category == IMOU_ACCOUNT_PROVIDER else None), patch(
             "app.clear_device_secret", return_value=True
         ) as clear:
             self.window.remove_imou_account(ACCOUNT)

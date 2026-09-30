@@ -347,7 +347,7 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "video/mp2t")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            while not bridge.stopped.is_set():
+            while not bridge.stopped.is_set() or not subscriber.empty():
                 try:
                     data = subscriber.get(timeout=1)
                 except queue.Empty:
@@ -363,6 +363,37 @@ class StreamHandler(BaseHTTPRequestHandler):
                 bridge.subscribers.discard(subscriber)
 
     def log_message(self, format: str, *args) -> None:
+        pass
+
+
+def start_media_server(owner):
+    owner.stream_path = "/" + secrets.token_urlsafe(24)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), StreamHandler)
+    server.daemon_threads = True
+    server.bridge = owner
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_port}{owner.stream_path}"
+
+
+def broadcast_media(process, stopped, subscribers, subscriber_lock) -> None:
+    try:
+        while not stopped.is_set():
+            data = process.stdout.read(188 * 32)
+            if not data:
+                break
+            with subscriber_lock:
+                for subscriber in list(subscribers):
+                    try:
+                        subscriber.put_nowait(data)
+                    except queue.Full:
+                        subscribers.remove(subscriber)
+                        try:
+                            while True:
+                                subscriber.get_nowait()
+                        except queue.Empty:
+                            subscriber.put_nowait(None)
+    except OSError:
         pass
 
 
@@ -383,14 +414,8 @@ class NativeBridge:
         self.video_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=128)
         self.audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=512)
         self.process: subprocess.Popen | None = None
-        self.stream_path = "/" + secrets.token_urlsafe(24)
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), StreamHandler)
-        self.server.daemon_threads = True
-        self.server.bridge = self
-        self.url = f"http://127.0.0.1:{self.server.server_port}{self.stream_path}"
-        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server, self.server_thread, self.url = start_media_server(self)
         self.thread = threading.Thread(target=self._run, daemon=True)
-        self.server_thread.start()
         self.thread.start()
 
     def control(self, command: int, payload: bytes) -> bool:
@@ -433,25 +458,7 @@ class NativeBridge:
                 self.stopped.set()
 
     def _broadcast(self) -> None:
-        process = self.process
-        try:
-            while not self.stopped.is_set():
-                data = process.stdout.read(188 * 32)
-                if not data:
-                    break
-                with self.subscriber_lock:
-                    for subscriber in list(self.subscribers):
-                        try:
-                            subscriber.put_nowait(data)
-                        except queue.Full:
-                            self.subscribers.remove(subscriber)
-                            try:
-                                while True:
-                                    subscriber.get_nowait()
-                            except queue.Empty:
-                                subscriber.put_nowait(None)
-        except OSError:
-            pass
+        broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock)
         if not self.stopped.is_set():
             self.error = "The iCam365 media muxer stopped."
             self.stopped.set()
