@@ -27,7 +27,7 @@ import urllib.request
 import uuid
 from collections import deque
 from pathlib import Path
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import BinaryIO, Callable
 from datetime import datetime, timedelta, timezone
 
@@ -99,8 +99,9 @@ from okam_native.wakeup import WakeError, load_wake_credentials, wake_camera
 from icam365 import PTZ_COMMAND, PTZ_POSITION_COMMAND, close_bridge, get_bridge, load_config as load_icam365_config
 from imou import (
     IMOU_ACCOUNT_URL, IMOU_PRIVACY_MESSAGE, IMOU_REGIONS, IMOU_SECRET_MISSING_MESSAGE,
-    ImouAccount, ImouClient, ImouDevice, ImouError,
+    ImouAccount, ImouClient, ImouDevice, ImouError, ImouRecording,
 )
+from rtsp_tunnel import ImouReplayTunnel, RtspWebSocketTunnel
 from local_detection import (
     DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, organize_events, prune_events,
 )
@@ -696,8 +697,9 @@ def mpv_rtsp_command(
     command.insert(-1, RTSP_DENOISE_FILTER)
     if camera.provider == IMOU_ACCOUNT_PROVIDER:
         command[-1] = "--idle=yes"
-        command.insert(-1, "--no-audio")
-        command.insert(-1, f"--demuxer-lavf-o-add={IMOU_INPUT_CLOCK}")
+        command.insert(-1, "--demuxer-lavf-probesize=32768")
+        command.insert(-1, "--demuxer-lavf-analyzeduration=0.000001")
+        command.insert(-1, "--demuxer-lavf-o-add=fpsprobesize=0")
     elif camera.provider == IMOU_PROVIDER:
         if playlist_fd is None:
             raise ValueError("A private Imou stream playlist is required.")
@@ -789,6 +791,16 @@ def load_imou_cameras(settings: QSettings, accounts: list[ImouAccount]) -> list[
 def camera_continuous_allowed(camera: AccountDevice | RtspCamera) -> bool:
     return (not isinstance(camera, RtspCamera) or camera.provider != IMOU_ACCOUNT_PROVIDER
             or camera.imou_account is not None and camera.imou_account.cloud_recording)
+
+
+def set_replay_menu(button: QPushButton, remote: Callable[[], None], local: Callable[[], None]) -> None:
+    previous = button.menu()
+    if previous is not None:
+        previous.deleteLater()
+    menu = QMenu(button)
+    menu.addAction("Camera recordings").triggered.connect(remote)
+    menu.addAction("Local recordings (24 h)").triggered.connect(local)
+    button.setMenu(menu)
 
 
 class CameraCredentialError(OSError):
@@ -1412,6 +1424,7 @@ class CardRecording:
     start: datetime
     duration: int
     size: int
+    detection_event: bool | None = None
 
     @property
     def end(self) -> datetime:
@@ -1419,7 +1432,7 @@ class CardRecording:
 
     @property
     def detection(self) -> bool:
-        return is_detection_recording(self.name)
+        return self.detection_event if self.detection_event is not None else is_detection_recording(self.name)
 
 
 def list_recordings(session: CS2Session, user: str, password: str, day: str) -> list[CardRecording]:
@@ -3216,8 +3229,12 @@ class RtspStreamWorker(QThread):
     ptz_available = pyqtSignal()
     control_completed = pyqtSignal(str)
     control_failed = pyqtSignal(str)
+    capabilities_found = pyqtSignal(list, object)
+    setting_completed = pyqtSignal(str, object)
+    setting_failed = pyqtSignal(str, str)
 
-    def __init__(self, camera: RtspCamera, player: subprocess.Popen[bytes], socket_path: Path) -> None:
+    def __init__(self, camera: RtspCamera, player: subprocess.Popen[bytes], socket_path: Path,
+                 quality: str = "HD") -> None:
         super().__init__()
         self.camera = camera
         self.player = player
@@ -3240,7 +3257,18 @@ class RtspStreamWorker(QThread):
         self.ptz_request: str | None = None
         self.native_bridge = None
         self.imou_stream_url = ""
+        self.imou_tunnel: RtspWebSocketTunnel | None = None
+        self.recording_tunnels: dict[subprocess.Popen[bytes], RtspWebSocketTunnel] = {}
         self.imou_client: ImouClient | None = None
+        self.imou_collections: dict[str, str] = {}
+        self.quality = quality if quality in ("HD", "SD") else "HD"
+        self.settings_requests: queue.Queue[tuple[str, object]] = queue.Queue()
+
+    def queue_setting(self, name: str, value: object) -> bool:
+        if self.camera.provider != IMOU_ACCOUNT_PROVIDER or name != SETTING_QUALITY or value not in ("HD", "SD"):
+            return False
+        self.settings_requests.put((name, value))
+        return True
 
     def set_continuous(self, enabled: bool) -> None:
         if enabled and camera_continuous_allowed(self.camera):
@@ -3256,7 +3284,7 @@ class RtspStreamWorker(QThread):
             self.light_request = mode
 
     def set_ptz(self, direction: str) -> bool:
-        if self.native_bridge is not None:
+        if self.native_bridge is not None or self.imou_client is not None:
             pan, presets = self.movement_options()
             if direction not in ICAM365_TILT_ACTIONS and not (pan and direction in ("Left", "Right")) and direction not in presets:
                 return False
@@ -3269,6 +3297,8 @@ class RtspStreamWorker(QThread):
         return True
 
     def movement_options(self) -> tuple[bool, dict[str, str]]:
+        if self.imou_client is not None and self.camera.imou_device is not None:
+            return self.camera.imou_device.supports("PT", "PTZ"), self.imou_collections
         if self.native_bridge is None:
             return False, {}
         return self.native_bridge.pan_supported, {command: preset.name for command, preset in self.native_bridge.presets.items()}
@@ -3302,7 +3332,8 @@ class RtspStreamWorker(QThread):
         if device.privacy:
             raise ImouError(IMOU_PRIVACY_MESSAGE)
         self.imou_client = ImouClient(account, stored_secret(IMOU_ACCOUNT_PROVIDER, account.app_id) or "")
-        self.imou_stream_url = self.imou_client.stream_url(device)
+        self.imou_tunnel = self._open_imou_tunnel(self.quality)
+        self.imou_stream_url = self.imou_tunnel.url
         deadline = time.monotonic() + 10
         while not self.stop_requested.is_set():
             if self.player.poll() is not None:
@@ -3315,10 +3346,34 @@ class RtspStreamWorker(QThread):
                 raise ImouError("The camera video player did not start.")
             self.stop_requested.wait(0.1)
 
+    def _open_imou_tunnel(self, quality: str) -> RtspWebSocketTunnel:
+        if self.imou_client is None or self.camera.imou_device is None:
+            raise ImouError("The private Imou stream is not connected.")
+        return RtspWebSocketTunnel(self.imou_client.secure_stream_url(
+            self.camera.imou_device, 0 if quality == "HD" else 1,
+        ))
+
+    def _change_imou_quality(self, quality: str) -> None:
+        tunnel = self._open_imou_tunnel(quality)
+        if not mpv_request(self.socket_path, ["loadfile", tunnel.url, "replace"])[0]:
+            tunnel.close()
+            raise ImouError("Unable to change the camera video quality.")
+        previous = self.imou_tunnel
+        self.imou_tunnel = tunnel
+        self.imou_stream_url = tunnel.url
+        self.quality = quality
+        if previous is not None:
+            previous.close()
+
     def _ffmpeg(self, output: Path, segmented: bool) -> subprocess.Popen[bytes]:
         playlist_fd = None
+        tunnel = None
         command = ["ffmpeg", "-nostats", "-loglevel", "error"]
-        if self.camera.provider in (IMOU_PROVIDER, IMOU_ACCOUNT_PROVIDER):
+        if self.camera.provider == IMOU_ACCOUNT_PROVIDER:
+            tunnel = self._open_imou_tunnel(self.quality)
+            command += ["-analyzeduration", "1", "-probesize", "32768", "-fpsprobesize", "0",
+                        "-rtsp_transport", "tcp", "-i", tunnel.url]
+        elif self.camera.provider == IMOU_PROVIDER:
             playlist_fd = self._private_playlist()
             command += [
                 "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe,rtsp,tcp,udp,rtp",
@@ -3327,10 +3382,7 @@ class RtspStreamWorker(QThread):
         else:
             bridge = get_bridge(self.camera.uid)
             command += (["-i", bridge.url] if bridge is not None else ["-rtsp_transport", self.camera.transport, "-i", self.camera.url])
-        command += ["-map", "0:v:0"]
-        if self.camera.provider != IMOU_ACCOUNT_PROVIDER:
-            command += ["-map", "0:a?"]
-        command += ["-c", "copy"]
+        command += ["-map", "0:v:0", "-map", "0:a?", "-c", "copy"]
         if segmented:
             command += [
                 "-f", "segment", "-segment_format", "matroska",
@@ -3340,11 +3392,18 @@ class RtspStreamWorker(QThread):
         else:
             command += ["-f", "matroska"]
         try:
-            return subprocess.Popen(
+            process = subprocess.Popen(
                 command + [str(output)], stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 pass_fds=(playlist_fd,) if playlist_fd is not None else (),
             )
+            if tunnel is not None:
+                self.recording_tunnels[process] = tunnel
+            return process
+        except OSError:
+            if tunnel is not None:
+                tunnel.close()
+            raise
         finally:
             if playlist_fd is not None:
                 os.close(playlist_fd)
@@ -3359,6 +3418,14 @@ class RtspStreamWorker(QThread):
             process.wait(timeout=5)
         return process.returncode == 0
 
+    def _finish_recording_process(self, process: subprocess.Popen[bytes]) -> bool:
+        try:
+            return self._finish(process)
+        finally:
+            tunnel = self.recording_tunnels.pop(process, None)
+            if tunnel is not None:
+                tunnel.close()
+
     def _stop_recording(self) -> None:
         process = self.recording
         path = self.recording_path
@@ -3367,7 +3434,7 @@ class RtspStreamWorker(QThread):
         self.recording_announced = False
         if process is None or path is None:
             return
-        if self._finish(process) and path.is_file() and path.stat().st_size > 0:
+        if self._finish_recording_process(process) and path.is_file() and path.stat().st_size > 0:
             self.recording_saved.emit(str(path))
         else:
             path.unlink(missing_ok=True)
@@ -3381,6 +3448,8 @@ class RtspStreamWorker(QThread):
                 self.native_bridge = get_bridge(self.camera.uid)
             deadline = time.monotonic() + (60 if self.native_bridge is not None else 30)
             while not self.stop_requested.is_set():
+                if self.imou_tunnel is not None and self.imou_tunnel.error:
+                    raise OSError(self.imou_tunnel.error)
                 if self.native_bridge is not None and self.native_bridge.error:
                     raise OSError(self.native_bridge.error)
                 if self.player.poll() is not None:
@@ -3396,8 +3465,10 @@ class RtspStreamWorker(QThread):
             if self.stop_requested.is_set():
                 return
             self.status_changed.emit("Live video")
+            if self.imou_client is not None:
+                self.capabilities_found.emit(["HD", "SD"], None)
             tracks_ready, tracks = mpv_request(self.socket_path, ["get_property", "track-list"])
-            if self.camera.provider != IMOU_ACCOUNT_PROVIDER and tracks_ready and isinstance(tracks, list) and any(
+            if tracks_ready and isinstance(tracks, list) and any(
                 isinstance(track, dict) and track.get("type") == "audio" for track in tracks
             ):
                 self.audio_available.emit()
@@ -3406,7 +3477,14 @@ class RtspStreamWorker(QThread):
                 self.light_available.emit()
             if self.native_bridge is not None and self.native_bridge.light_mode is not None:
                 self.light_changed.emit(self.native_bridge.light_mode)
-            ptz_supported = self.native_bridge.ptz_supported if self.native_bridge is not None else icam365_ptz_request(self.camera)
+            if self.imou_client is not None and self.camera.imou_device is not None:
+                ptz_supported = self.camera.imou_device.supports("PT", "PTZ")
+                try:
+                    self.imou_collections = self.imou_client.collections(self.camera.imou_device)
+                except ImouError:
+                    self.control_failed.emit("Unable to read saved camera positions.")
+            else:
+                ptz_supported = self.native_bridge.ptz_supported if self.native_bridge is not None else icam365_ptz_request(self.camera)
             if ptz_supported:
                 self.ptz_available.emit()
             movement_options = self.movement_options()
@@ -3417,10 +3495,24 @@ class RtspStreamWorker(QThread):
             pending_light = None
             pending_ptz = None
             while not self.stop_requested.is_set():
+                if self.imou_tunnel is not None and self.imou_tunnel.error:
+                    raise OSError(self.imou_tunnel.error)
                 if self.native_bridge is not None and self.native_bridge.error:
                     raise OSError(self.native_bridge.error)
                 if self.player.poll() is not None:
                     raise OSError("The camera video player stopped.")
+                try:
+                    setting, quality = self.settings_requests.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    try:
+                        self._change_imou_quality(quality)
+                        latency_guard = LiveLatencyGuard()
+                        last_progress_at = time.monotonic()
+                        self.setting_completed.emit(setting, quality)
+                    except OSError as ex:
+                        self.setting_failed.emit(setting, str(ex))
                 current_options = self.movement_options()
                 current_ptz = self.native_bridge.ptz_supported if self.native_bridge is not None else ptz_supported
                 if current_ptz and (not ptz_supported or current_options != movement_options):
@@ -3444,7 +3536,13 @@ class RtspStreamWorker(QThread):
                     direction = self.ptz_request
                     self.ptz_request = None
                 if direction is not None:
-                    if self.native_bridge is not None:
+                    if self.imou_client is not None and self.camera.imou_device is not None:
+                        try:
+                            self.imou_client.move(self.camera.imou_device, direction, self.imou_collections)
+                            self.control_completed.emit(direction)
+                        except ImouError as ex:
+                            self.control_failed.emit(str(ex))
+                    elif self.native_bridge is not None:
                         if self.native_bridge.move_camera(direction):
                             pending_ptz = (direction, time.monotonic() + 8)
                         else:
@@ -3491,9 +3589,10 @@ class RtspStreamWorker(QThread):
                         LOG.info("Continuous RTSP recording could not start: %s", ex)
                         self.continuous_failed.emit("Unable to start continuous RTSP recording.")
                 elif not self.continuous_enabled.is_set() and self.continuous is not None:
-                    self._finish(self.continuous)
+                    self._finish_recording_process(self.continuous)
                     self.continuous = None
                 if self.continuous is not None and self.continuous.poll() is not None:
+                    self._finish_recording_process(self.continuous)
                     self.continuous = None
                     self.continuous_enabled.clear()
                     self.continuous_failed.emit("Continuous RTSP recording stopped.")
@@ -3531,7 +3630,11 @@ class RtspStreamWorker(QThread):
             self.imou_client = None
             self._stop_recording()
             if self.continuous is not None:
-                self._finish(self.continuous)
+                self._finish_recording_process(self.continuous)
+                self.continuous = None
+            if self.imou_tunnel is not None:
+                self.imou_tunnel.close()
+                self.imou_tunnel = None
             if self.local_detector is not None:
                 self.local_detector.close()
                 self.local_detector = None
@@ -3616,17 +3719,11 @@ class CameraPreview(QWidget):
         controls.addStretch(1)
         self.replay_button = QPushButton()
         set_button_icon(self.replay_button, "replay", "Play back recordings")
-        if isinstance(camera, RtspCamera):
+        if isinstance(camera, RtspCamera) and camera.provider != IMOU_ACCOUNT_PROVIDER:
             self.replay_button.clicked.connect(lambda: self.replay_requested.emit(self.camera))
         else:
-            replay_menu = QMenu(self.replay_button)
-            replay_menu.addAction("Camera recordings").triggered.connect(
-                lambda: self.camera_replay_requested.emit(self.camera)
-            )
-            replay_menu.addAction("Local recordings (24 h)").triggered.connect(
-                lambda: self.replay_requested.emit(self.camera)
-            )
-            self.replay_button.setMenu(replay_menu)
+            set_replay_menu(self.replay_button, lambda: self.camera_replay_requested.emit(self.camera),
+                            lambda: self.replay_requested.emit(self.camera))
         controls.addWidget(self.replay_button)
         self.snapshot_button = QPushButton()
         self.record_button = QPushButton()
@@ -3684,6 +3781,7 @@ class CameraPreview(QWidget):
             self.light_action.triggered.connect(self.toggle_light)
             self.light_action.changed.connect(self._update_light_action)
             self.light_button.clicked.connect(self.light_action.trigger)
+        if not isinstance(camera, RtspCamera) or camera.provider == IMOU_ACCOUNT_PROVIDER:
             self.quality_button = QPushButton(DEFAULT_QUALITY_LABEL)
             self.quality_button.setObjectName("qualityButton")
             self.quality_button.setFixedSize(56, 44)
@@ -3801,7 +3899,8 @@ class CameraPreview(QWidget):
             if playlist_fd is not None:
                 os.close(playlist_fd)
         if rtsp_camera:
-            self.worker = RtspStreamWorker(rtsp_camera, self.player, socket_path)
+            quality = self.settings.value(f"{QUALITY_SETTING}/{self.camera.uid}", "HD", str) if self.settings is not None else "HD"
+            self.worker = RtspStreamWorker(rtsp_camera, self.player, socket_path, quality)
         else:
             assert self.player.stdin is not None
             try:
@@ -3837,9 +3936,9 @@ class CameraPreview(QWidget):
             self.worker.sound_failed.connect(self._on_sound_failed)
             self.worker.control_completed.connect(self._on_control_finished)
             self.worker.control_failed.connect(self._on_control_failed)
-            self.worker.capabilities_found.connect(self._on_capabilities)
-            self.worker.setting_completed.connect(self._on_setting_completed)
-            self.worker.setting_failed.connect(self._on_setting_failed)
+        self.worker.capabilities_found.connect(self._on_capabilities)
+        self.worker.setting_completed.connect(self._on_setting_completed)
+        self.worker.setting_failed.connect(self._on_setting_failed)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
 
@@ -4086,7 +4185,7 @@ class CameraPreview(QWidget):
             self.light_button.setEnabled(self.light_action.isEnabled())
 
     def _queue_setting(self, name: str, value: object) -> None:
-        if not self.live or not isinstance(self.worker, StreamWorker) or self.setting_pending:
+        if not self.live or self.worker is None or self.setting_pending:
             return
         if self.worker.queue_setting(name, value):
             self.setting_pending = True
@@ -4165,18 +4264,171 @@ class CameraPreview(QWidget):
             self.stopped.emit()
 
 
+class ImouReplayWorker(QThread):
+    catalog_ready = pyqtSignal(list)
+    playback_ready = pyqtSignal(str, str, float)
+    saved = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, camera: RtspCamera) -> None:
+        super().__init__()
+        self.camera = camera
+        self.requests: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.downloads: queue.Queue[tuple[ImouRecording, Path]] = queue.Queue()
+        self.saving = threading.Event()
+        self.stopped = threading.Event()
+        self.tunnel: ImouReplayTunnel | None = None
+        self.client: ImouClient | None = None
+        self.playback_generation = 0
+
+    def list_range(self, start: datetime, end: datetime) -> None:
+        self.requests.put(("list", (start, end)))
+
+    def open_recording(self, recording: ImouRecording, offset: float = 0) -> None:
+        self.playback_generation += 1
+        self.requests.put(("open", (recording, offset, self.playback_generation)))
+
+    def save_recording(self, recording: ImouRecording, target: Path) -> bool:
+        if self.saving.is_set() or self.stopped.is_set():
+            return False
+        self.saving.set()
+        self.downloads.put((recording, target))
+        return True
+
+    def stop(self) -> None:
+        self.stopped.set()
+
+    def run(self) -> None:
+        downloader = None
+        try:
+            account = self.camera.imou_account
+            if account is None or self.camera.imou_device is None:
+                raise ImouError("The Imou playback account configuration is invalid.")
+            self.client = ImouClient(account, stored_secret(IMOU_ACCOUNT_PROVIDER, account.app_id) or "")
+            downloader = threading.Thread(target=self._download, daemon=True)
+            downloader.start()
+            while not self.stopped.is_set():
+                try:
+                    command, value = self.requests.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                try:
+                    if command == "list":
+                        self.catalog_ready.emit(self.client.recordings(self.camera.imou_device, *value))
+                    elif command == "open":
+                        recording, offset, generation = value
+                        if generation != self.playback_generation:
+                            continue
+                        if self.tunnel is not None:
+                            self.tunnel.close()
+                            self.tunnel = None
+                        if self.stopped.is_set():
+                            break
+                        duration = (recording.end - recording.start).total_seconds()
+                        offset = min(max(0, math.floor(offset)), max(0, duration - 1))
+                        selected = replace(recording, start=recording.start + timedelta(seconds=offset))
+                        url = self.client.replay_url(self.camera.imou_device, selected)
+                        if self.stopped.is_set():
+                            break
+                        if generation != self.playback_generation:
+                            continue
+                        self.tunnel = ImouReplayTunnel(url, selected.start, selected.end,
+                                                      self.camera.imou_device.channel_id)
+                        if not self.stopped.is_set():
+                            self.playback_ready.emit(recording.key, self.tunnel.url, offset)
+                except OSError as ex:
+                    if not self.stopped.is_set():
+                        self.failed.emit(str(ex))
+        except OSError as ex:
+            if not self.stopped.is_set():
+                self.failed.emit(str(ex))
+        finally:
+            self.stopped.set()
+            if self.tunnel is not None:
+                self.tunnel.close()
+                self.tunnel = None
+            if downloader is not None:
+                downloader.join()
+            self.client = None
+
+    def _download(self) -> None:
+        client = None
+        while not self.stopped.is_set():
+            try:
+                request = self.downloads.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                if client is None:
+                    account = self.camera.imou_account
+                    client = ImouClient(account, stored_secret(IMOU_ACCOUNT_PROVIDER, account.app_id) or "")
+                self._save(*request, client=client)
+            except OSError as ex:
+                if not self.stopped.is_set():
+                    self.failed.emit(str(ex))
+            finally:
+                self.saving.clear()
+
+    def _save(self, recording: ImouRecording, target: Path, client: ImouClient | None = None) -> None:
+        if self.stopped.is_set():
+            return
+        url = (client or self.client).replay_url(self.camera.imou_device, recording)
+        if self.stopped.is_set():
+            return
+        tunnel = ImouReplayTunnel(url, recording.start, recording.end, self.camera.imou_device.channel_id)
+        process = None
+        temporary = None
+        try:
+            descriptor, filename = tempfile.mkstemp(prefix="intraswitch_camera_viewer_", suffix=MATROSKA_SUFFIX,
+                                                   dir=target.parent)
+            os.close(descriptor)
+            temporary = Path(filename)
+            duration = math.ceil((recording.end - recording.start).total_seconds())
+            process = subprocess.Popen([
+                "ffmpeg", "-nostats", "-loglevel", "error", "-analyzeduration", "1000000", "-probesize", "1048576",
+                "-fpsprobesize", "0", "-f", "dhav",
+                "-i", tunnel.url, "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+                "-f", "matroska", "-y", str(temporary),
+            ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            deadline = time.monotonic() + duration + 60
+            while process.poll() is None and not self.stopped.is_set():
+                if time.monotonic() >= deadline or tunnel.error:
+                    break
+                self.stopped.wait(0.1)
+            succeeded = (process.poll() == 0 and not tunnel.error and temporary.is_file()
+                         and temporary.stat().st_size > 0)
+            if succeeded and not self.stopped.is_set():
+                temporary.replace(target)
+                self.saved.emit(str(target))
+            elif not self.stopped.is_set():
+                raise ImouError("Unable to save the camera recording.")
+        finally:
+            if process is not None and process.poll() is None:
+                RtspStreamWorker._finish(process)
+            tunnel.close()
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
 class LocalReplayPane(QWidget):
     live_requested = pyqtSignal()
     fullscreen_requested = pyqtSignal()
+    stopped = pyqtSignal()
 
     def __init__(
         self, camera: AccountDevice | RtspCamera, parent: QWidget,
         worker: StreamWorker | RtspStreamWorker | None = None,
         initial_detection: DetectionEvent | None = None,
+        camera_recordings: bool = False,
     ) -> None:
         super().__init__(parent)
         self.camera = camera
         self.worker = worker
+        self.camera_recordings = camera_recordings
+        self.remote_worker: ImouReplayWorker | None = None
+        self.remote_recordings: dict[Path, ImouRecording] = {}
+        self.remote_days: set[datetime] = set()
+        self.closing = False
         self.live_title = ""
         self.playback_title = f"{camera.name} · Playback"
         self.player: subprocess.Popen[bytes] | None = None
@@ -4188,6 +4440,7 @@ class LocalReplayPane(QWidget):
         self.current_path: Path | None = None
         self.segment_durations: dict[Path, int] = {}
         self.pending_seek: float | None = None
+        self.remote_offset = 0.0
         self.rewind_after_load = False
         self.zoom_level = 0
         self.speed_index = 0
@@ -4242,6 +4495,19 @@ class LocalReplayPane(QWidget):
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_recordings)
         self.refresh_timer.start(60_000)
+        if camera_recordings:
+            if not isinstance(camera, RtspCamera) or camera.provider != IMOU_ACCOUNT_PROVIDER:
+                raise OSError("Camera playback is unavailable through this connection.")
+            self.remote_worker = ImouReplayWorker(camera)
+            self.controls.speed_button.setVisible(camera.imou_device.supports("LRRF"))
+            self.remote_worker.catalog_ready.connect(self.on_remote_catalog)
+            self.remote_worker.playback_ready.connect(self.on_remote_playback)
+            self.remote_worker.saved.connect(lambda path: self.status_overlay.display(f"Recording saved: {Path(path).name}"))
+            self.remote_worker.failed.connect(self.status_overlay.display)
+            self.remote_worker.finished.connect(self.on_remote_finished)
+            self.timeline.range_changed.connect(self.load_remote_range)
+            self.remote_worker.start()
+            self.refresh_timer.setInterval(300_000)
         QTimer.singleShot(0, self.refresh_recordings)
 
     def show_overlay(self) -> None:
@@ -4260,6 +4526,12 @@ class LocalReplayPane(QWidget):
             self.show_overlay()
 
     def refresh_recordings(self) -> None:
+        if self.closing:
+            return
+        if self.remote_worker is not None:
+            self.remote_days.discard(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0))
+            self.load_remote_range(datetime.now() - timedelta(days=1), datetime.now())
+            return
         try:
             continuous = camera_recordings(self.camera, self.active_recordings())
             self.detected_events = {event.clip: event for event in load_events(self.camera.uid) if event.clip is not None}
@@ -4295,8 +4567,18 @@ class LocalReplayPane(QWidget):
             self.play_selected(self.recordings.index(latest), rewind=True)
 
     def recording_start(self, path: Path) -> datetime | None:
+        if path in self.remote_recordings:
+            return self.remote_recordings[path].start
         event = self.detected_events.get(path)
         return event.clip_start if event is not None else segment_time(path)
+
+    def playback_offset(self) -> float:
+        if self.remote_worker is not None and self.remote_worker.tunnel is not None:
+            start = self.recording_start(self.current_path)
+            media_start = self.remote_worker.tunnel.media_start
+            if start is not None and media_start is not None:
+                return (media_start - start).total_seconds()
+        return self.remote_offset
 
     def play_detection(self, event: DetectionEvent) -> None:
         if event.clip not in self.recordings or event.clip_start is None:
@@ -4305,19 +4587,26 @@ class LocalReplayPane(QWidget):
         self.play_selected(self.recordings.index(event.clip), max(0.0, (event.first - event.clip_start).total_seconds()))
 
     def jump_detection(self, direction: int) -> None:
-        events = sorted(self.detected_events.values(), key=lambda event: event.first)
+        events = sorted(
+            [(recording.start, path, 0.0) for path, recording in self.remote_recordings.items() if recording.detection]
+            if self.remote_worker is not None else [
+                (event.first, event.clip, max(0.0, (event.first - event.clip_start).total_seconds()))
+                for event in self.detected_events.values() if event.clip in self.recordings and event.clip_start is not None
+            ], key=lambda event: event[0],
+        )
         if not events:
-            self.status_overlay.display("No local detection")
+            self.status_overlay.display("No detection in these recordings")
             return
         current = self.recording_start(self.current_path) if self.current_path is not None else None
         position_ready, position = mpv_request(self.socket_path, ["get_property", "time-pos"])
-        moment = current + timedelta(seconds=position) if current is not None and position_ready and isinstance(position, (int, float)) else datetime.now()
-        candidates = (event for event in events if event.first < moment - timedelta(seconds=1)) if direction < 0 else (
-            event for event in events if event.first > moment + timedelta(seconds=1)
+        moment = current + timedelta(seconds=position + self.playback_offset()) if current is not None and position_ready and isinstance(position, (int, float)) else self.timeline.center
+        candidates = (event for event in events if event[0] < moment - timedelta(seconds=1)) if direction < 0 else (
+            event for event in events if event[0] > moment + timedelta(seconds=1)
         )
         selected = list(candidates)
         if selected:
-            self.play_detection(selected[-1] if direction < 0 else selected[0])
+            _, path, offset = selected[-1] if direction < 0 else selected[0]
+            self.play_selected(self.recordings.index(path), offset)
         else:
             self.status_overlay.display("No earlier detection" if direction < 0 else "No later detection")
 
@@ -4359,6 +4648,53 @@ class LocalReplayPane(QWidget):
         if started is not None:
             self.timeline.set_center(started + timedelta(seconds=offset))
         self.status_overlay.display("Loading recording...")
+        if self.remote_worker is not None:
+            self.controls.save_button.setEnabled(False)
+            duration = self.segment_durations[path]
+            if rewind:
+                offset = max(0.0, duration - REPLAY_DEFAULT_REWIND_SECONDS)
+            self.remote_offset = min(max(0, math.floor(offset)), max(0, duration - 1))
+            self.pending_seek = None
+            self.rewind_after_load = False
+            self.remote_worker.open_recording(self.remote_recordings[path], self.remote_offset)
+            return
+        self.start_replay_player(str(path))
+
+    def load_remote_range(self, start: datetime, end: datetime) -> None:
+        if self.remote_worker is None or self.closing:
+            return
+        end = min(end, datetime.now())
+        day = end.replace(hour=0, minute=0, second=0, microsecond=0)
+        first_day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        while day >= first_day and len(self.remote_days) < MAX_REPLAY_DAYS:
+            if day not in self.remote_days:
+                self.remote_days.add(day)
+                self.remote_worker.list_range(day, min(day + timedelta(days=1) - timedelta(seconds=1), end))
+            day -= timedelta(days=1)
+
+    def on_remote_catalog(self, recordings: list[ImouRecording]) -> None:
+        if self.closing:
+            return
+        self.remote_recordings.update({Path(recording.key): recording for recording in recordings})
+        self.recordings = sorted(self.remote_recordings, key=self.recording_start)
+        self.segment_durations.update({
+            path: math.ceil((recording.end - recording.start).total_seconds())
+            for path, recording in self.remote_recordings.items()
+        })
+        self.timeline.set_recordings([
+            CardRecording(path.name, recording.start, self.segment_durations[path], recording.size, recording.detection)
+            for path, recording in self.remote_recordings.items()
+        ])
+        if not self.recordings:
+            self.status_overlay.display("No camera recordings in this period")
+        elif self.current_path is None:
+            self.play_selected(len(self.recordings) - 1, rewind=True)
+
+    def on_remote_playback(self, key: str, url: str, offset: float = 0) -> None:
+        if not self.closing and self.current_path == Path(key) and offset == self.remote_offset:
+            self.start_replay_player(url)
+
+    def start_replay_player(self, source: str) -> None:
         try:
             self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-replay-")
             self.socket_path = Path(self.mpv_directory.name) / "control.sock"
@@ -4369,8 +4705,14 @@ class LocalReplayPane(QWidget):
             ]
             if isinstance(self.camera, RtspCamera):
                 command.append(RTSP_DENOISE_FILTER)
+            if self.remote_worker is not None:
+                command += ["--mute=yes", "--cache=no", "--cache-pause=no", "--vd-lavc-threads=1",
+                            "--demuxer-lavf-format=dhav",
+                            "--demuxer-lavf-probesize=1048576", "--demuxer-lavf-analyzeduration=1",
+                            "--demuxer-lavf-o-add=fpsprobesize=0"]
+                self.controls.sound_button.setEnabled(False)
             self.player = subprocess.Popen(
-                command + [str(path)],
+                command + [source],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except OSError:
@@ -4399,7 +4741,7 @@ class LocalReplayPane(QWidget):
             end = started + timedelta(seconds=self.segment_durations.get(path, CONTINUOUS_SEGMENT_SECONDS))
             if moment < end:
                 offset = max(0.0, (moment - started).total_seconds())
-                if path == self.current_path and mpv_request(self.socket_path, ["seek", offset, "absolute"])[0]:
+                if self.remote_worker is None and path == self.current_path and mpv_request(self.socket_path, ["seek", offset, "absolute"])[0]:
                     self.timeline.set_center(started + timedelta(seconds=offset))
                 else:
                     self.play_selected(row, offset)
@@ -4407,14 +4749,23 @@ class LocalReplayPane(QWidget):
         self.status_overlay.display("No recording at this time")
 
     def update_progress(self) -> None:
+        if self.remote_worker is not None and self.remote_worker.tunnel is not None and self.remote_worker.tunnel.error:
+            self.status_overlay.display(self.remote_worker.tunnel.error)
+            return
         if self.player is None or self.player.poll() is not None:
             self.progress_timer.stop()
             self.status_overlay.display("Playback stopped")
             return
         position_ready, current = mpv_request(self.socket_path, ["get_property", "time-pos"])
         duration_ready, duration = mpv_request(self.socket_path, ["get_property", "duration"])
+        if self.remote_worker is not None and self.current_path in self.segment_durations:
+            duration_ready, duration = True, self.segment_durations[self.current_path]
         if not position_ready or not duration_ready or not isinstance(current, (int, float)) or not isinstance(duration, (int, float)):
             return
+        current += self.playback_offset()
+        if self.remote_worker is not None:
+            audio_ready, audio = mpv_request(self.socket_path, ["get_property", "audio-params"])
+            self.controls.sound_button.setEnabled(audio_ready and bool(audio))
         if self.rewind_after_load:
             self.pending_seek = max(0.0, duration - REPLAY_DEFAULT_REWIND_SECONDS)
             self.rewind_after_load = False
@@ -4429,7 +4780,8 @@ class LocalReplayPane(QWidget):
             rounded_duration = max(1, round(duration))
             if self.segment_durations.get(path) != rounded_duration:
                 self.segment_durations[path] = rounded_duration
-                self.refresh_recordings()
+                if self.remote_worker is None:
+                    self.refresh_recordings()
                 if self.current_path != path:
                     return
             started = self.recording_start(path)
@@ -4445,6 +4797,8 @@ class LocalReplayPane(QWidget):
     def toggle_playing(self) -> None:
         ready, paused = mpv_request(self.socket_path, ["get_property", "pause"])
         if ready and mpv_request(self.socket_path, ["set_property", "pause", not paused])[0]:
+            if self.remote_worker is not None and self.remote_worker.tunnel is not None:
+                self.remote_worker.tunnel.set_paused(not paused)
             set_button_icon(self.controls.play_button, "play" if not paused else "pause", "Play" if not paused else "Pause")
 
     def toggle_sound(self) -> None:
@@ -4462,6 +4816,9 @@ class LocalReplayPane(QWidget):
         index = (self.speed_index + 1) % len(REPLAY_SPEEDS)
         speed = REPLAY_SPEEDS[index]
         if mpv_request(self.socket_path, ["set_property", "speed", speed])[0]:
+            if self.remote_worker is not None and self.remote_worker.tunnel is not None:
+                self.remote_worker.tunnel.set_speed(speed)
+                mpv_request(self.socket_path, ["set_property", "aid", "auto" if speed == 1 else "no"])
             self.speed_index = index
             self.controls.speed_button.setText(REPLAY_SPEED_LABEL.format(speed=speed))
 
@@ -4478,6 +4835,12 @@ class LocalReplayPane(QWidget):
         if self.current_path is None:
             return
         try:
+            if self.remote_worker is not None:
+                recording = self.remote_recordings[self.current_path]
+                target = media_directory() / f"{safe_camera_name(self.camera.name)}_{recording.start:%Y%m%d_%H%M%S}.mkv"
+                self.remote_worker.save_recording(recording, target)
+                self.status_overlay.display("Saving camera recording...")
+                return
             target = media_directory() / self.current_path.name
             shutil.copyfile(self.current_path, target)
         except OSError:
@@ -4495,12 +4858,25 @@ class LocalReplayPane(QWidget):
             self.socket_path = None
 
     def stop(self) -> None:
+        self.closing = True
         self.overlay_timer.stop()
         self.refresh_timer.stop()
         self.overlay.hide()
         self.status_overlay.timer.stop()
         self.status_overlay.hide()
         self.stop_player()
+        if self.remote_worker is not None:
+            self.remote_worker.stop()
+        else:
+            self.stopped.emit()
+
+    def on_remote_finished(self) -> None:
+        worker = self.remote_worker
+        self.remote_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if self.closing:
+            self.stopped.emit()
 
 
 class AccountDialog(QDialog):
@@ -4683,6 +5059,7 @@ class MainWindow(QMainWindow):
         self.device_accounts: dict[str, str] = {}
         self.previews: dict[str, CameraPreview] = {}
         self.local_replays: dict[str, LocalReplayPane] = {}
+        self.retired_replays: list[LocalReplayPane] = []
         self.retired_previews: list[CameraPreview] = []
         self.preview_layout: str | None = None
         self.layout_refresh_timer = QTimer(self)
@@ -5214,12 +5591,18 @@ class MainWindow(QMainWindow):
 
     def open_camera_replay(self) -> None:
         camera = getattr(self, "selected_device", None)
-        if isinstance(camera, RtspCamera):
+        if isinstance(camera, RtspCamera) and camera.provider == IMOU_ACCOUNT_PROVIDER:
+            self.open_camera_sd_replay(camera)
+        elif isinstance(camera, RtspCamera):
             self.open_local_replay(camera)
         elif camera is not None:
             self.enter_replay(None)
 
-    def open_local_replay(self, camera: AccountDevice | RtspCamera, event: DetectionEvent | None = None) -> None:
+    def open_local_replay(self, camera: AccountDevice | RtspCamera, event: DetectionEvent | None = None,
+                          camera_recordings: bool = False) -> None:
+        existing = self.local_replays.get(camera.uid)
+        if existing is not None and existing.camera_recordings != camera_recordings:
+            self.close_local_replay(camera.uid)
         if camera.uid in self.local_replays:
             if event is not None:
                 self.local_replays[camera.uid].play_detection(event)
@@ -5232,7 +5615,7 @@ class MainWindow(QMainWindow):
         stack = self.primary_video_stack if selected else preview.video_stack
         worker = self.stream_worker if selected else preview.worker
         try:
-            replay = LocalReplayPane(camera, self.primary_pane if selected else preview, worker, event)
+            replay = LocalReplayPane(camera, self.primary_pane if selected else preview, worker, event, camera_recordings)
         except OSError:
             self.show_notice("Unable to open local recordings.")
             return
@@ -5262,6 +5645,10 @@ class MainWindow(QMainWindow):
         label = self.primary_label if stack is self.primary_video_stack else (
             self.previews[uid].label if uid in self.previews else None
         )
+        replay.setParent(self)
+        replay.hide()
+        self.retired_replays.append(replay)
+        replay.stopped.connect(lambda current=replay: self._local_replay_stopped(current))
         replay.stop()
         if label is not None and label.text() == replay.playback_title:
             label.setText(replay.live_title)
@@ -5270,9 +5657,17 @@ class MainWindow(QMainWindow):
             stack.removeWidget(replay)
         if isinstance(replay.worker, StreamWorker):
             replay.worker.set_display(True)
-        replay.deleteLater()
 
-    def open_camera_sd_replay(self, camera: AccountDevice) -> None:
+    def _local_replay_stopped(self, replay: LocalReplayPane) -> None:
+        self.retired_replays.remove(replay)
+        replay.deleteLater()
+        if self.close_pending:
+            QTimer.singleShot(0, self.close)
+
+    def open_camera_sd_replay(self, camera: AccountDevice | RtspCamera) -> None:
+        if isinstance(camera, RtspCamera) and camera.provider == IMOU_ACCOUNT_PROVIDER:
+            self.open_local_replay(camera, camera_recordings=True)
+            return
         username = self.device_accounts.get(camera.uid)
         if username is None:
             return
@@ -5957,6 +6352,11 @@ class MainWindow(QMainWindow):
         self.on_capabilities_found([], None)
         self.rtsp_light_mode = None
         self.replay_button.setEnabled(True)
+        if isinstance(self.selected_device, RtspCamera) and self.selected_device.provider == IMOU_ACCOUNT_PROVIDER:
+            set_replay_menu(self.replay_button, lambda: self.open_camera_sd_replay(self.selected_device),
+                            lambda: self.open_local_replay(self.selected_device))
+        else:
+            self.replay_button.setMenu(None)
         self.ptz_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
         self.ptz_button.setVisible(not isinstance(self.selected_device, RtspCamera))
         self.sound_button.setVisible(not isinstance(self.selected_device, RtspCamera))
@@ -6120,6 +6520,9 @@ class MainWindow(QMainWindow):
     def watch_live(self) -> None:
         if not self.devices or self.stream_worker is not None:
             return
+        if isinstance(self.selected_device, RtspCamera) and self.selected_device.provider == IMOU_ACCOUNT_PROVIDER:
+            set_replay_menu(self.replay_button, lambda: self.open_camera_sd_replay(self.selected_device),
+                            lambda: self.open_local_replay(self.selected_device))
         if not self.camera_visible(self.selected_device.uid):
             self.set_status(NO_VISIBLE_CAMERAS_MESSAGE)
             return
@@ -6150,7 +6553,8 @@ class MainWindow(QMainWindow):
         )
         if rtsp_camera is not None:
             assert self.mpv_socket is not None
-            self.stream_worker = RtspStreamWorker(rtsp_camera, self.player, self.mpv_socket)
+            self.stream_worker = RtspStreamWorker(rtsp_camera, self.player, self.mpv_socket,
+                                                  self.settings.value(f"{QUALITY_SETTING}/{rtsp_camera.uid}", "HD", str))
         else:
             try:
                 continuous = ContinuousRecorder(continuous_directory(), safe_camera_name(self.selected_device.name))
@@ -6189,11 +6593,11 @@ class MainWindow(QMainWindow):
             self.stream_worker.control_completed.connect(self.on_control_completed)
             self.stream_worker.control_failed.connect(self.on_control_failed)
         if isinstance(self.stream_worker, StreamWorker):
-            self.stream_worker.capabilities_found.connect(self.on_capabilities_found)
             self.stream_worker.detections_listed.connect(self.on_detections_listed)
             self.stream_worker.detections_failed.connect(self.on_detections_failed)
-            self.stream_worker.setting_completed.connect(self.on_setting_completed)
-            self.stream_worker.setting_failed.connect(self.on_setting_failed)
+        self.stream_worker.capabilities_found.connect(self.on_capabilities_found)
+        self.stream_worker.setting_completed.connect(self.on_setting_completed)
+        self.stream_worker.setting_failed.connect(self.on_setting_failed)
         self.stream_worker.finished.connect(self.on_stream_finished)
         self.stream_worker.start()
         QTimer.singleShot(500, self.video.raise_interaction_layer)
@@ -6499,6 +6903,7 @@ class MainWindow(QMainWindow):
         for quality, action in self.quality_actions.items():
             action.setVisible(quality in qualities)
         self.quality_button.setVisible(bool(qualities))
+        self.quality_button.setEnabled(self.stream_live and bool(qualities))
         self.quality_menu.menuAction().setVisible(bool(qualities))
         self.light_on = light_on
         self.light_button.setVisible(light_on is not None)
@@ -6778,6 +7183,7 @@ class MainWindow(QMainWindow):
             or self.stream_worker is not None
             or self.detection_worker is not None
             or self.retired_previews
+            or self.retired_replays
         ):
             self.close_pending = True
             self.stop_stream()

@@ -39,12 +39,17 @@ Sign into [Imou Open Platform](https://open.imoulife.com/consoleNew) with the sa
 Enter these application credentials, your account email, and the server region in Camera Viewer.
 The AppSecret stays in the desktop keyring; account settings contain camera identities and names, and omit access tokens and temporary stream URLs.
 Account discovery runs in the background and displays authentication errors in the open setup form.
-The viewer authenticates with Imou's [HMAC-SHA256 request signature](https://open.imoulife.com/book/http/develop.html) and retrieves short-lived private cloud RTSP streams through the [official Imou API client's getStreamUrl operation](https://github.com/Imou-OpenPlatform/Py-Imou-Open-Api/blob/main/pyimouapi/device.py).
+The viewer authenticates with Imou's [HMAC-SHA256 request signature](https://open.imoulife.com/book/http/develop.html) and retrieves short-lived live and camera playback streams with separate camera-scoped tokens from the [official Imou player service](https://open.imoulife.com/book/js/sdk.html).
 This connection uses the account credentials and does not require the camera's device password or the phone.
-Live view, photos, manual video recording, zoom, and playback of local recordings use the same controls as local RTSP cameras.
-Cloud Imou streams use video only: the tested camera's cloud AAC tracks fail to decode with FFmpeg and keep mpv's audio clock at zero when selected.
-Audio remains available on compatible local RTSP connections.
-Cloud playback and local recordings use packet arrival timestamps to keep their video clock advancing at the received rate.
+Live view, sound, photos, manual video and audio recording, zoom, and playback use the existing camera controls.
+HD and SD quality use the shared quality menu, and supported pan, tilt, and saved positions use the shared movement panel.
+The playback menu offers camera microSD recordings and local 24-hour recordings, with the same timeline, pause, seeking, speeds up to 8x, sound, photos, and clip saving.
+Imou recording times retain the camera's local clock, with motion recordings shown in red and continuous recordings in blue.
+Live and camera playback share a certificate-verified secure WebSocket transport exposed through loopback-only listeners.
+Live video uses RTSP, while camera playback uses Imou's native recording transport and FFmpeg's DHAV demuxer for video, audio, pause, and supported camera playback speeds.
+Accelerated camera playback is silent; normal speed restores sound.
+Private upstream URLs and tokens remain in memory; player and recorder command lines contain only the loopback URL.
+Camera clip saving runs in the background, publishes the complete file atomically, and removes temporary downloads on cancellation.
 Cloud video consumes the account's Imou traffic allowance; continuous cloud recording requires an explicit opt-in in that account's form and the global continuous recording setting.
 Use the account's submenu under **Cameras** to edit its region or recording choice, or remove the account and its keyring secret.
 Privacy mode is preserved: a masked camera displays its state and does not open a video connection.
@@ -70,8 +75,9 @@ All panes use the same inline movement panel and translucent controls, with dire
 Compatible RTSP panes also have sound and vertical tilt, native iCam365 panes have pan-and-tilt and their camera's saved positions, and O-KAM panes have pan-and-tilt, saved positions, light, and video quality controls when supported.
 Compatible iCam365 camera panes have a bulb button that switches white light between On and Automatic.
 Local playback stays in that camera's video pane and uses the same controls and timeline as camera microSD playback, with recordings from the last 24 hours, pause, seeking, speeds up to 8x, sound, photo, saved clips, and full-screen controls; **LIVE** returns to the camera stream.
-For an O-KAM pane, the playback button offers the camera's microSD recordings and its local 24-hour recordings.
-Selecting microSD playback makes that camera the selected pane while the other live feed remains visible.
+For an O-KAM or Imou Life account pane, the playback button offers the camera's microSD recordings and its local 24-hour recordings.
+Selecting O-KAM microSD playback makes that camera the selected pane while the other live feed remains visible.
+Imou microSD playback stays in its camera pane while the other live feeds continue.
 The other camera views reconnect independently.
 Click either video to show or hide its own control bar; the bars are hidden initially and close after five seconds.
 Double-click either video to toggle full screen.
@@ -129,7 +135,8 @@ The Imou form uses the [Dahua main-stream RTSP path](https://www.dahuasecurity.c
 The camera must expose that RTSP stream on the local network; model support depends on the camera and its settings.
 Use the camera's device password or safety code, which may differ from the Imou Life account password.
 Local Imou cameras have the RTSP live-view and local recording controls described above.
-Imou camera microSD playback, talkback, and remote movement are unavailable in the viewer.
+This local connection uses local recording playback; the Imou Life account connection provides camera microSD playback and supported remote movement.
+Talkback is unavailable in the viewer.
 For access away from the camera's network, the computer needs a route to its local IP address, such as a VPN.
 
 Each camera keeps its 16:9 ratio in single-camera and multi-camera views, including when the window is resized.

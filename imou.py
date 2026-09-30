@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable
 
 
@@ -27,6 +28,10 @@ IMOU_PAGE_SIZE = 50
 IMOU_MAX_PAGES = 100
 IMOU_AUTH_CODES = frozenset(("SN1001", "SN1004", "TK1001"))
 IMOU_TOKEN_EXPIRED = "TK1002"
+IMOU_MOVE_OPERATIONS = {"Up": "0", "Down": "1", "Left": "2", "Right": "3"}
+IMOU_MOVE_DURATION_MS = 500
+IMOU_RECORD_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+IMOU_RECORD_PAGE_SIZE = 30
 
 
 class ImouError(OSError):
@@ -57,18 +62,35 @@ class ImouDevice:
     channel_id: str
     product_id: str = ""
     privacy: bool = False
+    abilities: str = ""
 
     def __post_init__(self) -> None:
         if (not isinstance(self.device_id, str) or not self.device_id.strip()
                 or not isinstance(self.name, str) or not self.name.strip()
                 or not isinstance(self.channel_id, str) or not self.channel_id.isascii()
                 or not self.channel_id.isdigit() or not isinstance(self.product_id, str)
-                or not isinstance(self.privacy, bool)):
+                or not isinstance(self.privacy, bool) or not isinstance(self.abilities, str)):
             raise ValueError("The Imou service returned an invalid camera identity.")
+
+    def supports(self, *abilities: str) -> bool:
+        return bool(set(abilities).intersection(self.abilities.split(",")))
 
     def uid(self, app_id: str) -> str:
         identity = f"{app_id}:{self.device_id}:{self.channel_id}"
         return f"rtsp:{hashlib.sha256(identity.encode()).hexdigest()[:24]}-imou"
+
+
+@dataclass(frozen=True)
+class ImouRecording:
+    record_id: str
+    start: datetime
+    end: datetime
+    detection: bool
+    size: int
+
+    @property
+    def key(self) -> str:
+        return hashlib.sha256(self.record_id.encode()).hexdigest()
 
 
 def imou_signature(secret: str, timestamp: int, nonce: str) -> str:
@@ -108,6 +130,7 @@ class ImouClient:
         self.host = IMOU_REGIONS[account.region]
         self.token = ""
         self.token_expires = 0.0
+        self.kit_tokens: dict[str, tuple[str, float]] = {}
 
     def call(self, method: str, params: dict | None = None, retry_token: bool = True) -> dict:
         if method != "accessToken" and (not self.token or time.monotonic() >= self.token_expires):
@@ -197,6 +220,7 @@ class ImouClient:
                             or record.get("deviceName") or record.get("deviceId", ""),
                             str(channel.get("channelId", "")), record.get("productId") or "",
                             channel.get("cameraStatus") == "on",
+                            channel.get("channelAbility") or record.get("deviceAbility") or "",
                         )
                     except (ValueError, AttributeError):
                         raise ImouError("Imou returned an invalid camera identity.") from None
@@ -205,10 +229,12 @@ class ImouClient:
                 return list(cameras.values())
         raise ImouError("The Imou camera list exceeded the pagination limit.")
 
-    def stream_url(self, camera: ImouDevice) -> str:
+    def stream_url(self, camera: ImouDevice, stream_id: int = 0) -> str:
         if camera.privacy:
             raise ImouError(IMOU_PRIVACY_MESSAGE)
-        params = {"deviceId": camera.device_id, "channelId": camera.channel_id, "streamId": 0}
+        if stream_id not in (0, 1):
+            raise ValueError("Unsupported Imou video quality.")
+        params = {"deviceId": camera.device_id, "channelId": camera.channel_id, "streamId": stream_id}
         if camera.product_id:
             params["productId"] = camera.product_id
         url = self.call("getStreamUrl", params).get("url")
@@ -220,3 +246,98 @@ class ImouClient:
         except ValueError:
             raise ImouError("Imou returned no usable private camera stream.") from None
         return url
+
+    def collections(self, camera: ImouDevice) -> dict[str, str]:
+        if not camera.supports("CollectionPoint"):
+            return {}
+        records = self.call("getCollection", self.camera_params(camera)).get("collections", [])
+        if not isinstance(records, list) or any(
+            not isinstance(record, dict) or not isinstance(record.get("name"), str) or not record["name"]
+            for record in records
+        ):
+            raise ImouError("Imou returned invalid saved camera positions.")
+        return {f"Preset {index}": record["name"] for index, record in enumerate(records, 1)}
+
+    def move(self, camera: ImouDevice, direction: str, collections: dict[str, str]) -> None:
+        if camera.privacy:
+            raise ImouError(IMOU_PRIVACY_MESSAGE)
+        params = self.camera_params(camera)
+        if direction in collections and camera.supports("CollectionPoint"):
+            self.call("turnCollection", dict(params, name=collections[direction]))
+        elif direction in IMOU_MOVE_OPERATIONS and camera.supports("PT", "PTZ"):
+            self.call("controlMovePTZ", dict(
+                params, operation=IMOU_MOVE_OPERATIONS[direction], duration=IMOU_MOVE_DURATION_MS,
+            ))
+        else:
+            raise ImouError("This camera movement is unavailable.")
+
+    def recordings(self, camera: ImouDevice, start: datetime, end: datetime) -> list[ImouRecording]:
+        params = dict(self.camera_params(camera), beginTime=start.strftime(IMOU_RECORD_TIME_FORMAT),
+                      endTime=end.strftime(IMOU_RECORD_TIME_FORMAT), type="All")
+        recordings: dict[str, ImouRecording] = {}
+        for page in range(IMOU_MAX_PAGES):
+            first = page * IMOU_RECORD_PAGE_SIZE + 1
+            data = self.call("queryLocalRecords", dict(params, queryRange=f"{first}-{first + IMOU_RECORD_PAGE_SIZE - 1}"))
+            records = data.get("records", [])
+            if not isinstance(records, list):
+                raise ImouError("Imou returned an invalid recording list.")
+            before = len(recordings)
+            for record in records:
+                if not isinstance(record, dict):
+                    raise ImouError("Imou returned invalid recording metadata.")
+                try:
+                    recording = ImouRecording(
+                        record["recordId"], datetime.strptime(record["beginTime"], IMOU_RECORD_TIME_FORMAT),
+                        datetime.strptime(record["endTime"], IMOU_RECORD_TIME_FORMAT),
+                        str(record.get("type", "normal")).lower() not in ("normal", "regular"), int(record.get("fileLength", 0)),
+                    )
+                    if (not isinstance(recording.record_id, str) or not recording.record_id
+                            or recording.end <= recording.start or recording.size < 0):
+                        raise ValueError()
+                except (ValueError, KeyError, TypeError):
+                    raise ImouError("Imou returned invalid recording metadata.") from None
+                recordings[recording.key] = recording
+            if len(records) < IMOU_RECORD_PAGE_SIZE:
+                return sorted(recordings.values(), key=lambda recording: recording.start)
+            if len(recordings) == before:
+                raise ImouError("Imou repeated the same recording page.")
+        raise ImouError("The Imou recording list exceeded the pagination limit.")
+
+    def replay_url(self, camera: ImouDevice, recording: ImouRecording) -> str:
+        return self.secure_stream_url(camera, recording=recording, native=True)
+
+    def secure_stream_url(self, camera: ImouDevice, stream_id: int = 0,
+                          recording: ImouRecording | None = None, native: bool = False) -> str:
+        if camera.privacy:
+            raise ImouError(IMOU_PRIVACY_MESSAGE)
+        if stream_id not in (0, 1):
+            raise ValueError("Unsupported Imou video quality.")
+        permission = "1" if recording is None else "2"
+        key = f"{camera.device_id}:{camera.channel_id}:{permission}"
+        token, expires = self.kit_tokens.get(key, ("", 0.0))
+        if not token or time.monotonic() >= expires:
+            data = self.call("getKitToken", dict(self.camera_params(camera), type=permission))
+            token = data.get("kitToken")
+            if not isinstance(token, str) or not token:
+                raise ImouError("Imou returned no camera stream token.")
+            self.kit_tokens[key] = token, time.monotonic() + 3600
+        params = dict(
+            self.camera_params(camera), kitToken=token, streamId=stream_id,
+            businessType="real" if recording is None else "localRecord",
+            beginTime=recording.start.strftime(IMOU_RECORD_TIME_FORMAT) if recording is not None else "",
+            endTime=recording.end.strftime(IMOU_RECORD_TIME_FORMAT) if recording is not None else "",
+            encryptStreamFlag=False, rtsvEnable=native, nvrLinkFlag=True,
+        )
+        if not native:
+            params["protoType"] = "rtsp"
+        data = self.call("getEncryptKitStreamUrl", params)
+        url = data.get("url")
+        if data.get("isEncrypt") is not False or not isinstance(url, str):
+            raise ImouError("The camera requires an encrypted video format.")
+        if native and data.get("streamType") != "rtsv":
+            raise ImouError("Native camera playback is unavailable.")
+        return url
+
+    @staticmethod
+    def camera_params(camera: ImouDevice) -> dict:
+        return {"deviceId": camera.device_id, "channelId": camera.channel_id}

@@ -1,8 +1,11 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -11,10 +14,10 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from PyQt6.QtCore import QObject, QSettings, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QDialog
 
-from imou import IMOU_PRIVACY_MESSAGE, ImouAccount, ImouClient, ImouDevice, ImouError, imou_signature
+from imou import IMOU_PRIVACY_MESSAGE, ImouAccount, ImouClient, ImouDevice, ImouError, ImouRecording, imou_signature
 from app import (
     IMOU_ACCOUNT_PROVIDER, IMOU_ACCOUNTS_SETTING, IMOU_CAMERAS_SETTING,
-    CameraPreview, ImouAccountDialog, ImouAccountWorker, MainWindow, RtspCamera, RtspStreamWorker,
+    CameraPreview, ImouAccountDialog, ImouAccountWorker, ImouReplayWorker, LocalReplayPane, MainWindow, RtspCamera, RtspStreamWorker,
     imou_account_camera, load_imou_accounts, load_imou_cameras, mpv_rtsp_command,
 )
 
@@ -130,6 +133,92 @@ class ImouClientTest(unittest.TestCase):
             with self.subTest(url=url), self.assertRaisesRegex(ImouError, "usable private"):
                 client.stream_url(DEVICE)
 
+    def test_movement_uses_device_capabilities_and_preserves_privacy(self):
+        camera = replace(DEVICE, abilities="PT,LocalStorage")
+        client = self.client([response({"accessToken": "token"}), response()])
+        client.move(camera, "Left", {})
+        self.assertTrue(self.requests[-1][0].endswith("/controlMovePTZ"))
+        self.assertEqual(self.requests[-1][1]["params"], {
+            "deviceId": DEVICE.device_id, "channelId": "0", "operation": "2", "duration": 500, "token": "token",
+        })
+        for unavailable in (DEVICE, replace(camera, privacy=True)):
+            with self.assertRaises(ImouError):
+                client.move(unavailable, "Up", {})
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(client.collections(camera), {})
+
+    def test_saved_positions_keep_their_names_and_use_the_same_command(self):
+        camera = replace(DEVICE, abilities="PT,CollectionPoint")
+        client = self.client([
+            response({"accessToken": "token"}), response({"collections": [{"name": "Door"}, {"name": "Window"}]}),
+            response(),
+        ])
+        positions = client.collections(camera)
+        self.assertEqual(positions, {"Preset 1": "Door", "Preset 2": "Window"})
+        client.move(camera, "Preset 2", positions)
+        self.assertTrue(self.requests[-1][0].endswith("/turnCollection"))
+        self.assertEqual(self.requests[-1][1]["params"]["name"], "Window")
+
+    def test_recordings_keep_camera_times_and_distinguish_motion_from_continuous(self):
+        start = datetime(2026, 9, 30, 2, 0)
+        record = {"recordId": "/private/clip.mp4", "beginTime": "2026-09-30 02:00:00",
+                  "endTime": "2026-09-30 02:05:00", "fileLength": 12345, "type": "normal"}
+        client = self.client([response({"accessToken": "token"}), response({"records": [record]}),
+                              response({"records": [dict(record, recordId="/private/event.mp4", type="videomotion")]}),
+                              response({"records": []})])
+        with patch("imou.IMOU_RECORD_PAGE_SIZE", 1):
+            recordings = client.recordings(DEVICE, start, start + timedelta(hours=1))
+        self.assertEqual([recording.detection for recording in recordings], [False, True])
+        self.assertEqual(recordings[0].start, start)
+        self.assertEqual(self.requests[-1][1]["params"]["queryRange"], "3-3")
+        self.assertNotIn("private", recordings[0].key)
+        client = self.client([response({"accessToken": "token"}), response({"records": [None]})])
+        with self.assertRaisesRegex(ImouError, "metadata"):
+            client.recordings(DEVICE, start, start + timedelta(hours=1))
+
+    def test_playback_requests_private_sd_video_and_caches_its_scoped_token(self):
+        start = datetime(2026, 9, 30, 2, 0)
+        recording = ImouRecording("private-record", start, start + timedelta(minutes=5), False, 12345)
+        url = "rtsp://gateway.example.com:8556/private?digest=secret"
+        client = self.client([response({"accessToken": "token"}), response({"kitToken": "playback-token"}),
+                              response({"url": url, "isEncrypt": False, "streamType": "rtsv"}),
+                              response({"url": url, "isEncrypt": False, "streamType": "rtsv"})])
+        self.assertEqual(client.replay_url(DEVICE, recording), url)
+        self.assertEqual(client.replay_url(DEVICE, recording), url)
+        self.assertEqual([request[0].rsplit("/", 1)[-1] for request in self.requests],
+                         ["accessToken", "getKitToken", "getEncryptKitStreamUrl", "getEncryptKitStreamUrl"])
+        params = self.requests[-1][1]["params"]
+        self.assertEqual(params["businessType"], "localRecord")
+        self.assertEqual(params["beginTime"], "2026-09-30 02:00:00")
+        self.assertFalse(params["encryptStreamFlag"])
+        self.assertTrue(params["rtsvEnable"])
+        self.assertNotIn("protoType", params)
+        with self.assertRaisesRegex(ImouError, IMOU_PRIVACY_MESSAGE):
+            client.replay_url(replace(DEVICE, privacy=True), recording)
+
+    def test_live_quality_and_playback_keep_separate_scoped_tokens(self):
+        start = datetime(2026, 9, 30, 2, 0)
+        recording = ImouRecording("private-record", start, start + timedelta(minutes=5), False, 12345)
+        url = "rtsp://gateway.example.com:8556/private?digest=secret"
+        client = self.client([
+            response({"accessToken": "token"}), response({"kitToken": "live-token"}),
+            response({"url": url, "isEncrypt": False}), response({"kitToken": "replay-token"}),
+            response({"url": url, "isEncrypt": False, "streamType": "rtsv"}), response({"url": url, "isEncrypt": False}),
+        ])
+        client.secure_stream_url(DEVICE, 1)
+        client.replay_url(DEVICE, recording)
+        client.secure_stream_url(DEVICE)
+        params = [request[1]["params"] for request in self.requests]
+        self.assertEqual([item["type"] for item in params if "type" in item], ["1", "2"])
+        streams = [item for item in params if "businessType" in item]
+        self.assertEqual([item["kitToken"] for item in streams], ["live-token", "replay-token", "live-token"])
+        self.assertEqual([item["streamId"] for item in streams], [1, 0, 0])
+        self.assertEqual(streams[0]["beginTime"], "")
+        with self.assertRaises(ImouError):
+            client.secure_stream_url(replace(DEVICE, privacy=True))
+        with self.assertRaises(ValueError):
+            client.secure_stream_url(DEVICE, 2)
+
 
 class FakeImouWorker(QObject):
     devices_found = pyqtSignal(list)
@@ -231,8 +320,7 @@ class ImouAccountUiTest(unittest.TestCase):
         camera = imou_account_camera(ACCOUNT, DEVICE)
         command = mpv_rtsp_command(Path("/tmp/test-imou.sock"), 1, False, camera)
         self.assertIn("--idle=yes", command)
-        self.assertIn("--no-audio", command)
-        self.assertIn("--demuxer-lavf-o-add=use_wallclock_as_timestamps=1", command)
+        self.assertNotIn("--no-audio", command)
         self.assertNotIn(STREAM_URL, " ".join(command))
         socket_path = Path(self.directory.name) / "socket"
         socket_path.touch()
@@ -241,24 +329,50 @@ class ImouAccountUiTest(unittest.TestCase):
         worker = RtspStreamWorker(camera, player, socket_path)
         with patch("app.stored_secret", return_value="private-application-key"), patch("app.ImouClient") as client, patch(
             "app.mpv_request", return_value=(True, None)
-        ) as ipc:
-            client.return_value.stream_url.return_value = STREAM_URL
+        ) as ipc, patch("app.RtspWebSocketTunnel") as transport:
+            client.return_value.secure_stream_url.return_value = STREAM_URL
+            transport.return_value.url = "rtsp://127.0.0.1:40000/recording"
             worker._load_imou_stream()
-            ipc.assert_called_once_with(socket_path, ["loadfile", STREAM_URL, "replace"])
-            client.return_value.stream_url.return_value = STREAM_URL + "-renewed"
+            ipc.assert_called_once_with(socket_path, ["loadfile", transport.return_value.url, "replace"])
+            client.return_value.secure_stream_url.return_value = STREAM_URL + "-renewed"
 
             def start_recorder(arguments, **options):
-                fd = options["pass_fds"][0]
-                playlist = os.read(fd, 4096).decode()
-                self.assertIn(STREAM_URL + "-renewed", playlist)
-                self.assertIn("option use_wallclock_as_timestamps 1", playlist)
+                self.assertIn(transport.return_value.url, arguments)
                 self.assertNotIn("private-stream-token", " ".join(arguments))
-                self.assertNotIn("0:a?", arguments)
-                return Mock()
+                self.assertIn("0:a?", arguments)
+                process = Mock(returncode=0)
+                process.poll.return_value = 0
+                return process
 
             with patch("app.subprocess.Popen", side_effect=start_recorder):
-                worker._ffmpeg(Path(self.directory.name) / "clip.mkv", False)
-            self.assertEqual(client.return_value.stream_url.call_count, 2)
+                process = worker._ffmpeg(Path(self.directory.name) / "clip.mkv", False)
+            self.assertEqual(client.return_value.secure_stream_url.call_count, 2)
+            transport.assert_called_with(STREAM_URL + "-renewed")
+            worker._finish_recording_process(process)
+            transport.return_value.close.assert_called_once()
+            self.assertEqual(worker.recording_tunnels, {})
+
+    def test_quality_uses_shared_controls_and_failed_open_preserves_live_transport(self):
+        camera = imou_account_camera(ACCOUNT, DEVICE)
+        worker = RtspStreamWorker(camera, Mock(), Path("/tmp/test.sock"))
+        worker.imou_client = Mock()
+        previous = Mock()
+        worker.imou_tunnel = previous
+        with patch("app.RtspWebSocketTunnel") as transport, patch("app.mpv_request", return_value=(False, None)):
+            with self.assertRaises(ImouError):
+                worker._change_imou_quality("SD")
+            self.assertIs(worker.imou_tunnel, previous)
+            self.assertEqual(worker.quality, "HD")
+            previous.close.assert_not_called()
+            transport.return_value.close.assert_called_once()
+        self.window.selected_device = camera
+        self.window.stream_worker = worker
+        self.window.stream_live = True
+        self.window.on_capabilities_found(["HD", "SD"], None)
+        self.assertTrue(self.window.quality_button.isEnabled())
+        self.assertTrue(worker.queue_setting("quality", "SD"))
+        self.assertFalse(worker.queue_setting("quality", "LD"))
+        self.window.stream_worker = None
 
     def test_cloud_continuous_recording_requires_account_opt_in(self):
         worker = RtspStreamWorker(imou_account_camera(ACCOUNT, DEVICE), Mock(), Path("/tmp/test.sock"))
@@ -269,6 +383,140 @@ class ImouAccountUiTest(unittest.TestCase):
         self.assertTrue(worker.continuous_enabled.is_set())
         worker.set_continuous(False)
         self.assertFalse(worker.continuous_enabled.is_set())
+
+    def test_cancelled_camera_download_preserves_a_previous_saved_clip(self):
+        camera = imou_account_camera(ACCOUNT, DEVICE)
+        worker = ImouReplayWorker(camera)
+        worker.client = Mock()
+        start = datetime(2026, 9, 30, 2, 0)
+        recording = ImouRecording("private-record", start, start + timedelta(minutes=5), False, 12345)
+        target = Path(self.directory.name) / "saved.mkv"
+        target.write_bytes(b"previous complete recording")
+        process = Mock()
+        process.poll.return_value = None
+
+        def start_download(arguments, **options):
+            Path(arguments[-1]).write_bytes(b"partial recording")
+            worker.stopped.set()
+            return process
+
+        with patch("app.ImouReplayTunnel") as tunnel, patch("app.subprocess.Popen", side_effect=start_download), patch.object(
+            RtspStreamWorker, "_finish"
+        ):
+            tunnel.return_value.error = ""
+            worker._save(recording, target)
+            tunnel.return_value.close.assert_called_once()
+        self.assertEqual(target.read_bytes(), b"previous complete recording")
+        self.assertEqual(sorted(path.name for path in target.parent.iterdir()), ["saved.mkv"])
+
+    def test_camera_navigation_remains_available_during_a_download(self):
+        camera = imou_account_camera(ACCOUNT, DEVICE)
+        worker = ImouReplayWorker(camera)
+        start = datetime(2026, 9, 30, 2, 0)
+        recording = ImouRecording("private-record", start, start + timedelta(minutes=5), False, 12345)
+        downloading = threading.Event()
+        release = threading.Event()
+
+        def save(*args, **kwargs):
+            downloading.set()
+            release.wait(5)
+
+        with patch("app.stored_secret", return_value="private-application-key"), patch("app.ImouClient"), patch(
+            "app.ImouReplayTunnel"
+        ) as transport, patch.object(worker, "_save", side_effect=save):
+            try:
+                worker.start()
+                worker.save_recording(recording, Path(self.directory.name) / "clip.mkv")
+                self.assertTrue(downloading.wait(2))
+                self.assertFalse(worker.save_recording(recording, Path(self.directory.name) / "duplicate.mkv"))
+                worker.open_recording(recording)
+                deadline = time.monotonic() + 2
+                while not transport.called and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(transport.called)
+                self.assertFalse(release.is_set())
+            finally:
+                worker.stop()
+                release.set()
+                self.assertTrue(worker.wait(5000))
+
+    def test_camera_seek_uses_the_requested_camera_time_and_keeps_the_catalog_identity(self):
+        camera = imou_account_camera(ACCOUNT, DEVICE)
+        worker = ImouReplayWorker(camera)
+        start = datetime(2026, 9, 30, 2)
+        recording = ImouRecording("private-record", start, start + timedelta(minutes=5), False, 12345)
+        with patch("app.stored_secret", return_value="private-key"), patch("app.ImouClient") as client, patch(
+            "app.ImouReplayTunnel"
+        ) as transport:
+            try:
+                worker.open_recording(recording, 60)
+                worker.open_recording(recording, 120)
+                worker.start()
+                deadline = time.monotonic() + 2
+                while not transport.called and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(transport.called)
+                requested = client.return_value.replay_url.call_args.args[1]
+                self.assertEqual(requested.start, start + timedelta(seconds=120))
+                self.assertEqual(requested.end, recording.end)
+                self.assertEqual(requested.key, recording.key)
+                self.assertEqual(transport.call_count, 1)
+            finally:
+                worker.stop()
+                self.assertTrue(worker.wait(5000))
+
+    def test_imou_pan_controls_use_the_existing_movement_panel(self):
+        camera = imou_account_camera(ACCOUNT, replace(DEVICE, abilities="PT"))
+        preview = CameraPreview(camera, settings=self.settings)
+        worker = RtspStreamWorker(camera, Mock(), Path("/tmp/test.sock"))
+        worker.imou_client = Mock()
+        preview.worker = worker
+        preview.live = True
+        preview._on_rtsp_ptz_available()
+        self.assertFalse(preview.ptz_panel.buttons[0].isHidden())
+        self.assertTrue(preview.ptz_panel.presets.isHidden())
+        preview.move_camera("Left")
+        self.assertEqual(worker.ptz_request, "Left")
+        self.assertTrue(preview.control_pending)
+        self.assertFalse(preview.ptz_button.isEnabled())
+        preview._on_control_finished("Left")
+        self.assertTrue(preview.ptz_button.isEnabled())
+        preview.worker = None
+        preview.stop()
+
+    def test_camera_playback_uses_the_shared_pane_without_changing_other_live_cameras(self):
+        camera = imou_account_camera(ACCOUNT, DEVICE)
+        existing = RtspCamera("rtsp:existing", "Entrance", "rtsp://192.0.2.1/video")
+        self.window.devices = [existing, camera]
+        self.window.selected_device = existing
+        self.window.device_accounts = {existing.uid: "rtsp", camera.uid: "rtsp"}
+        with patch.object(CameraPreview, "start"), patch("app.ImouReplayWorker") as remote:
+            self.window.sync_previews()
+            live_worker = Mock()
+            self.window.previews[camera.uid].worker = live_worker
+            self.window.open_camera_sd_replay(camera)
+            pane = self.window.local_replays[camera.uid]
+            self.assertIsInstance(pane, LocalReplayPane)
+            self.assertTrue(pane.camera_recordings)
+            self.assertIs(self.window.selected_device, existing)
+            self.assertIs(self.window.previews[camera.uid].worker, live_worker)
+            remote.return_value.list_range.reset_mock()
+            now = datetime.now()
+            pane.load_remote_range(now - timedelta(hours=1), now)
+            first_count = remote.return_value.list_range.call_count
+            pane.load_remote_range(now - timedelta(minutes=30), now)
+            self.assertGreaterEqual(first_count, 1)
+            self.assertEqual(remote.return_value.list_range.call_count, first_count)
+            self.window.close_local_replay(camera.uid)
+            remote.return_value.stop.assert_called_once()
+            self.assertIn(pane, self.window.retired_replays)
+            pane.on_remote_finished()
+            self.assertNotIn(pane, self.window.retired_replays)
+            with patch.object(pane, "start_replay_player") as player:
+                pane.current_path = Path("late")
+                pane.on_remote_playback("late", "rtsp://127.0.0.1:12345/recording")
+                player.assert_not_called()
+            self.window.previews[camera.uid].worker = None
 
     def test_privacy_creates_no_player_and_does_not_retry(self):
         camera = imou_account_camera(ACCOUNT, replace(DEVICE, privacy=True))
