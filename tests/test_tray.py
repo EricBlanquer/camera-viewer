@@ -48,6 +48,7 @@ class TrayTest(unittest.TestCase):
             "Add camera",
             "Continuous recording (24 h)",
             "Detect people and animals locally",
+            "Local detection cameras",
             "Open recordings folder",
             "Quit",
         ])

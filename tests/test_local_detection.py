@@ -9,13 +9,17 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PyQt6.QtWidgets import QApplication, QWidget
+from PyQt6.QtCore import QSettings
+from PyQt6.QtWidgets import QApplication, QMenu, QWidget
 
-from app import LocalReplayPane, MainWindow, RtspCamera, measured_video_rate, update_local_detector
+from app import (
+    LOCAL_DETECTION_CAMERAS_SETTING, LocalReplayPane, MainWindow, RtspCamera,
+    measured_video_rate, update_local_detector,
+)
 from local_detection import (
     DetectionEvent, DetectionHit, DetectionPipeline, DogEventReviewer, EventTracker, _animal_tracks_are_cats,
     export_event, install_model, load_events, organize_events, prune_events, save_event,
@@ -336,6 +340,83 @@ class RecordingExcerptTest(unittest.TestCase):
         with patch("app.local_detection_engine") as engine:
             self.assertIsNone(update_local_detector(worker, RtspCamera("camera", "Garden", "rtsp://example.invalid"), lambda: []))
             engine.assert_not_called()
+
+
+class CameraDetectionSettingsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_")
+        self.settings = QSettings(str(Path(self.directory.name) / "settings.ini"), QSettings.Format.IniFormat)
+        with patch("app.QSettings", return_value=self.settings), patch("app.QTimer.singleShot"):
+            self.window = MainWindow()
+        self.garden = RtspCamera("garden", "Garden", "rtsp://example.invalid")
+        self.living = RtspCamera("living", "Living room", "rtsp://example.invalid")
+        self.window.devices = [self.garden, self.living]
+        self.window.selected_device = self.garden
+        self.window.local_detection_menu = QMenu(self.window)
+        self.window.stream_worker = SimpleNamespace(local_detection_enabled=True)
+        self.preview = Mock()
+        self.window.previews = {self.living.uid: self.preview}
+
+    def tearDown(self):
+        self.window.stream_worker = None
+        self.window.previews.clear()
+        self.window.quit_requested = True
+        self.window.close()
+        self.directory.cleanup()
+
+    def test_camera_choices_persist_and_master_toggle_preserves_independent_preferences(self):
+        self.window.set_camera_local_detection(self.living.uid, False)
+        self.assertTrue(self.window.stream_worker.local_detection_enabled)
+        self.preview.set_local_detection.assert_called_with(False)
+        with patch.object(self.window, "show_notice"):
+            self.window.set_local_detection(False)
+            self.assertFalse(self.window.stream_worker.local_detection_enabled)
+            self.assertFalse(self.window.local_detection_menu.isEnabled())
+            self.window.set_local_detection(True)
+        self.assertTrue(self.window.stream_worker.local_detection_enabled)
+        self.assertTrue(self.window.local_detection_menu.isEnabled())
+        self.assertFalse(self.window.local_detection_enabled(self.living.uid))
+        self.preview.set_local_detection.assert_called_with(False)
+        reopened = QSettings(self.settings.fileName(), QSettings.Format.IniFormat)
+        self.assertFalse(reopened.value(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{self.living.uid}", True, bool))
+        self.window.selected_device = self.living
+        self.window.apply_local_detection_settings()
+        self.assertFalse(self.window.stream_worker.local_detection_enabled)
+
+    def test_menu_changes_only_the_chosen_camera(self):
+        self.window.update_local_detection_menu()
+        actions = self.window.local_detection_menu.actions()
+        self.assertEqual([action.text() for action in actions], ["Garden", "Living room"])
+        self.assertTrue(all(action.isCheckable() and action.isChecked() for action in actions))
+        actions[1].trigger()
+        self.assertTrue(actions[0].isChecked())
+        self.assertTrue(self.window.local_detection_enabled(self.garden.uid))
+        self.assertFalse(self.window.local_detection_enabled(self.living.uid))
+
+    def test_already_queued_disabled_camera_event_updates_history_without_a_notification(self):
+        self.window.set_camera_local_detection(self.living.uid, False)
+        now = datetime.now()
+        event = DetectionEvent(self.living.uid, self.living.name, now, now, ("person",), .8,
+                               Path(self.directory.name) / "event.mkv", now)
+        replay = Mock()
+        self.window.local_replays[self.living.uid] = replay
+        self.window.tray = Mock()
+        with patch.object(self.window, "show_notice") as notice:
+            self.window.on_local_detection_ready(event)
+            replay.refresh_recordings.assert_called_once()
+            self.window.tray.showMessage.assert_not_called()
+            notice.assert_not_called()
+            enabled_event = DetectionEvent(self.garden.uid, self.garden.name, now, now, ("person",), .8,
+                                          Path(self.directory.name) / "garden.mkv", now)
+            self.window.on_local_detection_ready(enabled_event)
+            self.window.tray.showMessage.assert_called_once()
+            notice.assert_called_once()
+        self.window.local_replays.clear()
+        self.window.tray = None
 
 
 class LocalReplayTest(unittest.TestCase):

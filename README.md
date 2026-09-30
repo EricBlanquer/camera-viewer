@@ -160,6 +160,8 @@ Live video starts automatically, and the viewer reconnects by itself after a net
 RTSP and native iCam365 live views also reconnect when playback accumulates at least six seconds of additional delay for three seconds.
 The delay is measured against monotonic elapsed time and the fastest observed playback position, independently of the camera's displayed clock and initial connection delay.
 Reconnecting closes the current recording segment and starts a fresh transport, player, and continuous recording segment.
+Each video keeps its last decoded camera image during reconnection and replaces it when the new player has a frame.
+The connection message identifies this paused image; changing or stopping a camera clears it.
 Use **Full screen** to expand the viewer.
 **Photo** saves a picture and **Record** saves the live video as a Matroska file in `Pictures/O-KAM Linux`.
 The existing media and settings paths retain their O-KAM Linux names so earlier recordings and account settings remain available.
@@ -182,6 +184,8 @@ Clicking the tray icon brings a window behind other applications to the front; c
 Camera selection, connection retries, and account errors preserve the window's visibility, minimization, and focus.
 Video controls and status messages remain hidden while Camera Viewer is behind another application, minimized, or hidden; current messages reappear when its window becomes active.
 The tray menu enables local detection of people, cats, dogs, and birds while continuous recording is on.
+Use **Local detection cameras** to enable or disable analysis and notifications independently for each camera.
+The global detection switch preserves these camera choices; disabling a camera's detection keeps its video and continuous recording running.
 It analyzes one 640 × 360 frame per second with the SHA-256-verified OpenCV Zoo YOLOX-s model and confirms an event when the same object appears twice within two seconds.
 Nearby detections of the same animal retain a cat classification when the model briefly calls that animal a dog or bird; spatially separate animals retain their own types.
 Before saving a dog-only detection, Camera Viewer checks sampled frames from its recorded clip at a lower recognition threshold and classifies it as a cat when multiple frames show the same animal as a cat.

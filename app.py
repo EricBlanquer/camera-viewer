@@ -42,6 +42,7 @@ from PyQt6.QtGui import (
     QMoveEvent,
     QPainter,
     QPen,
+    QPixmap,
     QRegion,
     QResizeEvent,
     QShowEvent,
@@ -332,6 +333,7 @@ REPLAY_FILE_IDLE_SECONDS = 5
 CONTINUOUS_SETTING = "recording/continuous"
 DETECTION_SETTING = "detections/last_seen"
 LOCAL_DETECTION_SETTING = "detections/local_enabled"
+LOCAL_DETECTION_CAMERAS_SETTING = "detections/camera_enabled"
 DETECTION_MESSAGE_MS = 15000
 RAW_RECORDING_SUFFIX = ".h264"
 MIN_RECORDING_FRAMES = 2
@@ -2619,6 +2621,17 @@ class VideoWidget(QWidget):
         self.controls_overlay: ControlsOverlay | None = None
         self.recording_badge: QWidget | None = None
         self.status_overlay: QWidget | None = None
+        self.retained_frame = QPixmap()
+        self.frame_placeholder = QLabel(self)
+        self.frame_placeholder.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+        self.frame_placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.frame_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.frame_placeholder.setStyleSheet("background-color: #171717;")
+        self.frame_placeholder.hide()
+        self.reconnected_socket: Path | None = None
+        self.frame_ready_timer = QTimer(self)
+        self.frame_ready_timer.setInterval(100)
+        self.frame_ready_timer.timeout.connect(self.refresh_reconnected_frame)
         self.x_display = xdisplay.Display() if QApplication.platformName() == "xcb" else None
         self.input_window = None
         self.input_timer = QTimer(self)
@@ -2654,6 +2667,8 @@ class VideoWidget(QWidget):
         self.place_overlay()
 
     def raise_interaction_layer(self) -> None:
+        if not self.retained_frame.isNull():
+            self.frame_placeholder.raise_()
         if self.input_window is not None:
             self.input_window.configure(stack_mode=X11.Above)
         for overlay in (self.controls_overlay, self.recording_badge, self.status_overlay):
@@ -2696,10 +2711,59 @@ class VideoWidget(QWidget):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
+        self.place_retained_frame()
         if self.input_window is not None:
             self.input_window.configure(width=self.width(), height=self.height())
             self.x_display.flush()
         self.place_overlay()
+
+    def retain_player_frame(self, socket_path: Path | None) -> None:
+        self.frame_ready_timer.stop()
+        self.reconnected_socket = None
+        if socket_path is None:
+            return
+        try:
+            with tempfile.TemporaryDirectory(prefix="intraswitch_camera_viewer_frame_") as directory:
+                path = Path(directory) / "frame.png"
+                saved, _ = mpv_request(socket_path, ["screenshot-to-file", str(path), "video"])
+                frame = QPixmap(str(path)) if saved else QPixmap()
+        except OSError:
+            return
+        if frame.isNull():
+            return
+        self.retained_frame = frame
+        self.place_retained_frame()
+        self.frame_placeholder.show()
+        self.raise_interaction_layer()
+
+    def place_retained_frame(self) -> None:
+        if self.retained_frame.isNull():
+            return
+        scaled = self.retained_frame.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                          Qt.TransformationMode.SmoothTransformation)
+        self.frame_placeholder.setGeometry(self.rect())
+        self.frame_placeholder.setPixmap(scaled.copy((scaled.width() - self.width()) // 2,
+                                                     (scaled.height() - self.height()) // 2,
+                                                     self.width(), self.height()))
+
+    def await_reconnected_frame(self, socket_path: Path | None) -> None:
+        if not self.retained_frame.isNull() and socket_path is not None:
+            self.reconnected_socket = socket_path
+            self.frame_ready_timer.start()
+
+    def refresh_reconnected_frame(self) -> None:
+        configured, parameters = mpv_request(self.reconnected_socket, ["get_property", "video-out-params"])
+        if configured and isinstance(parameters, dict):
+            positioned, position = mpv_request(self.reconnected_socket, ["get_property", "time-pos"])
+            if positioned and isinstance(position, (int, float)):
+                self.clear_retained_frame()
+
+    def clear_retained_frame(self) -> None:
+        self.frame_ready_timer.stop()
+        self.reconnected_socket = None
+        self.retained_frame = QPixmap()
+        self.frame_placeholder.hide()
+        self.frame_placeholder.clear()
 
     def _start_drag(self, x: int, y: int, button: Qt.MouseButton = Qt.MouseButton.LeftButton) -> None:
         self.drag_start = (x, y)
@@ -2804,6 +2868,7 @@ class VideoWidget(QWidget):
 
     def closeEvent(self, event: object) -> None:
         self.input_timer.stop()
+        self.clear_retained_frame()
         if self.x_display is not None:
             self.x_display.close()
         super().closeEvent(event)
@@ -4061,6 +4126,8 @@ class CameraPreview(QWidget):
 
     def _on_status(self, message: str) -> None:
         if message == "Live video":
+            socket_path = Path(self.mpv_directory.name) / "control.sock" if self.mpv_directory is not None else None
+            self.video.await_reconnected_frame(socket_path)
             self.retry_seconds = 2
             self.live = True
             self.snapshot_button.setEnabled(True)
@@ -4079,6 +4146,11 @@ class CameraPreview(QWidget):
             "The camera rejected the available credentials.", IMOU_PRIVACY_MESSAGE,
             IMOU_SECRET_MISSING_MESSAGE, IMOU_TRAFFIC_MESSAGE,
         )
+        if self.retry_enabled and self.live and not self.closing:
+            socket_path = Path(self.mpv_directory.name) / "control.sock" if self.mpv_directory is not None else None
+            self.video.retain_player_frame(socket_path)
+        elif not self.retry_enabled:
+            self.video.clear_retained_frame()
         if not self.retry_enabled:
             self.retry_timer.stop()
 
@@ -4349,6 +4421,7 @@ class CameraPreview(QWidget):
 
     def stop(self) -> None:
         self.closing = True
+        self.video.clear_retained_frame()
         self.retry_timer.stop()
         self.overlay_timer.stop()
         self.hide_overlay()
@@ -5419,6 +5492,9 @@ class MainWindow(QMainWindow):
         self.local_detection_action.setCheckable(True)
         self.local_detection_action.setChecked(self.local_detection_enabled())
         self.local_detection_action.toggled.connect(self.set_local_detection)
+        self.local_detection_menu = menu.addMenu("Local detection cameras")
+        self.local_detection_menu.setEnabled(self.local_detection_enabled())
+        self.local_detection_menu.aboutToShow.connect(self.update_local_detection_menu)
         open_recordings = menu.addAction("Open recordings folder")
         open_recordings.triggered.connect(self.open_recordings_folder)
         menu.addSeparator()
@@ -5559,7 +5635,7 @@ class MainWindow(QMainWindow):
         replay = self.local_replays.get(event.uid)
         if replay is not None:
             replay.refresh_recordings()
-        if not self.local_detection_enabled():
+        if not self.local_detection_enabled(event.uid):
             return
         self.latest_local_detection = event
         description = ", ".join(event.classes)
@@ -5633,16 +5709,42 @@ class MainWindow(QMainWindow):
     def continuous_recording_enabled(self) -> bool:
         return self.settings.value(CONTINUOUS_SETTING, True, bool)
 
-    def local_detection_enabled(self) -> bool:
-        return self.settings.value(LOCAL_DETECTION_SETTING, True, bool)
+    def camera_local_detection_enabled(self, uid: str) -> bool:
+        return self.settings.value(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{uid}", True, bool)
+
+    def local_detection_enabled(self, uid: str | None = None) -> bool:
+        return self.settings.value(LOCAL_DETECTION_SETTING, True, bool) and (
+            uid is None or self.camera_local_detection_enabled(uid)
+        )
+
+    def update_local_detection_menu(self) -> None:
+        self.local_detection_menu.clear()
+        for camera in self.ordered_devices():
+            action = self.local_detection_menu.addAction(camera.name)
+            action.setCheckable(True)
+            action.setChecked(self.camera_local_detection_enabled(camera.uid))
+            action.toggled.connect(lambda enabled, uid=camera.uid: self.set_camera_local_detection(uid, enabled))
+        if not self.devices:
+            self.local_detection_menu.addAction("No cameras available").setEnabled(False)
+
+    def apply_local_detection_settings(self) -> None:
+        selected = getattr(self, "selected_device", None)
+        if self.stream_worker is not None and selected is not None:
+            self.stream_worker.local_detection_enabled = self.local_detection_enabled(selected.uid)
+        for uid, preview in self.previews.items():
+            preview.set_local_detection(self.local_detection_enabled(uid))
+
+    def set_camera_local_detection(self, uid: str, enabled: bool) -> None:
+        self.settings.setValue(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{uid}", enabled)
+        self.settings.sync()
+        self.apply_local_detection_settings()
 
     def set_local_detection(self, enabled: bool) -> None:
         self.settings.setValue(LOCAL_DETECTION_SETTING, enabled)
         self.settings.sync()
-        if self.stream_worker is not None:
-            self.stream_worker.local_detection_enabled = enabled
-        for preview in self.previews.values():
-            preview.set_local_detection(enabled)
+        self.apply_local_detection_settings()
+        if hasattr(self, "local_detection_menu"):
+            self.local_detection_menu.setEnabled(enabled)
         self.show_notice("Local detection on." if enabled else "Local detection off.")
 
     def set_continuous_recording(self, enabled: bool) -> None:
@@ -5958,7 +6060,7 @@ class MainWindow(QMainWindow):
                     continue
                 preview = CameraPreview(
                     camera, self.continuous_recording_enabled(), self.settings,
-                    self.local_detection_enabled(), self.local_detection_ready.emit,
+                    self.local_detection_enabled(camera.uid), self.local_detection_ready.emit,
                     self.local_detection_failed.emit,
                 )
                 preview.video.camera_drop_requested.connect(self.drop_camera)
@@ -6146,6 +6248,7 @@ class MainWindow(QMainWindow):
         self.save_rtsp_cameras()
         self.settings.remove(f"{RTSP_SOUND_SETTING}/{camera.uid}")
         self.settings.remove(f"{CAMERA_VISIBLE_SETTING}/{camera.uid}")
+        self.settings.remove(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{camera.uid}")
         self.settings.remove("camera/selected_uid")
         self.settings.remove("camera/selected_account")
         self.settings.sync()
@@ -6313,6 +6416,7 @@ class MainWindow(QMainWindow):
         for camera in removed:
             self.settings.remove(f"{RTSP_SOUND_SETTING}/{camera.uid}")
             self.settings.remove(f"{CAMERA_VISIBLE_SETTING}/{camera.uid}")
+            self.settings.remove(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{camera.uid}")
         self.save_imou_accounts()
         self.sync_previews()
 
@@ -6703,7 +6807,7 @@ class MainWindow(QMainWindow):
                 continuous,
             )
         self.stream_worker.set_continuous(self.continuous_recording_enabled())
-        self.stream_worker.local_detection_enabled = self.local_detection_enabled()
+        self.stream_worker.local_detection_enabled = self.local_detection_enabled(self.selected_device.uid)
         self.stream_worker.local_event_callback = self.local_detection_ready.emit
         self.stream_worker.local_error_callback = self.local_detection_failed.emit
         if isinstance(self.stream_worker, StreamWorker):
@@ -6744,7 +6848,7 @@ class MainWindow(QMainWindow):
             self.video_pan = (0.0, 0.0)
             self.apply_video_pan()
             return True
-        self.stop_player()
+        self.stop_player(preserve_frame=True)
         self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-mpv-")
         self.mpv_socket = Path(self.mpv_directory.name) / "control.sock"
         playlist_fd = None
@@ -6773,7 +6877,9 @@ class MainWindow(QMainWindow):
                 os.close(playlist_fd)
         return True
 
-    def stop_player(self) -> None:
+    def stop_player(self, preserve_frame: bool = False) -> None:
+        if not preserve_frame:
+            self.video.clear_retained_frame()
         stop_mpv_player(self.player)
         self.player = None
         if self.mpv_directory is not None:
@@ -6784,6 +6890,7 @@ class MainWindow(QMainWindow):
     def on_stream_status(self, message: str) -> None:
         self.set_status(message)
         if message == "Live video":
+            self.video.await_reconnected_frame(self.mpv_socket)
             self.stream_live = True
             self.reconnect_attempts = 0
             if self.pending_local_detection is not None and self.pending_local_detection.uid == self.selected_device.uid:
@@ -7191,6 +7298,10 @@ class MainWindow(QMainWindow):
             "The camera rejected the available credentials.", IMOU_PRIVACY_MESSAGE,
             IMOU_SECRET_MISSING_MESSAGE, IMOU_TRAFFIC_MESSAGE,
         )
+        if self.retry_pending and self.stream_live and not self.close_pending:
+            self.video.retain_player_frame(self.mpv_socket)
+        elif not self.retry_pending:
+            self.video.clear_retained_frame()
         if not self.retry_pending:
             self.reconnect_timer.stop()
         self.stream_live = False
