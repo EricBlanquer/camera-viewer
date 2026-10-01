@@ -7,6 +7,7 @@
 #include <sstream>
 #include <string>
 #include "video_decoder.h"
+#include "tls_client.h"
 #include "ppapi/c/pp_errors.h"
 #include "ppapi/cpp/instance.h"
 #include "ppapi/cpp/module.h"
@@ -43,12 +44,14 @@ class TcpChannel {
  public:
   TcpChannel(Transport* owner, int id);
   ~TcpChannel() { Close(); }
-  void Connect(const std::string& host, int port);
+  void Connect(const std::string& host, int port, const std::string& pin, const std::string& seed);
   void Send(const std::string& data);
   void Close();
  private:
   void OnResolve(int32_t code);
   void OnConnect(int32_t code);
+  void ProcessTls();
+  void Enqueue(const std::string& data);
   void Receive();
   void OnReceive(int32_t count);
   void Flush();
@@ -65,6 +68,7 @@ class TcpChannel {
   size_t sent_ = 0;
   bool connected_ = false;
   bool sending_ = false;
+  std::unique_ptr<TlsClient> tls_;
 };
 
 class UdpChannel {
@@ -119,12 +123,26 @@ class Transport : public pp::Instance {
       pp::Var host = message.Get("host");
       pp::Var port = message.Get("port");
       if (!host.is_string() || !port.is_int()) return;
+      pp::Var pin = message.Get("certificate_sha256");
+      if (!pin.is_undefined() && !pin.is_string()) return;
       tcp_channels_[id].reset(new TcpChannel(this, id));
-      tcp_channels_[id]->Connect(host.AsString(), port.AsInt());
+      tcp_channels_[id]->Connect(host.AsString(), port.AsInt(), pin.is_string() ? pin.AsString() : "", BufferBytes(message.Get("seed")));
     } else if (command == "tcp-close") {
       tcp_channels_.erase(id);
     } else if (command == "tcp-send" && tcp_channels_.count(id)) {
       tcp_channels_[id]->Send(BufferBytes(message.Get("data")));
+    } else if (command == "digest-hash") {
+      pp::Var data = message.Get("data");
+      pp::Var algorithm = message.Get("algorithm");
+      pp::Var request = message.Get("request");
+      if (!data.is_string() || data.AsString().size() > 8192 || !algorithm.is_string() || !request.is_int()) return;
+      if (algorithm.AsString() != "MD5" && algorithm.AsString() != "SHA-256") return;
+      pp::VarDictionary event;
+      event.Set("type", "digest-hash");
+      event.Set("id", id);
+      event.Set("request", request);
+      event.Set("value", DigestHex(data.AsString(), algorithm.AsString()));
+      PostMessage(event);
     } else if (command == "decode-video") {
       pp::Var codec = message.Get("codec");
       pp::Var generation = message.Get("generation");
@@ -171,11 +189,15 @@ class Transport : public pp::Instance {
 };
 
 TcpChannel::TcpChannel(Transport* owner, int id) : owner_(owner), id_(id), socket_(owner), resolver_(owner), callbacks_(this) {}
-void TcpChannel::Connect(const std::string& host, int port) {
+void TcpChannel::Connect(const std::string& host, int port, const std::string& pin, const std::string& seed) {
   if (!pp::TCPSocket::IsAvailable() || !pp::HostResolver::IsAvailable()) { Fail("unavailable", PP_ERROR_NOTSUPPORTED); return; }
   if (host.empty() || host.size() > 253 || port < 1 || port > 65535) { Fail("address", PP_ERROR_BADARGUMENT); return; }
   for (unsigned char character : host) {
     if (!std::isalnum(character) && character != '.' && character != '-') { Fail("address", PP_ERROR_BADARGUMENT); return; }
+  }
+  if (!pin.empty()) {
+    tls_.reset(new TlsClient());
+    if (!tls_->Initialize(pin, seed)) { Fail("TLS configuration", PP_ERROR_BADARGUMENT); return; }
   }
   PP_HostResolver_Hint hint = {PP_NETADDRESS_FAMILY_IPV4, 0};
   int32_t code = resolver_.Resolve(host.c_str(), static_cast<uint16_t>(port), hint, callbacks_.NewCallback(&TcpChannel::OnResolve));
@@ -188,9 +210,27 @@ void TcpChannel::OnResolve(int32_t code) {
 }
 void TcpChannel::OnConnect(int32_t code) {
   if (code != PP_OK) { Fail("connect", code); return; }
-  connected_ = true;
-  owner_->Event("tcp-ready", "ready", id_);
-  Receive();
+  if (tls_) ProcessTls();
+  else { connected_ = true; owner_->Event("tcp-ready", "ready", id_); }
+  if (!socket_.is_null()) Receive();
+}
+void TcpChannel::ProcessTls() {
+  if (!connected_) {
+    int code = tls_->Handshake();
+    Enqueue(tls_->Output());
+    if (socket_.is_null()) return;
+    if (code == 0) { connected_ = true; owner_->Event("tcp-ready", "TLS certificate verified", id_); }
+    else if (!TlsClient::Pending(code)) { Fail("TLS authentication", code); return; }
+  }
+  while (connected_) {
+    char plaintext[65536];
+    int code = tls_->Read(plaintext, sizeof(plaintext));
+    Enqueue(tls_->Output());
+    if (socket_.is_null()) return;
+    if (code > 0) owner_->TcpData(id_, plaintext, code);
+    else if (TlsClient::Pending(code)) return;
+    else { Fail("TLS receive", code); return; }
+  }
 }
 void TcpChannel::Receive() {
   int32_t code = socket_.Read(buffer_, sizeof(buffer_), callbacks_.NewCallback(&TcpChannel::OnReceive));
@@ -198,11 +238,24 @@ void TcpChannel::Receive() {
 }
 void TcpChannel::OnReceive(int32_t count) {
   if (count <= 0) { Fail("receive", count); return; }
-  owner_->TcpData(id_, buffer_, count);
-  Receive();
+  if (tls_) { tls_->Feed(buffer_, count); ProcessTls(); }
+  else owner_->TcpData(id_, buffer_, count);
+  if (!socket_.is_null()) Receive();
 }
 void TcpChannel::Send(const std::string& data) {
   if (!connected_ || data.empty()) return;
+  if (!tls_) { Enqueue(data); return; }
+  size_t offset = 0;
+  while (offset < data.size()) {
+    int code = tls_->Write(data.data() + offset, data.size() - offset);
+    Enqueue(tls_->Output());
+    if (!connected_) return;
+    if (code <= 0) { Fail("TLS send", code); return; }
+    offset += code;
+  }
+}
+void TcpChannel::Enqueue(const std::string& data) {
+  if (data.empty()) return;
   if (data.size() > 65536 || queued_ + data.size() > 262144) { Fail("send buffer", PP_ERROR_NOMEMORY); return; }
   queue_.push_back(data);
   queued_ += data.size();
@@ -229,7 +282,7 @@ void TcpChannel::Fail(const std::string& operation, int32_t code) {
   Close();
   owner_->Event("tcp-error", "TCP " + operation + ": " + std::to_string(code), id_);
 }
-void TcpChannel::Close() { callbacks_.CancelAll(); socket_.Close(); connected_ = false; }
+void TcpChannel::Close() { callbacks_.CancelAll(); socket_.Close(); connected_ = false; socket_ = pp::TCPSocket(); }
 
 UdpChannel::UdpChannel(Transport* owner, int id) : owner_(owner), id_(id), socket_(owner), callbacks_(this) {}
 void UdpChannel::Bind() {

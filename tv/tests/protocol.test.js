@@ -193,3 +193,21 @@ test("queue bounds reject oversized or distant packets", () => {
   buffer.append(new Uint8Array(8 * 1024 * 1024));
   assert.throws(() => buffer.append(Uint8Array.of(1)), /buffer/);
 });
+test("iCam365 authentication starts video and selects the desktop HD stream", () => {
+  const { connection } = session();
+  const commands = [];
+  connection.command = (command, body) => commands.push([command, body]);
+  connection.commandBuffer.append(
+    p.concat(p.word32(0x8003), p.word32(4), p.word32(0)),
+  );
+  connection.commands();
+  assert.deepEqual(commands.map(([command]) => command), [
+    0x8024,
+    0x8012,
+    0x1ff,
+    0x320,
+  ]);
+  assert.deepEqual(Array.from(commands.at(-1)[1]), [0, 0, 0, 0, 1, 0, 0, 0]);
+  connection.commands();
+  assert.equal(commands.length, 4);
+});

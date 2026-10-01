@@ -639,6 +639,7 @@
             this.command(0x8024);
             this.command(0x8012, new Uint8Array(8));
             this.command(0x1ff, concat(word32(2), word32(0)));
+            this.command(0x320, concat(word32(0), word32(1)));
           }
           this.callbacks.status("Authenticated, waiting for live video");
         } else if (

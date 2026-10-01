@@ -127,6 +127,14 @@ class CameraPane {
       return false;
     }
     if (camera.type === "imou") {
+      if (camera.local || this.camera.local) {
+        return Boolean(
+          camera.local && this.camera.local &&
+            camera.local.host === this.camera.local.host &&
+            camera.local.port === this.camera.local.port &&
+            camera.local.channel === this.camera.local.channel,
+        );
+      }
       return camera.device_id === this.camera.device_id &&
         camera.channel_id === this.camera.channel_id &&
         camera.account.app_id === this.camera.account.app_id;

@@ -3,6 +3,7 @@
   <name>Camera Viewer</name>
   <author>Eric Blanquer</author>
   <content src="index.html"/>
+  <icon src="icon.png"/>
   <tizen:application id="CamViewTV1.CameraViewer" package="CamViewTV1" required_version="5.0"/>
   <tizen:profile name="tv-samsung"/>
   <tizen:privilege name="http://tizen.org/privilege/internet"/>

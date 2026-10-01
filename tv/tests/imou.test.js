@@ -463,3 +463,267 @@ test("stopping during authentication prevents a late socket connection", async (
   assert.equal(session.state, "closed");
   assert.deepEqual(messages, []);
 });
+
+const nodeCrypto = require("node:crypto");
+const localCamera = {
+  type: "imou",
+  name: "Kitchen",
+  local: {
+    host: "192.168.1.210",
+    port: 554,
+    channel: 1,
+    username: "admin",
+    password: "test-camera-password",
+    certificate_sha256: "a".repeat(64),
+  },
+};
+function reply(sequence, status, headers = "", body = "") {
+  return bytes(
+    "RTSP/1.0 " + status + " Status\r\nCSeq: " + sequence + "\r\n" + headers +
+      "Content-Length: " + bytes(body).length + "\r\n\r\n" + body,
+  );
+}
+function fixture(config = localCamera, delayed = false) {
+  const messages = [], errors = [], hashes = [];
+  let session;
+  const native = {
+    postMessage(message) {
+      messages.push(message);
+      if (message.command !== "digest-hash") return;
+      const hash = () =>
+        session.event({
+          type: "digest-hash",
+          id: session.id,
+          request: message.request,
+          value: nodeCrypto.createHash(
+            message.algorithm === "MD5" ? "md5" : "sha256",
+          ).update(message.data).digest("hex"),
+        });
+      if (delayed) hashes.push(hash);
+      else queueMicrotask(hash);
+    },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  session = new imou.Session(config, native, {
+    status() {},
+    video() {},
+    error(message) {
+      errors.push(message);
+    },
+  });
+  const event = (data) =>
+    session.event({ type: "tcp-data", id: session.id, data: data.buffer });
+  return { session, messages, errors, hashes, event };
+}
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+test("local Imou configuration permits private addresses and enforces camera credentials and certificate pins", () => {
+  imou.validate(localCamera);
+  const endpoint = imou.localUrl(localCamera);
+  assert.equal(
+    endpoint.href,
+    "rtsp://192.168.1.210:554/cam/realmonitor?channel=1&subtype=0",
+  );
+  assert.equal(endpoint.local, true);
+  for (
+    const change of [
+      { host: "127.0.0.1" },
+      { host: "192.168.01.210" },
+      { host: "8.8.8.8" },
+      { host: "192.168.1.256" },
+      { host: "192.168.1.210\r\n" },
+      { password: "" },
+      { username: "admin\r\n" },
+      { port: 0 },
+      { channel: 0 },
+      { certificate_sha256: "" },
+      { certificate_sha256: ["a".repeat(64)] },
+    ]
+  ) {
+    assert.throws(
+      () =>
+        imou.validate({
+          ...localCamera,
+          local: { ...localCamera.local, ...change },
+        }),
+      /Invalid local Imou/,
+    );
+  }
+  const description = imou.videoDescription(
+    "m=video 0 RTP/AVP 98\r\na=rtpmap:98 H265/90000\r\na=control:rtsp://192.168.1.210:554/trackID=0\r\n",
+    endpoint,
+  );
+  assert.equal(description.control, "rtsp://192.168.1.210:554/trackID=0");
+  assert.throws(
+    () =>
+      imou.videoDescription(
+        "m=video 0 RTP/AVP 98\r\na=rtpmap:98 H265/90000\r\na=control:rtsp://192.168.1.211:554/trackID=0\r\n",
+        endpoint,
+      ),
+    /Invalid RTSP control/,
+  );
+});
+test("local video connects without account requests and authenticates DESCRIBE, SETUP, PLAY and stop", async (t) => {
+  const original = global.XMLHttpRequest;
+  global.XMLHttpRequest = class {
+    constructor() {
+      assert.fail("Local video requested cloud access");
+    }
+  };
+  t.after(() => {
+    global.XMLHttpRequest = original;
+  });
+  const f = fixture();
+  t.after(() => f.session.finishClose());
+  await f.session.open();
+  assert.equal(f.messages[0].host, localCamera.local.host);
+  assert.equal(
+    f.messages[0].certificate_sha256,
+    localCamera.local.certificate_sha256,
+  );
+  assert.equal(f.messages[0].seed.byteLength, 48);
+  f.session.event({ type: "tcp-ready", id: f.session.id });
+  f.event(
+    reply(
+      1,
+      401,
+      'WWW-Authenticate: Digest realm="Login", nonce="testnonce", qop="auth", algorithm=MD5\r\n',
+    ),
+  );
+  await settle();
+  const authenticated = text(new Uint8Array(f.messages.at(-1).data));
+  assert.match(authenticated, /Authorization: Digest username="admin"/);
+  assert.ok(!authenticated.includes(localCamera.local.password));
+  const auth = imou.challenge(
+    authenticated.match(/Authorization: (.*)\r\n/)[1],
+  );
+  const md5 = (value) =>
+    nodeCrypto.createHash("md5").update(value).digest("hex");
+  const uri = imou.localUrl(localCamera).href;
+  assert.equal(
+    auth.response,
+    md5(
+      md5("admin:Login:" + localCamera.local.password) + ":testnonce:" +
+        auth.nc + ":" + auth.cnonce + ":auth:" + md5("DESCRIBE:" + uri),
+    ),
+  );
+  f.event(
+    reply(
+      2,
+      200,
+      "Content-Base: " + uri + "/\r\n",
+      "m=video 0 RTP/AVP 98\r\na=rtpmap:98 H265/90000\r\na=control:trackID=0\r\n",
+    ),
+  );
+  await settle();
+  assert.match(
+    text(new Uint8Array(f.messages.at(-1).data)),
+    /^SETUP .*\r\n(?:.*\r\n)*Authorization: Digest /,
+  );
+  f.event(
+    reply(
+      3,
+      200,
+      "Session: testSession;timeout=60\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n",
+    ),
+  );
+  await settle();
+  f.event(reply(4, 200));
+  assert.equal(f.session.state, "playing");
+  f.session.close();
+  await settle();
+  assert.ok(
+    text(new Uint8Array(f.messages.at(-1).data)).startsWith("TEARDOWN "),
+  );
+  f.event(reply(5, 200));
+  assert.equal(f.session.state, "closed");
+  assert.deepEqual(f.errors, []);
+});
+test("local authentication stops after rejected credentials without cloud fallback", async (t) => {
+  const f = fixture();
+  t.after(() => f.session.finishClose());
+  await f.session.open();
+  f.session.event({ type: "tcp-ready", id: f.session.id });
+  f.event(
+    reply(
+      1,
+      401,
+      'WWW-Authenticate: Digest realm="Login", nonce="testnonce"\r\n',
+    ),
+  );
+  await settle();
+  f.event(
+    reply(
+      2,
+      401,
+      'WWW-Authenticate: Digest realm="Login", nonce="testnonce"\r\n',
+    ),
+  );
+  assert.equal(f.session.state, "closed");
+  assert.deepEqual(f.errors, ["Imou stream rejected (RTSP 401)"]);
+});
+test("closing during local authentication discards late digests", async () => {
+  const f = fixture(localCamera, true);
+  await f.session.open();
+  f.session.event({ type: "tcp-ready", id: f.session.id });
+  f.event(
+    reply(
+      1,
+      401,
+      'WWW-Authenticate: Digest realm="Login", nonce="testnonce"\r\n',
+    ),
+  );
+  const sent =
+    f.messages.filter((message) => message.command === "tcp-send").length;
+  f.session.close();
+  f.hashes.forEach((hash) => hash());
+  await settle();
+  assert.equal(f.session.state, "closed");
+  assert.equal(
+    f.messages.filter((message) => message.command === "tcp-send").length,
+    sent,
+  );
+  assert.deepEqual(f.errors, []);
+});
+test("Digest responses support MD5 and SHA-256 session algorithms with and without auth qop", async (t) => {
+  const f = fixture();
+  t.after(() => f.session.finishClose());
+  await f.session.open();
+  const uri = imou.localUrl(localCamera).href;
+  for (const algorithm of ["MD5", "MD5-sess", "SHA-256", "SHA-256-sess"]) {
+    for (const qop of ["", ', qop="auth-int, auth"']) {
+      f.session.authentication = imou.challenge(
+        'Digest realm="Login", nonce="testnonce", opaque="a\\"b", algorithm=' +
+          algorithm + qop,
+      );
+      const value = imou.challenge(
+        await f.session.authorization("DESCRIBE", uri),
+      );
+      const hash = (data) =>
+        nodeCrypto.createHash(algorithm.startsWith("MD5") ? "md5" : "sha256")
+          .update(data).digest("hex");
+      let first = hash("admin:Login:" + localCamera.local.password);
+      if (algorithm.endsWith("-sess")) {
+        first = hash(first + ":testnonce:" + value.cnonce);
+      }
+      const second = hash("DESCRIBE:" + uri);
+      assert.equal(
+        value.response,
+        hash(
+          first + ":testnonce:" +
+            (qop ? value.nc + ":" + value.cnonce + ":auth:" : "") + second,
+        ),
+      );
+      assert.equal(value.opaque, 'a"b');
+    }
+  }
+  for (
+    const value of [
+      'Basic realm="Login"',
+      'Digest realm="Login", nonce="n", algorithm=SHA-1',
+      'Digest realm="Login", nonce="n", qop="auth-int"',
+      'Digest realm="Login", nonce="n", nonce="other"',
+      'Digest realm="Login", nonce="n"\r\nInjected: value',
+    ]
+  ) assert.throws(() => imou.challenge(value), /authentication/);
+});

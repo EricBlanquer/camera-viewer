@@ -275,3 +275,35 @@ test("stalled rendering closes only the affected connection", async () => {
   assert.equal(state[1].connected, true);
   assert.equal(app.nodes["debug-panel"].hidden, true);
 });
+test("local Imou reconnects retain images only for the same local camera and channel", async () => {
+  const app = viewer();
+  const camera = {
+    type: "imou",
+    name: "Kitchen",
+    local: {
+      host: "192.168.1.210",
+      port: 554,
+      channel: 1,
+      username: "admin",
+      password: "test",
+    },
+  };
+  app.context.window.cameraViewer.configure([camera]);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  app.render(0);
+  const pane = app.pane(0);
+  const image = pane.canvas.image;
+  await pane.connect({
+    ...camera,
+    local: { ...camera.local, password: "updated" },
+  });
+  assert.equal(pane.canvas.image, image);
+  for (
+    const change of [{ host: "192.168.1.244" }, { port: 8554 }, { channel: 2 }]
+  ) {
+    app.render(0);
+    await pane.connect({ ...camera, local: { ...camera.local, ...change } });
+    assert.equal(pane.canvas.image, null);
+  }
+});

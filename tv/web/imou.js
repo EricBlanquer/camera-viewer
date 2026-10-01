@@ -63,6 +63,24 @@
     );
   }
   function validate(camera) {
+    if (camera.local !== undefined) {
+      const local = camera.local;
+      if (
+        camera.type !== "imou" || !local || !privateHost(local.host) ||
+        !Number.isInteger(local.port) || local.port < 1 || local.port > 65535 ||
+        !Number.isInteger(local.channel) || local.channel < 1 ||
+        local.channel > 65535 ||
+        typeof local.username !== "string" || !local.username ||
+        local.username.length > 128 ||
+        typeof local.password !== "string" || !local.password ||
+        local.password.length > 512 ||
+        /[\r\n\0]/.test(local.username + local.password) ||
+        (local.certificate_sha256 !== undefined &&
+          (typeof local.certificate_sha256 !== "string" ||
+            !/^[a-f0-9]{64}$/.test(local.certificate_sha256)))
+      ) throw new Error("Invalid local Imou camera configuration");
+      return;
+    }
     const account = camera.account;
     if (
       camera.type !== "imou" || !account ||
@@ -80,6 +98,66 @@
         (typeof camera.product_id !== "string" ||
           camera.product_id.length > 128))
     ) throw new Error("Invalid Imou camera configuration");
+  }
+  function privateHost(host) {
+    if (typeof host !== "string" || !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
+      return false;
+    }
+    const parts = host.split(".").map(Number);
+    if (
+      parts.some((part, index) =>
+        part > 255 || String(part) !== host.split(".")[index]
+      )
+    ) return false;
+    return parts[0] === 10 || parts[0] === 192 && parts[1] === 168 ||
+      parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31;
+  }
+  function localUrl(camera) {
+    validate(camera);
+    const local = camera.local;
+    return streamUrl(
+      "rtsp://" + local.host + ":" + local.port +
+        "/cam/realmonitor?channel=" + local.channel + "&subtype=0",
+      true,
+    );
+  }
+  function challenge(value) {
+    if (
+      typeof value !== "string" || !value.startsWith("Digest ") ||
+      value.length > 4096 || /[\r\n\0]/.test(value)
+    ) {
+      throw new Error("Unsupported camera authentication");
+    }
+    const parameters = Object.create(null);
+    const pattern =
+      /([A-Za-z_-]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^,\s]+))\s*(?:,|$)/g;
+    let match;
+    let offset = 7;
+    while ((match = pattern.exec(value))) {
+      if (
+        value.slice(offset, match.index).trim() ||
+        parameters[match[1].toLowerCase()] !== undefined
+      ) {
+        throw new Error("Invalid camera authentication challenge");
+      }
+      parameters[match[1].toLowerCase()] = match[2] === undefined
+        ? match[3]
+        : match[2].replace(/\\(.)/g, "$1");
+      offset = pattern.lastIndex;
+    }
+    const algorithm = parameters.algorithm || "MD5";
+    if (
+      value.slice(offset).trim() || !parameters.realm || !parameters.nonce ||
+      !["MD5", "MD5-sess", "SHA-256", "SHA-256-sess"].includes(algorithm) ||
+      parameters.qop &&
+        !parameters.qop.split(",").map((item) => item.trim()).includes("auth")
+    ) {
+      throw new Error("Unsupported camera authentication");
+    }
+    return Object.assign(parameters, { algorithm });
+  }
+  function quoted(value) {
+    return '"' + value.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
   }
   function request(host, method, body) {
     return new Promise((resolve, reject) => {
@@ -208,7 +286,7 @@
       return (await this.call("getStreamUrl", params)).url;
     }
   }
-  function streamUrl(value) {
+  function streamUrl(value, local = false) {
     if (
       typeof value !== "string" || value.length > 8192 || /[\r\n\0]/.test(value)
     ) {
@@ -229,7 +307,11 @@
     if (
       url.protocol !== "http:" || url.username || url.password ||
       url.hash ||
-      !/^[A-Za-z0-9.-]+\.(imoulife\.com|easy4ip\.com)$/.test(url.hostname) ||
+      !(local
+        ? privateHost(url.hostname)
+        : /^[A-Za-z0-9.-]+\.(imoulife\.com|easy4ip\.com)$/.test(
+          url.hostname,
+        )) ||
       port < 1 || port > 65535
     ) {
       throw new Error("Invalid Imou stream address");
@@ -239,6 +321,7 @@
       hostname: url.hostname,
       port: String(port),
       http: url,
+      local,
     };
   }
   function controlUrl(value, base) {
@@ -246,7 +329,7 @@
     const endpoint = base.http ? base : streamUrl(base.href);
     try {
       url = value.startsWith("rtsp://")
-        ? streamUrl(value).http
+        ? streamUrl(value, endpoint.local).http
         : new URL(value === "*" ? endpoint.http.href : value, endpoint.http);
     } catch (error) {
       throw new Error("Invalid RTSP control address");
@@ -521,6 +604,9 @@
       this.pending = new Map();
       this.sequence = 0;
       this.session = "";
+      this.hashes = new Map();
+      this.hashSequence = 0;
+      this.nonceCount = 0;
       this.reader = new RtspReader(
         (status, headers, body) => this.response(status, headers, body),
         (channel, packet) => {
@@ -543,18 +629,21 @@
         }
       }, 1000);
       try {
-        const config = this.config.account;
-        let account = accounts.get(config.app_id);
-        if (
-          !account || account.config.region !== config.region ||
-          account.config.app_secret !== config.app_secret
-        ) {
-          account = new Account(config);
-          accounts.set(config.app_id, account);
+        if (this.config.local) this.url = localUrl(this.config);
+        else {
+          const config = this.config.account;
+          let account = accounts.get(config.app_id);
+          if (
+            !account || account.config.region !== config.region ||
+            account.config.app_secret !== config.app_secret
+          ) {
+            account = new Account(config);
+            accounts.set(config.app_id, account);
+          }
+          const value = await account.stream(this.config);
+          if (this.state !== "account") return;
+          this.url = streamUrl(value);
         }
-        const value = await account.stream(this.config);
-        if (this.state !== "account") return;
-        this.url = streamUrl(value);
         this.aggregate = this.url.href;
         this.state = "connecting";
         this.opened = true;
@@ -563,6 +652,12 @@
           id: this.id,
           host: this.url.hostname,
           port: Number(this.url.port) || 554,
+          ...(this.config.local && this.config.local.certificate_sha256
+            ? {
+              certificate_sha256: this.config.local.certificate_sha256,
+              seed: crypto.getRandomValues(new Uint8Array(48)).buffer,
+            }
+            : {}),
         });
       } catch (error) {
         if (this.state !== "closed" && this.state !== "closing") {
@@ -570,7 +665,59 @@
         }
       }
     }
-    send(method, address = this.aggregate, headers = {}) {
+    hash(data, algorithm) {
+      return new Promise((resolve, reject) => {
+        const request = ++this.hashSequence;
+        this.hashes.set(request, { resolve, reject });
+        this.native.postMessage({
+          command: "digest-hash",
+          id: this.id,
+          request,
+          data,
+          algorithm,
+        });
+      });
+    }
+    async authorization(method, address) {
+      const auth = this.authentication;
+      const local = this.config.local;
+      const algorithm = auth.algorithm.replace(/-sess$/, "");
+      const cnonce = uuid().replace(/-/g, "");
+      const nc = (++this.nonceCount).toString(16).padStart(8, "0");
+      let first = await this.hash(
+        local.username + ":" + auth.realm + ":" + local.password,
+        algorithm,
+      );
+      if (auth.algorithm.endsWith("-sess")) {
+        first = await this.hash(
+          first + ":" + auth.nonce + ":" + cnonce,
+          algorithm,
+        );
+      }
+      const second = await this.hash(method + ":" + address, algorithm);
+      const response = await this.hash(
+        first + ":" + auth.nonce + ":" +
+          (auth.qop ? nc + ":" + cnonce + ":auth:" : "") + second,
+        algorithm,
+      );
+      const fields = {
+        username: quoted(local.username),
+        realm: quoted(auth.realm),
+        nonce: quoted(auth.nonce),
+        uri: quoted(address),
+        response: quoted(response),
+        algorithm: auth.algorithm,
+      };
+      if (auth.opaque !== undefined) fields.opaque = quoted(auth.opaque);
+      if (auth.qop) {
+        Object.assign(fields, { qop: "auth", nc, cnonce: quoted(cnonce) });
+      } else if (auth.algorithm.endsWith("-sess")) {
+        fields.cnonce = quoted(cnonce);
+      }
+      return "Digest " +
+        Object.keys(fields).map((key) => key + "=" + fields[key]).join(", ");
+    }
+    send(method, address = this.aggregate, headers = {}, retried = false) {
       if (this.pending.size >= 4) {
         throw new Error("Too many pending RTSP requests");
       }
@@ -583,6 +730,27 @@
         this.session ? { Session: this.session } : {},
         headers,
       );
+      this.pending.set(sequence, {
+        method,
+        address,
+        headers,
+        retried,
+        sent: performance.now(),
+      });
+      if (this.authentication) {
+        this.authorization(method, address).then((authorization) => {
+          if (this.pending.has(sequence)) {
+            this.transmit(
+              sequence,
+              method,
+              address,
+              Object.assign(fields, { Authorization: authorization }),
+            );
+          }
+        }).catch((error) => this.fail(error));
+      } else this.transmit(sequence, method, address, fields);
+    }
+    transmit(sequence, method, address, fields) {
       const message = bytes(
         method + " " + address + " RTSP/1.0\r\n" +
           Object.keys(fields).map((key) => key + ": " + fields[key]).join(
@@ -590,7 +758,6 @@
           ) +
           "\r\n\r\n",
       );
-      this.pending.set(sequence, { method, sent: performance.now() });
       this.native.postMessage({
         command: "tcp-send",
         id: this.id,
@@ -610,11 +777,20 @@
         return;
       }
       if (status !== 200) {
+        if (status === 401 && this.config.local && !pending.retried) {
+          this.authentication = challenge(headers["www-authenticate"]);
+          this.nonceCount = 0;
+          this.send(pending.method, pending.address, pending.headers, true);
+          return;
+        }
         throw new Error("Imou stream rejected (RTSP " + status + ")");
       }
       if (pending.method === "DESCRIBE") {
         const base = headers["content-base"]
-          ? streamUrl(controlUrl(headers["content-base"], this.url))
+          ? streamUrl(
+            controlUrl(headers["content-base"], this.url),
+            this.url.local,
+          )
           : this.url;
         const description = videoDescription(body, base);
         this.video = new RtpVideo(description, (payload, codec) => {
@@ -658,7 +834,16 @@
     event(event) {
       if (event.id !== this.id || this.state === "closed") return;
       try {
-        if (event.type === "tcp-ready" && this.state === "connecting") {
+        if (event.type === "digest-hash") {
+          const pending = this.hashes.get(event.request);
+          if (!pending) return;
+          this.hashes.delete(event.request);
+          if (
+            typeof event.value !== "string" ||
+            !/^(?:[a-f0-9]{32}|[a-f0-9]{64})$/.test(event.value)
+          ) pending.reject(new Error("Camera authentication failed"));
+          else pending.resolve(event.value);
+        } else if (event.type === "tcp-ready" && this.state === "connecting") {
           this.state = "describe";
           this.send("DESCRIBE", this.url.href, { Accept: "application/sdp" });
         } else if (event.type === "tcp-data") {
@@ -691,6 +876,12 @@
         throw new Error("Imou video stalled, reconnecting");
       }
     }
+    cancelAuthentication() {
+      this.hashes.forEach((pending) =>
+        pending.reject(new Error("Camera authentication stopped"))
+      );
+      this.hashes.clear();
+    }
     close() {
       if (this.state === "closed" || this.state === "closing") return;
       clearInterval(this.timer);
@@ -704,6 +895,7 @@
       this.native.addEventListener("message", this.closeListener);
       this.closeTimer = setTimeout(() => this.finishClose(), 2000);
       this.pending.clear();
+      this.cancelAuthentication();
       this.send("TEARDOWN");
     }
     finishClose() {
@@ -717,6 +909,7 @@
       }
       this.opened = false;
       this.pending.clear();
+      this.cancelAuthentication();
       this.state = "closed";
       this.reader.buffer = new ByteQueue();
       this.video = null;
@@ -732,6 +925,8 @@
     signature,
     Account,
     streamUrl,
+    localUrl,
+    challenge,
     videoDescription,
     RtspReader,
     RtpVideo,
