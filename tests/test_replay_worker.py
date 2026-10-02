@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime
@@ -49,6 +51,47 @@ class ReplayWorkerQueueTest(unittest.TestCase):
         self.assertEqual(self.worker._next_request(), (REPLAY_DOWNLOAD_REQUEST, newer))
         self.assertTrue(older.ended)
         self.assertIsNone(self.worker._next_request())
+
+
+CLOSED_PLAYBACK_FAILURE_SCRIPT = """
+import gc, os, sys, threading
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+sys.path.insert(0, sys.argv[1])
+from datetime import datetime
+from types import SimpleNamespace
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication
+from app import ReplayController, TimelineWidget
+application = QApplication([])
+messages = []
+for index in range(30):
+    failed = threading.Event()
+    timeline = TimelineWidget()
+    controller = ReplayController(SimpleNamespace(), "", timeline)
+    if not index:
+        controller.status_changed.connect(messages.append)
+    controller.worker.failed.connect(lambda message, done=failed: done.set(), Qt.ConnectionType.DirectConnection)
+    controller.load_visible_days(datetime.now(), datetime.now())
+    if not failed.wait(10):
+        raise SystemExit("The replay worker did not fail.")
+    if not index:
+        application.processEvents()
+    controller.stop()
+    del controller, timeline
+    gc.collect()
+application.processEvents()
+print(messages)
+"""
+
+
+class ReplayFailureTest(unittest.TestCase):
+    def test_worker_failure_reaches_status_and_survives_closed_playback(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-c", CLOSED_PLAYBACK_FAILURE_SCRIPT, str(Path(__file__).resolve().parents[1])],
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertEqual(result.stdout.strip(), "['The camera recording could not be read.']")
 
 
 class ReplayLoadingTest(unittest.TestCase):

@@ -3178,7 +3178,7 @@ class ReplayController(QObject):
         self.worker.day_listed.connect(self.on_day_listed)
         self.worker.progress.connect(self.on_progress)
         self.worker.downloaded.connect(self.on_downloaded)
-        self.worker.failed.connect(self.status_changed.emit)
+        self.worker.failed.connect(self.status_changed)
         self.worker.failed.connect(self.cancel_jump)
         self.position_changed.connect(self.on_position)
         self.playback_finished.connect(self.on_finished)
