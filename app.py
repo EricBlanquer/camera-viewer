@@ -867,13 +867,12 @@ def save_fullscreen_alignment(settings: QSettings, layout: str, cameras: tuple[s
     settings.sync()
 
 
-def dragged_fullscreen_alignment(alignment: str, slack: int, dy: int) -> str:
-    index = FULLSCREEN_ALIGNMENTS.index(alignment)
-    candidates = range(index) if dy < 0 else range(index + 1, len(FULLSCREEN_ALIGNMENTS))
-    if not dy or not candidates:
-        return alignment
-    position = index * slack / 2 + dy
-    return FULLSCREEN_ALIGNMENTS[min(candidates, key=lambda candidate: abs(candidate * slack / 2 - position))]
+def fullscreen_alignment_top(alignment: str, slack: int) -> int:
+    return FULLSCREEN_ALIGNMENTS.index(alignment) * slack // 2
+
+
+def nearest_fullscreen_alignment(slack: int, top: int) -> str:
+    return min(FULLSCREEN_ALIGNMENTS, key=lambda alignment: abs(fullscreen_alignment_top(alignment, slack) - top))
 
 
 def camera_continuous_allowed(camera: AccountDevice | RtspCamera) -> bool:
@@ -2685,12 +2684,14 @@ class VideoWidget(QWidget):
     drag_moved = pyqtSignal(int, int)
     wheel_zoomed = pyqtSignal(int, int, int)
     double_clicked = pyqtSignal(int, int)
-    camera_drop_requested = pyqtSignal(str, QPoint, QPoint)
+    camera_dragged = pyqtSignal(str, QPoint)
+    camera_drop_requested = pyqtSignal(str, QPoint)
 
     def __init__(self) -> None:
         super().__init__()
         self.drag_start: tuple[int, int] | None = None
         self.drag_last: tuple[int, int] | None = None
+        self.drag_origin = QPoint()
         self.camera_uid = ""
         self.reorder_enabled = False
         self.drag_camera_uid = ""
@@ -2862,29 +2863,32 @@ class VideoWidget(QWidget):
         self.frame_placeholder.hide()
         self.frame_placeholder.clear()
 
-    def _start_drag(self, x: int, y: int, button: Qt.MouseButton = Qt.MouseButton.LeftButton) -> None:
+    def _start_drag(self, x: int, y: int, position: QPoint, button: Qt.MouseButton = Qt.MouseButton.LeftButton) -> None:
         self.drag_start = (x, y)
         self.drag_last = (x, y)
+        self.drag_origin = position
         self.drag_button = button
         self.drag_camera_uid = self.camera_uid if self.reorder_enabled and button == Qt.MouseButton.LeftButton else ""
         self.drag_exceeded = False
 
-    def _move_drag(self, x: int, y: int) -> None:
+    def _move_drag(self, x: int, y: int, position: QPoint) -> None:
         if self.drag_last is None:
             return
         dx = x - self.drag_last[0]
         dy = y - self.drag_last[1]
         self.drag_last = (x, y)
         if self.drag_camera_uid:
-            if abs(x - self.drag_start[0]) + abs(y - self.drag_start[1]) >= QApplication.startDragDistance():
+            if (position - self.drag_origin).manhattanLength() >= QApplication.startDragDistance():
                 self.drag_exceeded = True
                 self.click_timer.stop()
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            if self.drag_exceeded:
+                self.camera_dragged.emit(self.drag_camera_uid, position - self.drag_origin)
             return
         if dx or dy:
             self.drag_moved.emit(dx, dy)
 
-    def _finish_drag(self, x: int, y: int) -> None:
+    def _finish_drag(self, x: int, y: int, position: QPoint) -> None:
         self.drag_last = None
         if self.drag_start is None:
             return
@@ -2893,9 +2897,9 @@ class VideoWidget(QWidget):
         self.drag_start = None
         if self.drag_camera_uid:
             self.unsetCursor()
-            if self.drag_exceeded or abs(dx) + abs(dy) >= QApplication.startDragDistance():
+            if self.drag_exceeded or (position - self.drag_origin).manhattanLength() >= QApplication.startDragDistance():
                 self.click_timer.stop()
-                self.camera_drop_requested.emit(self.drag_camera_uid, self.mapToGlobal(QPoint(x, y)), QPoint(dx, dy))
+                self.camera_drop_requested.emit(self.drag_camera_uid, position)
                 return
         if self.drag_button == Qt.MouseButton.RightButton:
             if abs(dx) >= DRAG_PIXELS_PER_STEP // 2 or abs(dy) >= DRAG_PIXELS_PER_STEP // 2:
@@ -2912,13 +2916,14 @@ class VideoWidget(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
-            self._start_drag(round(event.position().x()), round(event.position().y()), event.button())
+            self._start_drag(round(event.position().x()), round(event.position().y()),
+                             event.globalPosition().toPoint(), event.button())
             event.accept()
         else:
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        self._move_drag(round(event.position().x()), round(event.position().y()))
+        self._move_drag(round(event.position().x()), round(event.position().y()), event.globalPosition().toPoint())
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         if event.angleDelta().y():
@@ -2928,7 +2933,7 @@ class VideoWidget(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == self.drag_button:
-            self._finish_drag(round(event.position().x()), round(event.position().y()))
+            self._finish_drag(round(event.position().x()), round(event.position().y()), event.globalPosition().toPoint())
             event.accept()
         else:
             super().mouseReleaseEvent(event)
@@ -2936,7 +2941,7 @@ class VideoWidget(QWidget):
     def read_mouse_events(self) -> None:
         if self.x_display is None:
             return
-        motion: tuple[int, int] | None = None
+        motion: tuple[int, int, QPoint] | None = None
         while self.x_display.pending_events():
             event = self.x_display.next_event()
             if self.input_window is None:
@@ -2946,7 +2951,7 @@ class VideoWidget(QWidget):
                 self.raise_interaction_layer()
                 continue
             if event.type == X11.MotionNotify:
-                motion = (event.event_x, event.event_y)
+                motion = (event.event_x, event.event_y, QPoint(event.root_x, event.root_y))
                 continue
             if event.type not in (X11.ButtonPress, X11.ButtonRelease):
                 continue
@@ -2958,9 +2963,9 @@ class VideoWidget(QWidget):
             elif event.detail in (1, 3):
                 button = Qt.MouseButton.LeftButton if event.detail == 1 else Qt.MouseButton.RightButton
                 if event.type == X11.ButtonPress:
-                    self._start_drag(event.event_x, event.event_y, button)
+                    self._start_drag(event.event_x, event.event_y, QPoint(event.root_x, event.root_y), button)
                 elif button == self.drag_button:
-                    self._finish_drag(event.event_x, event.event_y)
+                    self._finish_drag(event.event_x, event.event_y, QPoint(event.root_x, event.root_y))
         if motion is not None:
             self._move_drag(*motion)
 
@@ -5450,6 +5455,7 @@ class MainWindow(QMainWindow):
         self.tray: QSystemTrayIcon | None = None
         self.window_hints: X11WindowHints | None = None
         self.normal_geometry: QRect | None = None
+        self.dragged_alignment: str | None = None
         self.devices: list[AccountDevice | RtspCamera] = []
         self.device_accounts: dict[str, str] = {}
         self.previews: dict[str, CameraPreview] = {}
@@ -5540,6 +5546,7 @@ class MainWindow(QMainWindow):
         self.video.drag_moved.connect(self.pan_zoomed_video)
         self.video.wheel_zoomed.connect(self.change_zoom)
         self.video.double_clicked.connect(lambda x, y: self.toggle_fullscreen())
+        self.video.camera_dragged.connect(self.drag_camera)
         self.video.camera_drop_requested.connect(self.drop_camera)
         self.video_grid = QGridLayout()
         self.video_grid.setContentsMargins(0, 0, 0, 0)
@@ -6088,6 +6095,7 @@ class MainWindow(QMainWindow):
         replay.live_requested.connect(lambda uid=camera.uid: self.close_local_replay(uid))
         replay.fullscreen_requested.connect(self.toggle_fullscreen)
         replay.video.reorder_enabled = len(self.visible_devices()) > 1
+        replay.video.camera_dragged.connect(self.drag_camera)
         replay.video.camera_drop_requested.connect(self.drop_camera)
         self.local_replays[camera.uid] = replay
         if selected:
@@ -6285,17 +6293,32 @@ class MainWindow(QMainWindow):
         self.settings.sync()
         self.sync_previews()
 
-    def drop_camera(self, source_uid: str, position: QPoint, offset: QPoint) -> None:
-        visible = self.visible_devices()
-        if not self.isVisible() or len(visible) < 2 or source_uid not in {camera.uid for camera in visible}:
+    def drag_camera(self, source_uid: str, offset: QPoint) -> None:
+        slack = self.fullscreen_video_slack()
+        if not slack or source_uid not in {camera.uid for camera in self.visible_devices()}:
             return
-        selected_uid = getattr(getattr(self, "selected_device", None), "uid", None)
-        for camera in visible:
-            pane = self.primary_pane if camera.uid == selected_uid else self.previews.get(camera.uid)
-            if pane is not None and pane.isVisible() and QRect(pane.mapToGlobal(QPoint()), pane.size()).contains(position):
-                self.swap_cameras(source_uid, camera.uid)
-                return
-        self.drop_fullscreen_videos(position, offset)
+        top = fullscreen_alignment_top(self.fullscreen_alignment(), slack) + offset.y()
+        alignment = nearest_fullscreen_alignment(slack, top)
+        if alignment != self.dragged_alignment:
+            self.dragged_alignment = alignment
+            self.update_camera_mask()
+
+    def drop_camera(self, source_uid: str, position: QPoint) -> None:
+        alignment, self.dragged_alignment = self.dragged_alignment, None
+        visible = self.visible_devices()
+        if self.isVisible() and len(visible) > 1 and source_uid in {camera.uid for camera in visible}:
+            selected_uid = getattr(getattr(self, "selected_device", None), "uid", None)
+            for camera in visible:
+                pane = self.primary_pane if camera.uid == selected_uid else self.previews.get(camera.uid)
+                if (camera.uid != source_uid and pane is not None and pane.isVisible()
+                        and QRect(pane.mapToGlobal(QPoint()), pane.size()).contains(position)):
+                    self.swap_cameras(source_uid, camera.uid)
+                    return
+            if alignment is not None:
+                cameras, layout = self.current_camera_view()
+                save_fullscreen_alignment(self.settings, layout, cameras, alignment)
+        if alignment is not None:
+            self.update_camera_mask()
 
     def fullscreen_alignment(self) -> str:
         cameras, layout = self.current_camera_view()
@@ -6312,26 +6335,12 @@ class MainWindow(QMainWindow):
 
     def align_fullscreen_videos(self) -> None:
         slack = self.fullscreen_video_slack()
-        top = FULLSCREEN_ALIGNMENTS.index(self.fullscreen_alignment()) * slack // 2
+        top = fullscreen_alignment_top(self.dragged_alignment or self.fullscreen_alignment(), slack)
         margins = QMargins(0, top, 0, slack - top)
         if self.video_grid.contentsMargins() != margins:
             self.video_grid.setContentsMargins(margins)
             self.video_grid.activate()
             self.layout().activate()
-
-    def drop_fullscreen_videos(self, position: QPoint, offset: QPoint) -> None:
-        slack = self.fullscreen_video_slack()
-        origin = self.centralWidget().mapToGlobal(QPoint())
-        area = self.video_grid.geometry().translated(origin)
-        if not slack or not area.contains(position) or self.video_grid.contentsRect().translated(origin).contains(position):
-            return
-        current = self.fullscreen_alignment()
-        alignment = dragged_fullscreen_alignment(current, slack, offset.y())
-        if alignment == current:
-            return
-        cameras, layout = self.current_camera_view()
-        save_fullscreen_alignment(self.settings, layout, cameras, alignment)
-        self.update_camera_mask()
 
     def _retire_preview(self, preview: CameraPreview) -> None:
         self.close_local_replay(preview.camera.uid)
@@ -6407,6 +6416,7 @@ class MainWindow(QMainWindow):
                     self.local_detection_enabled(camera.uid), self.local_detection_ready.emit,
                     self.local_detection_failed.emit,
                 )
+                preview.video.camera_dragged.connect(self.drag_camera)
                 preview.video.camera_drop_requested.connect(self.drop_camera)
                 preview.replay_requested.connect(self.open_local_replay)
                 preview.camera_replay_requested.connect(self.open_camera_sd_replay)
@@ -7457,6 +7467,7 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.Type.WindowStateChange:
             self.centralWidget().setStyleSheet("background-color: black;" if self.isFullScreen()
                                               else "background-color: #171717;")
+            self.dragged_alignment = None
             self.align_fullscreen_videos()
             self.camera_mask_timer.start(0)
             if self.isMinimized():

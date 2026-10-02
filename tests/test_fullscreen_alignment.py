@@ -11,27 +11,17 @@ from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QApplication
 
 from app import (
-    CameraPreview, MainWindow, RtspCamera, dragged_fullscreen_alignment, load_fullscreen_alignment,
+    CameraPreview, MainWindow, RtspCamera, load_fullscreen_alignment, nearest_fullscreen_alignment,
     save_fullscreen_alignment,
 )
 
 
-class DraggedFullscreenAlignmentTest(unittest.TestCase):
-    def test_drag_moves_at_least_one_position_towards_the_nearest_anchor(self) -> None:
-        for alignment, dy, expected in (
-            ("center", -10, "top"),
-            ("center", 10, "bottom"),
-            ("top", 10, "center"),
-            ("top", 140, "center"),
-            ("top", 160, "bottom"),
-            ("bottom", -10, "center"),
-            ("bottom", -160, "top"),
-            ("top", -50, "top"),
-            ("bottom", 50, "bottom"),
-            ("center", 0, "center"),
-        ):
-            with self.subTest(alignment=alignment, dy=dy):
-                self.assertEqual(dragged_fullscreen_alignment(alignment, 200, dy), expected)
+class NearestFullscreenAlignmentTest(unittest.TestCase):
+    def test_videos_snap_to_the_nearest_position(self) -> None:
+        for top, expected in ((-80, "top"), (49, "top"), (51, "center"), (149, "center"), (151, "bottom"),
+                              (280, "bottom")):
+            with self.subTest(top=top):
+                self.assertEqual(nearest_fullscreen_alignment(200, top), expected)
 
 
 class FullscreenAlignmentTest(unittest.TestCase):
@@ -60,6 +50,8 @@ class FullscreenAlignmentTest(unittest.TestCase):
             self.normal_geometry = self.window.geometry()
             self.window.toggle_fullscreen()
             self.settle()
+        self.slack = self.window.fullscreen_video_slack()
+        self.area = self.window.video_grid.geometry()
 
     def tearDown(self) -> None:
         self.window.quit_requested = True
@@ -79,48 +71,57 @@ class FullscreenAlignmentTest(unittest.TestCase):
     def video_top(self, index) -> int:
         return self.video(index).mapTo(self.window.centralWidget(), QPoint()).y()
 
-    def band_point(self, above: bool) -> QPoint:
-        self.window.video_grid.activate()
-        area = self.window.video_grid.geometry()
-        content = self.window.video_grid.contentsRect()
-        y = (area.top() + content.top()) // 2 if above else (content.bottom() + area.bottom()) // 2
-        return self.window.centralWidget().mapToGlobal(QPoint(area.center().x(), y))
+    def send(self, source, kind, position: QPoint) -> None:
+        button = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseMove else Qt.MouseButton.LeftButton
+        buttons = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseButtonRelease else Qt.MouseButton.LeftButton
+        event = QMouseEvent(kind, QPointF(source.mapFromGlobal(position)), QPointF(position), button, buttons,
+                            Qt.KeyboardModifier.NoModifier)
+        self.application.sendEvent(source, event)
 
-    def drag(self, source, destination, origin=None) -> None:
-        origin = source.rect().center() if origin is None else origin
-        target = source.mapFromGlobal(destination)
-        for kind, position, buttons in (
-            (QEvent.Type.MouseButtonPress, origin, Qt.MouseButton.LeftButton),
-            (QEvent.Type.MouseMove, target, Qt.MouseButton.LeftButton),
-            (QEvent.Type.MouseButtonRelease, target, Qt.MouseButton.NoButton),
-        ):
-            event = QMouseEvent(kind, QPointF(position), QPointF(source.mapToGlobal(position)),
-                                Qt.MouseButton.NoButton if kind == QEvent.Type.MouseMove else Qt.MouseButton.LeftButton,
-                                buttons, Qt.KeyboardModifier.NoModifier)
-            self.application.sendEvent(source, event)
+    def press(self, source) -> QPoint:
+        origin = source.mapToGlobal(source.rect().center())
+        self.send(source, QEvent.Type.MouseButtonPress, origin)
+        return origin
+
+    def drag(self, source, offset: QPoint) -> None:
+        origin = self.press(source)
+        self.send(source, QEvent.Type.MouseMove, origin + offset)
+        self.send(source, QEvent.Type.MouseButtonRelease, origin + offset)
         self.settle()
-
-    def visible_uids(self) -> tuple[str, ...]:
-        return tuple(camera.uid for camera in self.window.visible_devices())
 
     def test_fullscreen_videos_are_centered_without_inner_letterboxing(self) -> None:
         self.assertTrue(self.window.isFullScreen())
-        slack = self.window.fullscreen_video_slack()
-        area = self.window.video_grid.geometry()
-        self.assertGreater(slack, 0)
+        self.assertGreater(self.slack, 0)
         for index in (0, 1):
-            self.assertEqual(self.video_top(index), area.top() + slack // 2)
-            self.assertEqual(self.video(index).width(), area.width() // 2)
-            self.assertEqual(self.video(index).height(), (area.height() - slack) // 2)
+            self.assertEqual(self.video_top(index), self.area.top() + self.slack // 2)
+            self.assertEqual(self.video(index).width(), self.area.width() // 2)
+            self.assertEqual(self.video(index).height(), (self.area.height() - self.slack) // 2)
 
-    def test_dropping_above_sticks_videos_to_the_top_and_is_remembered(self) -> None:
-        area = self.window.video_grid.geometry()
-        self.drag(self.video(1), self.band_point(above=True))
-        self.assertEqual(self.video_top(0), area.top())
-        self.assertEqual(self.video_top(1), area.top())
+    def test_videos_show_their_landing_position_while_dragging(self) -> None:
+        video = self.video(1)
+        origin = self.press(video)
+        self.send(video, QEvent.Type.MouseMove, origin + QPoint(0, -self.slack // 4 + 10))
+        self.settle()
+        self.assertEqual(self.video_top(1), self.area.top() + self.slack // 2)
+        self.send(video, QEvent.Type.MouseMove, origin + QPoint(0, -self.slack // 4 - 10))
+        self.settle()
+        self.assertEqual(self.video_top(0), self.area.top())
+        self.assertEqual(self.video_top(1), self.area.top())
+        self.assertEqual(load_fullscreen_alignment(self.settings, "grid", self.window.current_camera_view()[0]),
+                         "center")
+        self.send(video, QEvent.Type.MouseMove, origin + QPoint(0, self.slack // 2))
+        self.settle()
+        self.assertEqual(self.video_top(1), self.area.top() + self.slack)
+        self.send(video, QEvent.Type.MouseButtonRelease, origin + QPoint(0, self.slack // 2))
+        self.settle()
+        self.assertEqual(self.window.fullscreen_alignment(), "bottom")
+        self.assertEqual(self.video_top(0), self.area.top() + self.slack)
         self.assertEqual([camera.uid for camera in self.window.ordered_devices()],
                          [camera.uid for camera in self.cameras])
-        self.assertEqual(load_fullscreen_alignment(self.settings, "grid", self.visible_uids()), "top")
+
+    def test_videos_return_to_the_center_and_the_choice_is_remembered(self) -> None:
+        self.drag(self.video(0), QPoint(0, -self.slack))
+        self.assertEqual(self.window.fullscreen_alignment(), "top")
         with patch("app.QSettings", return_value=self.settings), patch("app.QTimer.singleShot"):
             restored = MainWindow()
         try:
@@ -129,25 +130,22 @@ class FullscreenAlignmentTest(unittest.TestCase):
         finally:
             restored.quit_requested = True
             restored.close()
-
-    def test_dropping_below_sticks_videos_to_the_bottom_and_back_to_center(self) -> None:
-        area = self.window.video_grid.geometry()
-        self.drag(self.video(0), self.band_point(above=False))
-        slack = self.window.fullscreen_video_slack()
-        self.assertEqual(self.video_top(0), area.top() + slack)
-        self.assertEqual(self.video_top(1), area.top() + slack)
-        video = self.video(0)
-        self.drag(video, video.mapToGlobal(QPoint(video.width() // 2, 5 - slack // 2)), QPoint(video.width() // 2, 5))
+        self.drag(self.video(1), QPoint(0, self.slack // 2))
         self.assertEqual(self.window.fullscreen_alignment(), "center")
-        self.assertEqual(self.video_top(1), area.top() + slack // 2)
+        self.assertEqual(self.video_top(0), self.area.top() + self.slack // 2)
         self.assertEqual(self.settings.value("view/fullscreen_alignment", "", str), "[]")
 
+    def test_small_vertical_drag_keeps_the_current_position(self) -> None:
+        self.drag(self.video(0), QPoint(0, -self.slack // 4 + 10))
+        self.assertEqual(self.window.fullscreen_alignment(), "center")
+        self.assertEqual(self.video_top(0), self.area.top() + self.slack // 2)
+
     def test_alignment_is_kept_per_layout_and_camera_selection(self) -> None:
-        self.drag(self.video(0), self.band_point(above=True))
+        self.drag(self.video(0), QPoint(0, -self.slack))
         self.window.swap_cameras(self.cameras[0].uid, self.cameras[1].uid)
         self.settle()
         self.assertEqual(self.window.fullscreen_alignment(), "top")
-        self.assertEqual(self.video_top(0), self.window.video_grid.geometry().top())
+        self.assertEqual(self.video_top(0), self.area.top())
         self.window.set_camera_layout("horizontal")
         self.settle()
         self.assertEqual(self.window.fullscreen_alignment(), "center")
@@ -159,22 +157,22 @@ class FullscreenAlignmentTest(unittest.TestCase):
         self.settle()
         self.assertEqual(self.window.fullscreen_alignment(), "top")
 
-    def test_dropping_on_an_empty_grid_cell_keeps_videos_in_place(self) -> None:
-        self.window.video_grid.activate()
-        cell = self.window.video_grid.cellRect(1, 1)
-        self.drag(self.video(0), self.window.centralWidget().mapToGlobal(cell.center()))
-        self.assertEqual(self.window.fullscreen_alignment(), "center")
-        self.assertEqual([camera.uid for camera in self.window.ordered_devices()],
-                         [camera.uid for camera in self.cameras])
-
-    def test_dropping_on_another_video_still_exchanges_without_moving(self) -> None:
-        self.drag(self.video(0), self.video(1).mapToGlobal(self.video(1).rect().center()))
+    def test_dropping_on_another_video_exchanges_and_restores_the_saved_position(self) -> None:
+        video = self.video(0)
+        origin = self.press(video)
+        self.send(video, QEvent.Type.MouseMove, origin + QPoint(0, -self.slack))
+        self.settle()
+        self.assertEqual(self.video_top(0), self.area.top())
+        target = self.video(1).mapToGlobal(self.video(1).rect().center())
+        self.send(video, QEvent.Type.MouseButtonRelease, target)
+        self.settle()
         self.assertEqual([camera.uid for camera in self.window.ordered_devices()][:2],
                          [self.cameras[1].uid, self.cameras[0].uid])
         self.assertEqual(self.window.fullscreen_alignment(), "center")
+        self.assertEqual(self.video_top(0), self.area.top() + self.slack // 2)
 
     def test_leaving_fullscreen_removes_the_alignment_margins(self) -> None:
-        self.drag(self.video(0), self.band_point(above=True))
+        self.drag(self.video(0), QPoint(0, -self.slack))
         self.assertNotEqual(self.window.video_grid.contentsMargins(), QMargins())
         with patch.object(self.window, "fit_video_aspect"):
             self.window.toggle_fullscreen()
@@ -182,7 +180,8 @@ class FullscreenAlignmentTest(unittest.TestCase):
         self.assertFalse(self.window.isFullScreen())
         self.assertEqual(self.window.video_grid.contentsMargins(), QMargins())
         self.assertEqual(self.window.geometry(), self.normal_geometry)
-        self.drag(self.video(0), self.window.mapToGlobal(QPoint(10, -50)))
+        self.drag(self.video(0), QPoint(0, 200))
+        self.assertEqual(self.window.video_grid.contentsMargins(), QMargins())
         self.assertEqual(self.window.fullscreen_alignment(), "top")
 
     def test_invalid_saved_records_are_ignored(self) -> None:

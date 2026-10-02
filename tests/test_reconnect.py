@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QPoint, QSettings
 from PyQt6.QtWidgets import QApplication
 
 from app import ACCOUNT_REJECTED_MESSAGE, MainWindow
@@ -114,8 +114,8 @@ class ReconnectTest(unittest.TestCase):
         self.window.video.double_clicked.connect(lambda x, y: self.window.toggle_fullscreen())
         self.window.video.clicked.connect(lambda: toggles.append(True))
         for _ in range(2):
-            self.window.video._start_drag(750, 250)
-            self.window.video._finish_drag(750, 250)
+            self.window.video._start_drag(750, 250, QPoint(750, 250))
+            self.window.video._finish_drag(750, 250, QPoint(750, 250))
         self.assertEqual(fullscreen, [True])
         self.assertFalse(self.window.video.click_timer.isActive())
         self.assertEqual(toggles, [])

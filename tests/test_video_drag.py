@@ -99,9 +99,9 @@ class VideoDragTest(unittest.TestCase):
         video.drag_moved.connect(panned)
         self.drag(video, self.window.mapToGlobal(QPoint(-100, -100)))
         start = video.rect().center()
-        video._start_drag(start.x(), start.y())
-        video._move_drag(start.x() + 100, start.y())
-        video._finish_drag(start.x(), start.y())
+        video._start_drag(start.x(), start.y(), video.mapToGlobal(start))
+        video._move_drag(start.x() + 100, start.y(), video.mapToGlobal(start + QPoint(100, 0)))
+        video._finish_drag(start.x(), start.y(), video.mapToGlobal(start))
         self.assertEqual([camera.uid for camera in self.window.ordered_devices()], original)
         self.assertFalse(video.click_timer.isActive())
         moved.assert_not_called()
@@ -112,12 +112,12 @@ class VideoDragTest(unittest.TestCase):
         double_clicked = Mock()
         video.double_clicked.connect(double_clicked)
         with patch.object(self.window, "toggle_fullscreen"):
-            video._start_drag(20, 20)
-            video._move_drag(21, 20)
-            video._finish_drag(21, 20)
+            video._start_drag(20, 20, video.mapToGlobal(QPoint(20, 20)))
+            video._move_drag(21, 20, video.mapToGlobal(QPoint(21, 20)))
+            video._finish_drag(21, 20, video.mapToGlobal(QPoint(21, 20)))
             self.assertTrue(video.click_timer.isActive())
-            video._start_drag(20, 20)
-            video._finish_drag(20, 20)
+            video._start_drag(20, 20, video.mapToGlobal(QPoint(20, 20)))
+            video._finish_drag(20, 20, video.mapToGlobal(QPoint(20, 20)))
         double_clicked.assert_called_once_with(20, 20)
         self.assertFalse(video.click_timer.isActive())
 
@@ -165,7 +165,8 @@ class VideoDragTest(unittest.TestCase):
         video = self.video(1)
         origin = video.rect().center()
         target = video.mapFromGlobal(self.video(0).mapToGlobal(self.video(0).rect().center()))
-        events = [SimpleNamespace(type=kind, detail=1, event_x=point.x(), event_y=point.y())
+        events = [SimpleNamespace(type=kind, detail=1, event_x=point.x(), event_y=point.y(),
+                                  root_x=video.mapToGlobal(point).x(), root_y=video.mapToGlobal(point).y())
                   for kind, point in ((X11.ButtonPress, origin), (X11.MotionNotify, target),
                                       (X11.ButtonRelease, target))]
         display = SimpleNamespace(pending_events=lambda: len(events), next_event=lambda: events.pop(0))
