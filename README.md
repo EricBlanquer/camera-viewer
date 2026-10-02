@@ -82,6 +82,10 @@ With three cameras, the fourth cell stays empty; additional cameras extend the g
 Adjacent empty cells form one transparent area without separators.
 Full-screen view displays empty cells on a black background; leaving full screen restores their transparency.
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
+Use **Camera profiles > Save current view...** to name the checked cameras, their order, and the camera layout.
+Choosing a saved profile restores that selection, order, and layout; the profile matching the current view is checked.
+Saving under an existing name, ignoring case, replaces that profile, and **Remove profile** deletes one.
+Cameras removed since a profile was saved are ignored when it is applied.
 The grid keeps its saved layout when docked.
 Camera videos appear without names, title bars, borders, or gaps between their panes.
 Embedded video players synchronize with their pane size after mapping and resizing, while preserving the selected zoom and pan.
@@ -197,17 +201,22 @@ It analyzes one 640 × 360 frame per second with the SHA-256-verified OpenCV Zoo
 A person shape confirms an event only after its position or size changes, so motionless scenery that resembles a person is ignored.
 Cats, dogs, and birds recognized by the model are reported as animals without naming the species, because dark animals in infrared images are often confused.
 Event excerpts include up to five seconds before and after the detected passage and are stored without audio in `Videos/O-KAM Linux/Detections`, using the system's configured Videos folder.
+Each excerpt embeds, as its `cover_land.jpg` Matroska cover, the analyzed frame with the highest detection score, with the detected people or animals outlined.
+File managers that use embedded covers, such as Dolphin, show this image as the excerpt's thumbnail instead of the first frame.
+When the analyzed frame is unavailable, such as for a detection recovered after an interruption, the cover comes from the excerpt at the middle of the detected passage.
+At startup, excerpts listed in the day folders' metadata without a cover receive one in the background; other folders are left unchanged.
 The `Detections` folder groups excerpts by day in `YYYY-MM-DD` folders, then in `animal` and `person` folders; clips with both types use the `animal_person` folder, and each clip name starts with its type and camera name.
 Each day folder also contains a hidden `.metadata` folder describing its detections for the playback timeline.
 Local detections appear in red on the local playback timeline, and its Previous and Next buttons jump between detected passages.
-The notification opens the excerpt for the affected camera, including when the viewer was hidden in the notification area.
+Clicking a local detection notification plays that notification's excerpt in its camera pane, including when the viewer was hidden in the notification area.
+Detection notifications are sent to the desktop notification service with a click action, and fall back to the notification area message when that service is unavailable.
 Local detection clips and metadata are kept until deleted manually; the playback timeline shows detections from the last 24 hours, and turning off continuous recording pauses local analysis.
 
 For O-KAM cameras, the playback button switches the window to the recordings stored on the camera's microSD card, and **LIVE** returns to live video.
 In playback, the control bar shows a timeline with continuous recording in blue and detections in red; drag it or click a time to play from there, and use the wheel or the magnifier buttons to show a shorter or longer period.
 Playback starts while the recording is still loading, with sound, pause, and speeds up to 8x.
 The picture button saves the current image, and the download button saves the loaded recording as a Matroska file.
-Clicking a detection notification opens the playback at that detection.
+Clicking a microSD detection notification opens that camera's playback at the detection, selecting the camera first when another one is selected.
 
 Every minute, Camera Viewer checks the selected O-KAM camera's microSD card for new detection recordings and shows a desktop notification with the time of the latest one.
 The check uses the live connection.

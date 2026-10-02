@@ -14,7 +14,7 @@ import time
 import urllib.request
 import uuid
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -48,6 +48,12 @@ PLAYBACK_PERIOD = timedelta(hours=24)
 RECORDING_RETENTION = timedelta(hours=24)
 EVENT_DAY_FORMAT = "%Y-%m-%d"
 METADATA_FOLDER = ".metadata"
+COVER_NAME = "cover_land.jpg"
+COVER_MIME_TYPE = "image/jpeg"
+COVER_JPEG_QUALITY = 90
+COVER_BOX_COLOR = (40, 60, 230)
+COVER_BOX_THICKNESS = 2
+COVER_TEMPORARY_PREFIX = "intraswitch_camera_cover_"
 
 
 def model_path() -> Path:
@@ -197,6 +203,20 @@ class DetectionEvent:
     score: float
     clip: Path | None = None
     clip_start: datetime | None = None
+    cover: bytes | None = field(default=None, repr=False, compare=False)
+
+
+def encode_cover(frame: bytes, boxes: tuple[tuple[float, float, float, float], ...]) -> bytes:
+    import cv2
+    import numpy as np
+    image = np.frombuffer(frame, np.uint8).reshape(SAMPLE_HEIGHT, SAMPLE_WIDTH, 3).copy()
+    for left, top, width, height in boxes:
+        cv2.rectangle(image, (round(left), round(top)), (round(left + width), round(top + height)),
+                      COVER_BOX_COLOR, COVER_BOX_THICKNESS)
+    encoded, data = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, COVER_JPEG_QUALITY])
+    if not encoded:
+        raise ValueError("The detection image could not be encoded.")
+    return data.tobytes()
 
 
 class EventTracker:
@@ -210,6 +230,7 @@ class EventTracker:
         self.next_track_id = 0
         self.active_hits: dict[int, int] = {}
         self.score = 0.0
+        self.cover_source: tuple[float, bytes, tuple[tuple[float, float, float, float], ...]] | None = None
 
     def _match(self, when: datetime, hits: list[DetectionHit]) -> dict[int, float]:
         for identifier, track in list(self.tracks.items()):
@@ -237,7 +258,12 @@ class EventTracker:
         track = self.tracks.get(identifier)
         return track is not None and (track.label != PERSON_CLASS or track.moved)
 
-    def observe(self, when: datetime, hits: list[DetectionHit]) -> list[DetectionEvent]:
+    def _keep_cover(self, frame: bytes | None, relevant: dict[int, float]) -> None:
+        score = max(relevant.values())
+        if frame is not None and (self.cover_source is None or score > self.cover_source[0]):
+            self.cover_source = (score, frame, tuple(self.tracks[identifier].box for identifier in relevant))
+
+    def observe(self, when: datetime, hits: list[DetectionHit], frame: bytes | None = None) -> list[DetectionEvent]:
         completed = []
         if self.last is not None and (when - self.last).total_seconds() > EVENT_GAP_SECONDS:
             completed.append(self.finish())
@@ -250,6 +276,7 @@ class EventTracker:
             for identifier in relevant:
                 self.active_hits[identifier] = self.active_hits.get(identifier, 0) + 1
             self.score = max(self.score, *relevant.values())
+            self._keep_cover(frame, relevant)
             if (when - self.first).total_seconds() >= EVENT_MAX_SECONDS:
                 completed.append(self.finish())
             return completed
@@ -265,6 +292,7 @@ class EventTracker:
                 self.active_hits = {identifier: int(identifier in confirmed) + int(identifier in relevant)
                                     for identifier in confirmed.keys() | relevant.keys()}
                 self.score = max(*confirmed.values(), *relevant.values())
+                self._keep_cover(frame, relevant)
                 self.candidate.clear()
                 return completed
         self.candidate.append((when, found))
@@ -274,11 +302,18 @@ class EventTracker:
         assert self.first is not None and self.last is not None
         classes = tuple(sorted({self.tracks[identifier].label for identifier, count in self.active_hits.items()
                                 if count >= 2 and identifier in self.tracks}))
-        event = DetectionEvent(self.uid, self.camera, self.first, self.last, classes, self.score)
+        cover = None
+        if self.cover_source is not None:
+            try:
+                cover = encode_cover(*self.cover_source[1:])
+            except (ImportError, ValueError) as ex:
+                LOG.warning("Could not keep the detection image for %s: %s", self.camera, ex)
+        event = DetectionEvent(self.uid, self.camera, self.first, self.last, classes, self.score, cover=cover)
         self.first = None
         self.last = None
         self.active_hits.clear()
         self.score = 0.0
+        self.cover_source = None
         self.candidate.clear()
         return event
 
@@ -365,6 +400,7 @@ def save_event(path: Path, event: DetectionEvent, status: str) -> None:
         "last": event.last.isoformat(), "classes": event.classes, "score": event.score,
         "clip": event.clip.relative_to(event_directory()).as_posix() if event.clip is not None else None,
         "clip_start": event.clip_start.isoformat() if event.clip_start is not None else None,
+        "cover": COVER_NAME if event.clip is not None and event.cover is not None else None,
         "status": status,
     }
     _write_event_document(path, document)
@@ -559,9 +595,70 @@ def export_event(
                   "-i", str(playlist), "-c", "copy", str(target)], timeout=30, cancel=cancel)
         if not _has_video_packets(target, cancel):
             raise OSError("The local detection excerpt is empty.")
+        covered = Path(temporary) / "covered.mkv"
+        try:
+            cover = attach_cover(target, covered, event.cover, _cover_offset(event.first, event.last, clip_start), cancel)
+            target = covered
+        except (OSError, ValueError, subprocess.SubprocessError) as ex:
+            LOG.warning("Could not add the detection image to %s: %s", clip.name, ex)
+            cover = None
         shutil.move(target, clip)
         clip.chmod(0o600)
-    return DetectionEvent(event.uid, event.camera, event.first, event.last, event.classes, event.score, clip, clip_start)
+    return DetectionEvent(event.uid, event.camera, event.first, event.last, event.classes, event.score, clip, clip_start,
+                          cover)
+
+
+def _cover_offset(first: datetime, last: datetime, clip_start: datetime) -> float:
+    return max(0.0, (first + (last - first) / 2 - clip_start).total_seconds())
+
+
+def attach_cover(
+    clip: Path, output: Path, cover: bytes | None, offset: float, cancel: threading.Event | None = None,
+) -> bytes:
+    image = output.with_name(COVER_NAME)
+    if cover is None:
+        _run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-ss", f"{offset:.3f}", "-i", str(clip),
+              "-frames:v", "1", "-vf", f"scale={SAMPLE_WIDTH}:-2", "-q:v", "3", str(image)],
+             timeout=30, cancel=cancel)
+        cover = image.read_bytes()
+        if not cover:
+            raise OSError("The local detection excerpt has no image at the detection time.")
+    else:
+        image.write_bytes(cover)
+    _run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(clip), "-map", "0:V", "-c", "copy",
+          "-attach", str(image), "-metadata:s:t:0", f"mimetype={COVER_MIME_TYPE}",
+          "-metadata:s:t:0", f"filename={COVER_NAME}", str(output)], timeout=30, cancel=cancel)
+    if not _has_video_packets(output, cancel):
+        raise OSError("The local detection excerpt with its image is empty.")
+    return cover
+
+
+def add_missing_covers(cancel: threading.Event | None = None) -> None:
+    root = event_directory()
+    for temporary in root.glob(f"*/{METADATA_FOLDER}/{COVER_TEMPORARY_PREFIX}*"):
+        shutil.rmtree(temporary, ignore_errors=True)
+    for metadata in sorted(root.glob(f"*/{METADATA_FOLDER}/*/*.json")):
+        if cancel is not None and cancel.is_set():
+            return
+        try:
+            document = json.loads(metadata.read_text(encoding="utf-8"))
+            if document["status"] != "ready" or not document["clip"] or document.get("cover"):
+                continue
+            clip = _clip_path(root, document["clip"])
+            if not clip.is_file():
+                continue
+            offset = _cover_offset(datetime.fromisoformat(document["first"]), datetime.fromisoformat(document["last"]),
+                                   datetime.fromisoformat(document["clip_start"]))
+            with tempfile.TemporaryDirectory(prefix=COVER_TEMPORARY_PREFIX, dir=metadata.parent.parent) as temporary:
+                output = Path(temporary) / clip.name
+                attach_cover(clip, output, None, offset, cancel)
+                output.chmod(0o600)
+                os.replace(output, clip)
+            document["cover"] = COVER_NAME
+            _write_event_document(metadata, document)
+            LOG.info("Added the detection image to %s", clip.name)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as ex:
+            LOG.warning("Could not add the detection image to %s: %s", metadata, ex)
 
 
 def _frame_count(path: Path, cancel: threading.Event | None = None) -> int:
@@ -679,7 +776,7 @@ class DetectionEngine:
                 return
             with self.condition:
                 tracker = self.trackers.setdefault(pipeline.uid, EventTracker(pipeline.uid, pipeline.camera))
-                completed = tracker.observe(when, found)
+                completed = tracker.observe(when, found, frame)
             for event in completed:
                 self.schedule(event, pipeline.prefix, pipeline.on_event)
             self.processed[pipeline.uid] = self.processed.get(pipeline.uid, 0) + 1

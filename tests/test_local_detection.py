@@ -21,9 +21,37 @@ from app import (
     measured_video_rate, update_local_detector,
 )
 from local_detection import (
-    SCORE_THRESHOLD, DetectionEngine, DetectionEvent, DetectionHit, DetectionPipeline, EventTracker, YoloXDetector,
-    export_event, install_model, load_events, organize_events, save_event,
+    COVER_NAME, SAMPLE_BYTES, SCORE_THRESHOLD, DetectionEngine, DetectionEvent, DetectionHit, DetectionPipeline,
+    EventTracker, YoloXDetector, add_missing_covers, encode_cover, export_event, install_model, load_events,
+    organize_events, save_event,
 )
+
+
+def media_streams(path):
+    return json.loads(subprocess.run([
+        "ffprobe", "-v", "error", "-show_entries",
+        "stream=index,codec_name:stream_disposition=attached_pic:stream_tags=filename,mimetype",
+        "-of", "json", str(path),
+    ], check=True, capture_output=True, text=True, timeout=10).stdout)["streams"]
+
+
+def attached_image(path):
+    return subprocess.run([
+        "ffmpeg", "-v", "error", "-i", str(path), "-map", "0:1", "-c", "copy", "-f", "image2", "pipe:1",
+    ], check=True, capture_output=True, timeout=10).stdout
+
+
+def decoded_image(data):
+    import cv2
+    import numpy as np
+    return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+
+
+def make_test_video(path, seconds):
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=8",
+        "-t", str(seconds), "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", str(path),
+    ], check=True, capture_output=True, timeout=15)
 
 
 class EventTrackerTest(unittest.TestCase):
@@ -114,6 +142,27 @@ class EventTrackerTest(unittest.TestCase):
                                          [self.hit("animal", .78, (87, 111, 46, 39))]), [])
         self.assertEqual(tracker.observe(start + timedelta(seconds=23), [])[0].classes, ("animal",))
         self.assertEqual(len(tracker.tracks), 1)
+
+    def test_event_cover_is_the_best_detection_frame_with_its_boxes(self):
+        start = datetime(2026, 10, 2, 9, 44, 42)
+        tracker = EventTracker("camera", "Kitchen")
+        frames = [bytes([level]) * SAMPLE_BYTES for level in (20, 120, 220)]
+        boxes = ((100, 100, 60, 150), (150, 100, 60, 150), (200, 100, 60, 150))
+        for seconds, (frame, box, score) in enumerate(zip(frames, boxes, (.7, .9, .8))):
+            self.assertEqual(tracker.observe(start + timedelta(seconds=seconds),
+                                             [self.hit("person", score, box)], frame), [])
+        event = tracker.observe(start + timedelta(seconds=9), [], frames[0])[0]
+        image = decoded_image(event.cover)
+        self.assertEqual(image.shape, (360, 640, 3))
+        self.assertAlmostEqual(float(image[20, 20].mean()), 120, delta=3)
+        blue, green, red = (int(value) for value in image[100, 180])
+        self.assertGreater(red, 180)
+        self.assertLess(blue, 100)
+        self.assertIsNone(tracker.cover_source)
+        without_frames = EventTracker("camera", "Kitchen")
+        for seconds, box in enumerate(boxes[:2]):
+            without_frames.observe(start + timedelta(seconds=seconds), [self.hit("person", .8, box)])
+        self.assertIsNone(without_frames.observe(start + timedelta(seconds=9), [])[0].cover)
 
     def test_motionless_animal_still_confirms_an_event(self):
         start = datetime(2026, 10, 1, 5, 41, 43)
@@ -260,6 +309,85 @@ class RecordingExcerptTest(unittest.TestCase):
                     "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(finished.clip),
                 ], check=True, capture_output=True, text=True, timeout=10)
                 self.assertGreater(int(packets.stdout.strip()), 0)
+
+    def test_excerpt_thumbnail_is_the_detection_image(self):
+        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
+            root = Path(directory)
+            recordings = root / "Continuous"
+            recordings.mkdir()
+            start = datetime.now().replace(microsecond=0) - timedelta(minutes=1)
+            make_test_video(recordings / f"Garden_{start:%Y%m%d_%H%M%S}.mkv", 30)
+            cover = encode_cover(bytes([90]) * SAMPLE_BYTES, ((10, 10, 50, 50),))
+            detected = DetectionEvent("camera", "Garden", start + timedelta(seconds=10),
+                                      start + timedelta(seconds=14), ("person",), .9, cover=cover)
+            undetected_image = DetectionEvent("camera", "Garden", start + timedelta(seconds=20),
+                                              start + timedelta(seconds=24), ("animal",), .8)
+            with patch("local_detection.event_directory", return_value=root / "Detections"):
+                finished = export_event(detected, recordings, "Garden")
+                extracted = export_event(undetected_image, recordings, "Garden")
+                metadata = root / "event.json"
+                save_event(metadata, finished, "ready")
+                self.assertEqual(json.loads(metadata.read_text(encoding="utf-8"))["cover"], COVER_NAME)
+            for clip in (finished.clip, extracted.clip):
+                streams = media_streams(clip)
+                self.assertEqual([(stream["codec_name"], stream["disposition"]["attached_pic"]) for stream in streams],
+                                 [("h264", 0), ("mjpeg", 1)])
+                self.assertEqual(streams[1]["tags"], {"filename": COVER_NAME, "mimetype": "image/jpeg"})
+                self.assertEqual(oct(clip.stat().st_mode & 0o777), "0o600")
+            self.assertEqual(attached_image(finished.clip), cover)
+            self.assertEqual(finished.cover, cover)
+            self.assertEqual(attached_image(extracted.clip), extracted.cover)
+            detection_frame = subprocess.run([
+                "ffmpeg", "-v", "error", "-ss", "7", "-i", str(extracted.clip), "-frames:v", "1",
+                "-vf", "scale=640:-2", "-f", "image2", "-c:v", "png", "pipe:1",
+            ], check=True, capture_output=True, timeout=10).stdout
+            first_frame = subprocess.run([
+                "ffmpeg", "-v", "error", "-i", str(extracted.clip), "-frames:v", "1",
+                "-vf", "scale=640:-2", "-f", "image2", "-c:v", "png", "pipe:1",
+            ], check=True, capture_output=True, timeout=10).stdout
+            embedded = decoded_image(extracted.cover).astype(int)
+            self.assertLess(abs(embedded - decoded_image(detection_frame)).mean(), 8)
+            self.assertGreater(abs(embedded - decoded_image(first_frame)).mean(), 15)
+
+    def test_existing_excerpts_receive_their_detection_image_once(self):
+        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
+            root = Path(directory) / "Detections"
+            clip_start = datetime(2026, 10, 2, 9, 44, 37)
+            clip = root / "2026-10-02" / "person" / "person_Kitchen_20261002_094437_03e42bc9.mkv"
+            clip.parent.mkdir(parents=True)
+            make_test_video(clip, 12)
+            clip.chmod(0o600)
+            metadata_folder = root / "2026-10-02" / ".metadata" / hashlib.sha256(b"camera").hexdigest()[:16]
+            metadata_folder.mkdir(parents=True)
+            stale = root / "2026-10-02" / ".metadata" / "intraswitch_camera_cover_interrupted"
+            stale.mkdir()
+            (stale / clip.name).write_bytes(b"partial")
+            archived = root / "old" / ".metadata" / metadata_folder.name
+            archived.mkdir(parents=True)
+            with patch("local_detection.event_directory", return_value=root):
+                save_event(metadata_folder / "event.json", DetectionEvent(
+                    "camera", "Kitchen", clip_start + timedelta(seconds=5), clip_start + timedelta(seconds=9),
+                    ("person",), .75, clip, clip_start,
+                ), "ready")
+                document = json.loads((metadata_folder / "event.json").read_text(encoding="utf-8"))
+                del document["cover"]
+                (metadata_folder / "event.json").write_text(json.dumps(document), encoding="utf-8")
+                archived_document = {**document, "clip": "person/person_Kitchen_moved.mkv"}
+                (archived / "event.json").write_text(json.dumps(archived_document), encoding="utf-8")
+                add_missing_covers()
+                covered = clip.stat()
+                streams = media_streams(clip)
+                self.assertEqual([stream["disposition"]["attached_pic"] for stream in streams], [0, 1])
+                self.assertEqual(oct(covered.st_mode & 0o777), "0o600")
+                self.assertFalse(stale.exists())
+                self.assertEqual(json.loads((metadata_folder / "event.json").read_text(encoding="utf-8"))["cover"],
+                                 COVER_NAME)
+                self.assertEqual(json.loads((archived / "event.json").read_text(encoding="utf-8")), archived_document)
+                self.assertEqual(load_events("camera", clip_start + timedelta(hours=1))[0].clip, clip)
+                add_missing_covers()
+                self.assertEqual(clip.stat().st_mtime_ns, covered.st_mtime_ns)
+                self.assertEqual(len(media_streams(clip)), 2)
+                self.assertEqual(list((root / "2026-10-02" / ".metadata").iterdir()), [metadata_folder])
 
     def test_existing_excerpts_are_sorted_by_type_and_remain_playable(self):
         with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
@@ -438,19 +566,17 @@ class CameraDetectionSettingsTest(unittest.TestCase):
                                Path(self.directory.name) / "event.mkv", now)
         replay = Mock()
         self.window.local_replays[self.living.uid] = replay
-        self.window.tray = Mock()
-        with patch.object(self.window, "show_notice") as notice:
+        with patch.object(self.window, "show_notice") as notice, patch.object(self.window.notifier, "notify") as notify:
             self.window.on_local_detection_ready(event)
             replay.refresh_recordings.assert_called_once()
-            self.window.tray.showMessage.assert_not_called()
+            notify.assert_not_called()
             notice.assert_not_called()
             enabled_event = DetectionEvent(self.garden.uid, self.garden.name, now, now, ("person",), .8,
                                           Path(self.directory.name) / "garden.mkv", now)
             self.window.on_local_detection_ready(enabled_event)
-            self.window.tray.showMessage.assert_called_once()
+            notify.assert_called_once()
             notice.assert_called_once()
         self.window.local_replays.clear()
-        self.window.tray = None
 
 
 class LocalReplayTest(unittest.TestCase):
@@ -486,12 +612,21 @@ class LocalReplayTest(unittest.TestCase):
             camera = RtspCamera("camera", "Garden", "rtsp://example.invalid")
             event = DetectionEvent(camera.uid, camera.name, datetime.now(), datetime.now(),
                                    ("person",), .8, Path(directory) / "event.mkv", datetime.now())
+            other = DetectionEvent(camera.uid, camera.name, datetime.now(), datetime.now(),
+                                   ("animal",), .7, Path(directory) / "other.mkv", datetime.now())
             window.devices = [camera]
             window.selected_device = camera
-            window.latest_local_detection = event
-            with patch.object(window, "show_window"), patch.object(window, "open_local_replay") as open_replay:
-                window.open_detection_notification()
+            actions = []
+            with patch.object(window.notifier, "notify",
+                              side_effect=lambda title, message, timeout, activate, fallback: actions.append(activate)), \
+                    patch.object(window, "show_notice"):
+                window.on_local_detection_ready(event)
+                window.on_local_detection_ready(other)
+            with patch.object(window, "show_window") as show_window, \
+                    patch.object(window, "open_local_replay") as open_replay:
+                actions[0]()
                 open_replay.assert_called_once_with(camera, event)
+                show_window.assert_called_once_with()
             window.quit_requested = True
             window.close()
 

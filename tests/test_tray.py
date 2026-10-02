@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -45,6 +46,7 @@ class TrayTest(unittest.TestCase):
             "Hide window",
             "Cameras",
             "Camera layout",
+            "Camera profiles",
             "Add camera",
             "Continuous recording (24 h)",
             "Detect people and animals locally",
@@ -95,7 +97,9 @@ class TrayTest(unittest.TestCase):
             self.window.selected_device = SimpleNamespace(name="Jardin", uid="garden")
             self.window.devices = [self.window.selected_device]
             messages: list[tuple[str, str]] = []
-            self.window.tray.showMessage = lambda title, text, *args: messages.append((title, text))
+            actions = []
+            self.window.notifier.notify = lambda title, text, timeout, activate, fallback: (
+                messages.append((title, text)), actions.append(activate))
             self.window.on_detections_listed(["20260926091500_011.mp4"])
             self.assertEqual(messages, [])
             self.window.on_detections_listed(["20260926091500_011.mp4"])
@@ -105,6 +109,10 @@ class TrayTest(unittest.TestCase):
             )
             self.assertEqual(messages, [("Camera detection", "Jardin \u00b7 26/09 15:00:01 (2 new detections)")])
             self.assertEqual(self.window.settings.value("detections/last_seen/garden"), "20260926150001_011.mp4")
+            self.window.device_accounts = {"garden": "first@example.com"}
+            with patch.object(self.window, "enter_replay") as enter_replay:
+                actions[0]()
+            enter_replay.assert_called_once_with(datetime(2026, 9, 26, 15, 0, 1))
 
     def test_tray_lists_and_toggles_account_cameras(self) -> None:
         garden = SimpleNamespace(name="Jardin", uid="garden")
@@ -640,6 +648,26 @@ class TrayTest(unittest.TestCase):
         self.assertIs(self.window.selected_device, garden)
         self.assertIn(entrance.uid, self.window.previews)
         replay.assert_called_once_with(None)
+
+    def test_card_detection_notification_selects_its_camera_at_the_detection(self) -> None:
+        garden = SimpleNamespace(name="Jardin", uid="garden")
+        entrance = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
+        self.window.devices = [garden, entrance]
+        self.window.selected_device = entrance
+        self.window.device_accounts = {garden.uid: "first@example.com", entrance.uid: RTSP_ACCOUNT}
+        moment = datetime(2026, 10, 2, 9, 44, 42)
+        with patch.object(CameraPreview, "start"):
+            self.window.sync_previews()
+            with patch.object(self.window, "stop_player"), patch.object(
+                self.window, "show_window_without_stream"
+            ), patch.object(self.window, "enter_replay") as replay:
+                self.window.open_card_detection(garden.uid, moment)
+                self.window.open_card_detection("removed", moment)
+                replay.assert_not_called()
+                self.application.processEvents()
+        self.assertIs(self.window.selected_device, garden)
+        replay.assert_called_once_with(moment)
+        self.assertIsNone(self.window.pending_camera_replay_start)
 
     def test_continuous_recording_setting_reaches_other_camera(self) -> None:
         garden = SimpleNamespace(name="Jardin", uid="garden")

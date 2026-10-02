@@ -25,13 +25,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 from dataclasses import asdict, dataclass, replace
 from typing import BinaryIO, Callable
 from datetime import datetime, timedelta, timezone
 
-from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QMetaType, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
     QAction,
     QDesktopServices,
@@ -69,6 +69,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PyQt6.QtDBus import QDBusArgument, QDBusConnection, QDBusMessage, QDBusPendingCallWatcher, QDBusPendingReply
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from okam_native.account import AccountDevice, AccountError, Eye4AccountClient
@@ -105,7 +106,7 @@ from rtsp_tunnel import (
     RtspWebSocketTunnel, rtsp_certificate_sha256,
 )
 from local_detection import (
-    DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, organize_events,
+    DetectionEngine, DetectionEvent, DetectionPipeline, add_missing_covers, load_events, model_path, organize_events,
 )
 from Xlib import X as X11, Xutil, display as xdisplay
 from Xlib.protocol import event as xevent
@@ -130,6 +131,10 @@ CAMERA_VISIBLE_SETTING = "view/camera_visible"
 NO_VISIBLE_CAMERAS_MESSAGE = "No cameras selected."
 MULTIVIEW_LAYOUT_SETTING = "view/camera_layout"
 CAMERA_ORDER_SETTING = "view/camera_order"
+CAMERA_PROFILES_SETTING = "view/camera_profiles"
+CAMERA_PROFILE_NAME_LIMIT = 60
+CAMERA_PROFILE_NAME_MESSAGE = "Enter a profile name."
+CAMERA_PROFILE_REPLACE_MESSAGE = "The existing profile with this name will be replaced."
 LOG = logging.getLogger("okam-linux")
 LOG_DIRECTORY = Path.home() / ".cache/okam-linux"
 LOG_FILE_NAME = "okam-linux.log"
@@ -337,6 +342,12 @@ DETECTION_SETTING = "detections/last_seen"
 LOCAL_DETECTION_SETTING = "detections/local_enabled"
 LOCAL_DETECTION_CAMERAS_SETTING = "detections/camera_enabled"
 DETECTION_MESSAGE_MS = 15000
+NOTIFICATIONS_SERVICE = "org.freedesktop.Notifications"
+NOTIFICATIONS_PATH = "/org/freedesktop/Notifications"
+NOTIFICATION_DEFAULT_ACTION = "default"
+NOTIFICATION_DEFAULT_LABEL = "Play detection"
+NOTIFICATION_CALL_TIMEOUT_MS = 5000
+NOTIFICATION_HISTORY_LIMIT = 50
 RAW_RECORDING_SUFFIX = ".h264"
 MIN_RECORDING_FRAMES = 2
 RECORDING_REMUX_TIMEOUT_SECONDS = 600
@@ -795,6 +806,35 @@ def load_imou_cameras(settings: QSettings, accounts: list[ImouAccount]) -> list[
         except (TypeError, ValueError, KeyError):
             continue
     return list(cameras.values())
+
+
+@dataclass(frozen=True)
+class CameraProfile:
+    name: str
+    cameras: tuple[str, ...]
+    layout: str
+
+
+def load_camera_profiles(settings: QSettings) -> list[CameraProfile]:
+    try:
+        records = json.loads(settings.value(CAMERA_PROFILES_SETTING, "[]", str))
+    except (ValueError, TypeError):
+        return []
+    profiles = []
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict):
+            continue
+        name, cameras, layout = record.get("name"), record.get("cameras"), record.get("layout")
+        if (isinstance(name, str) and name.strip() and layout in CAMERA_LAYOUT_VALUES and isinstance(cameras, list)
+                and all(isinstance(uid, str) for uid in cameras)):
+            profiles.append(CameraProfile(name.strip(), tuple(cameras), layout))
+    return sorted(profiles, key=lambda profile: profile.name.casefold())
+
+
+def save_camera_profiles(settings: QSettings, profiles: list[CameraProfile]) -> None:
+    ordered = sorted(profiles, key=lambda profile: profile.name.casefold())
+    settings.setValue(CAMERA_PROFILES_SETTING, json.dumps([asdict(profile) for profile in ordered], ensure_ascii=False))
+    settings.sync()
 
 
 def camera_continuous_allowed(camera: AccountDevice | RtspCamera) -> bool:
@@ -5223,6 +5263,98 @@ class ImouAccountDialog(QDialog):
         self.secret.setFocus()
 
 
+class CameraProfileDialog(QDialog):
+    def __init__(self, parent: QWidget, names: list[str]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Save camera profile")
+        self.setMinimumWidth(360)
+        self.names = {name.casefold() for name in names}
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name = QLineEdit()
+        self.name.setMaxLength(CAMERA_PROFILE_NAME_LIMIT)
+        self.name.setPlaceholderText("Garden and entrance")
+        form.addRow("Profile name", self.name)
+        layout.addLayout(form)
+        self.message = QLabel()
+        self.message.setWordWrap(True)
+        layout.addWidget(self.message)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.submit)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.name.textChanged.connect(self.update_message)
+
+    def profile_name(self) -> str:
+        return self.name.text().strip()
+
+    def update_message(self) -> None:
+        self.message.setStyleSheet("")
+        self.message.setText(CAMERA_PROFILE_REPLACE_MESSAGE if self.profile_name().casefold() in self.names else "")
+
+    def submit(self) -> None:
+        if not self.profile_name():
+            self.message.setStyleSheet(FORM_ERROR_STYLE)
+            self.message.setText(CAMERA_PROFILE_NAME_MESSAGE)
+            self.name.setFocus()
+            return
+        self.accept()
+
+
+class DesktopNotifier(QObject):
+    def __init__(self, parent: QObject | None = None, bus: QDBusConnection | None = None) -> None:
+        super().__init__(parent)
+        self.bus = bus if bus is not None else QDBusConnection.sessionBus()
+        self.actions: OrderedDict[int, Callable[[], None]] = OrderedDict()
+        if self.bus.isConnected():
+            self.bus.connect(NOTIFICATIONS_SERVICE, NOTIFICATIONS_PATH, NOTIFICATIONS_SERVICE, "ActionInvoked",
+                             self.on_action_invoked)
+            self.bus.connect(NOTIFICATIONS_SERVICE, NOTIFICATIONS_PATH, NOTIFICATIONS_SERVICE, "NotificationClosed",
+                             self.on_closed)
+
+    def notify(self, title: str, message: str, timeout_ms: int, activate: Callable[[], None],
+               fallback: Callable[[], None]) -> None:
+        if not self.bus.isConnected():
+            fallback()
+            return
+        call = QDBusMessage.createMethodCall(NOTIFICATIONS_SERVICE, NOTIFICATIONS_PATH, NOTIFICATIONS_SERVICE, "Notify")
+        call.setArguments([
+            APPLICATION_NAME, QDBusArgument(0, QMetaType.Type.UInt.value),
+            QUrl.fromLocalFile(str(ICON_DIRECTORY / "app.svg")).toString(), title, message,
+            QDBusArgument([NOTIFICATION_DEFAULT_ACTION, NOTIFICATION_DEFAULT_LABEL], QMetaType.Type.QStringList.value),
+            {"desktop-entry": DESKTOP_FILE_NAME}, timeout_ms,
+        ])
+        watcher = QDBusPendingCallWatcher(self.bus.asyncCall(call, NOTIFICATION_CALL_TIMEOUT_MS), self)
+        watcher.finished.connect(lambda finished: self.on_sent(finished, activate, fallback))
+
+    def on_sent(self, watcher: QDBusPendingCallWatcher, activate: Callable[[], None],
+                fallback: Callable[[], None]) -> None:
+        reply = QDBusPendingReply(watcher)
+        watcher.deleteLater()
+        identifier = None if reply.isError() else reply.argumentAt(0)
+        if not isinstance(identifier, int):
+            LOG.warning("Desktop notification failed: %s", reply.error().message() or "invalid reply")
+            fallback()
+            return
+        self.actions[identifier] = activate
+        while len(self.actions) > NOTIFICATION_HISTORY_LIMIT:
+            self.actions.popitem(last=False)
+
+    @pyqtSlot(QDBusMessage)
+    def on_action_invoked(self, message: QDBusMessage) -> None:
+        arguments = message.arguments()
+        if len(arguments) == 2 and isinstance(arguments[0], int) and arguments[1] == NOTIFICATION_DEFAULT_ACTION:
+            activate = self.actions.pop(arguments[0], None)
+            if activate is not None:
+                activate()
+
+    @pyqtSlot(QDBusMessage)
+    def on_closed(self, message: QDBusMessage) -> None:
+        arguments = message.arguments()
+        if arguments and isinstance(arguments[0], int):
+            self.actions.pop(arguments[0], None)
+
+
 class DialogPlacement(QObject):
     def __init__(self, parent: QWidget, dialog: QDialog, reposition: Callable[[], None]) -> None:
         super().__init__(dialog)
@@ -5294,6 +5426,7 @@ class MainWindow(QMainWindow):
         self.camera_mask_timer.timeout.connect(self.update_camera_mask)
         self.pending_camera: tuple[str, str] | None = None
         self.pending_camera_replay: str | None = None
+        self.pending_camera_replay_start: datetime | None = None
         self.pending_selection_start: tuple[str, bool] | None = None
         self.account_queue: list[tuple[str, str]] = []
         self.account_worker: AccountWorker | None = None
@@ -5324,8 +5457,8 @@ class MainWindow(QMainWindow):
         self.replay: ReplayController | None = None
         self.pending_replay: tuple[datetime | None] | None = None
         self.keep_player = False
-        self.latest_detection: datetime | None = None
-        self.latest_local_detection: DetectionEvent | None = None
+        self.notifier = DesktopNotifier(self)
+        self.tray_message_action: Callable[[], None] | None = None
         self.pending_local_detection: DetectionEvent | None = None
         self.local_detection_ready.connect(self.on_local_detection_ready)
         self.local_detection_failed.connect(self.on_local_detection_failed)
@@ -5528,13 +5661,18 @@ class MainWindow(QMainWindow):
         self.cameras_menu = menu.addMenu("Cameras")
         self.cameras_menu.aboutToShow.connect(self.update_cameras_menu)
         self.camera_layout_menu = menu.addMenu("Camera layout")
+        self.camera_layout_menu.aboutToShow.connect(self.update_camera_layout_menu)
         layout_group = QActionGroup(self)
+        self.camera_layout_actions: dict[str, QAction] = {}
         for value, label in CAMERA_LAYOUTS:
             action = self.camera_layout_menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(value == self.camera_layout())
             action.triggered.connect(lambda checked=False, orientation=value: self.set_camera_layout(orientation))
             layout_group.addAction(action)
+            self.camera_layout_actions[value] = action
+        self.camera_profiles_menu = menu.addMenu("Camera profiles")
+        self.camera_profiles_menu.aboutToShow.connect(self.update_camera_profiles_menu)
         add_camera_menu = menu.addMenu("Add camera")
         for index, (label, callback) in enumerate(zip(CAMERA_SOURCE_LABELS, self.camera_source_actions())):
             action = add_camera_menu.addAction(f"{label}...")
@@ -5563,13 +5701,68 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip(f"{APPLICATION_NAME}\n{self.status_text}")
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self.on_tray_activated)
-        self.tray.messageClicked.connect(self.open_detection_notification)
+        self.tray.messageClicked.connect(self.open_tray_message)
         self.tray.show()
 
     def update_tray_menu(self) -> None:
         self.window_action.setText("Hide window" if self.isVisible() else "Show window")
         self.camera_layout_menu.setEnabled(len(self.visible_devices()) > 1)
         self.add_account_action.setEnabled(self.account_worker is None)
+
+    def update_camera_layout_menu(self) -> None:
+        for value, action in self.camera_layout_actions.items():
+            action.setChecked(value == self.camera_layout())
+
+    def update_camera_profiles_menu(self) -> None:
+        self.camera_profiles_menu.clear()
+        profiles = load_camera_profiles(self.settings)
+        current = self.current_camera_view()
+        for profile in profiles:
+            action = self.camera_profiles_menu.addAction(profile.name)
+            action.setCheckable(True)
+            action.setChecked(self.camera_profile_view(profile) == current)
+            action.triggered.connect(lambda checked=False, value=profile: self.apply_camera_profile(value))
+        if not profiles:
+            self.camera_profiles_menu.addAction("No saved profiles").setEnabled(False)
+        self.camera_profiles_menu.addSeparator()
+        self.camera_profiles_menu.addAction("Save current view...").triggered.connect(self.save_camera_profile)
+        remove_menu = self.camera_profiles_menu.addMenu("Remove profile")
+        remove_menu.setEnabled(bool(profiles))
+        for profile in profiles:
+            remove_menu.addAction(profile.name).triggered.connect(
+                lambda checked=False, name=profile.name: self.remove_camera_profile(name)
+            )
+
+    def current_camera_view(self) -> tuple[tuple[str, ...], str]:
+        return tuple(camera.uid for camera in self.visible_devices()), self.camera_layout()
+
+    def camera_profile_view(self, profile: CameraProfile) -> tuple[tuple[str, ...], str]:
+        known = {camera.uid for camera in self.devices}
+        return tuple(uid for uid in profile.cameras if uid in known), profile.layout
+
+    def save_camera_profile(self) -> None:
+        profiles = load_camera_profiles(self.settings)
+        dialog = CameraProfileDialog(self, [profile.name for profile in profiles])
+        if self.exec_camera_dialog(dialog) == QDialog.DialogCode.Accepted:
+            name = dialog.profile_name()
+            cameras, layout = self.current_camera_view()
+            save_camera_profiles(self.settings, [
+                *(profile for profile in profiles if profile.name.casefold() != name.casefold()),
+                CameraProfile(name, cameras, layout),
+            ])
+        dialog.deleteLater()
+
+    def remove_camera_profile(self, name: str) -> None:
+        save_camera_profiles(self.settings, [
+            profile for profile in load_camera_profiles(self.settings) if profile.name != name
+        ])
+
+    def apply_camera_profile(self, profile: CameraProfile) -> None:
+        cameras, layout = self.camera_profile_view(profile)
+        order = [*cameras, *(camera.uid for camera in self.ordered_devices() if camera.uid not in cameras)]
+        self.settings.setValue(CAMERA_ORDER_SETTING, json.dumps(order))
+        self.settings.setValue(MULTIVIEW_LAYOUT_SETTING, layout)
+        self.apply_camera_visibility({camera.uid: camera.uid in cameras for camera in self.devices})
 
     def update_cameras_menu(self) -> None:
         self.cameras_menu.clear()
@@ -5673,15 +5866,11 @@ class MainWindow(QMainWindow):
         if not last_seen:
             return
         latest = recording_time(new_names[-1])
-        self.latest_detection = latest
-        self.latest_local_detection = None
-        message = f"{self.selected_device.name} \u00b7 {latest:%d/%m %H:%M:%S}"
+        camera = self.selected_device
+        message = f"{camera.name} \u00b7 {latest:%d/%m %H:%M:%S}"
         if len(new_names) > 1:
             message += f" ({len(new_names)} new detections)"
-        if self.tray is not None:
-            self.tray.showMessage(
-                "Camera detection", message, self.windowIcon(), DETECTION_MESSAGE_MS
-            )
+        self.notify_detection("Camera detection", message, lambda: self.open_card_detection(camera.uid, latest))
         self.show_notice(f"Detection at {latest:%d/%m %H:%M:%S}.")
 
     def on_detections_failed(self, message: str) -> None:
@@ -5695,22 +5884,35 @@ class MainWindow(QMainWindow):
             replay.refresh_recordings()
         if not self.local_detection_enabled(event.uid):
             return
-        self.latest_local_detection = event
         description = ", ".join(event.classes)
         message = f"{event.camera} · {description} · {event.first:%d/%m %H:%M:%S}"
-        if self.tray is not None:
-            self.tray.showMessage("Local camera detection", message, self.windowIcon(), DETECTION_MESSAGE_MS)
+        self.notify_detection("Local camera detection", message, lambda: self.open_local_detection(event))
         self.show_notice(message)
 
     def on_local_detection_failed(self, message: str) -> None:
         if not self.close_pending:
             self.show_notice(message)
 
-    def open_detection_notification(self) -> None:
-        event = self.latest_local_detection
-        if event is None:
-            self.enter_replay(self.latest_detection)
+    def notify_detection(self, title: str, message: str, activate: Callable[[], None]) -> None:
+        self.notifier.notify(title, message, DETECTION_MESSAGE_MS, activate,
+                             lambda: self.show_tray_message(title, message, activate))
+
+    def show_tray_message(self, title: str, message: str, activate: Callable[[], None]) -> None:
+        if self.tray is None:
             return
+        self.tray_message_action = activate
+        self.tray.showMessage(title, message, self.windowIcon(), DETECTION_MESSAGE_MS)
+
+    def open_tray_message(self) -> None:
+        if self.tray_message_action is not None:
+            self.tray_message_action()
+
+    def open_card_detection(self, uid: str, moment: datetime) -> None:
+        camera = next((camera for camera in self.devices if camera.uid == uid), None)
+        if camera is not None:
+            self.open_camera_sd_replay(camera, moment)
+
+    def open_local_detection(self, event: DetectionEvent) -> None:
         camera = next((camera for camera in self.devices if camera.uid == event.uid), None)
         if camera is None:
             return
@@ -5883,7 +6085,7 @@ class MainWindow(QMainWindow):
         if self.close_pending:
             QTimer.singleShot(0, self.close)
 
-    def open_camera_sd_replay(self, camera: AccountDevice | RtspCamera) -> None:
+    def open_camera_sd_replay(self, camera: AccountDevice | RtspCamera, start: datetime | None = None) -> None:
         if isinstance(camera, RtspCamera) and camera.provider == IMOU_ACCOUNT_PROVIDER:
             self.open_local_replay(camera, camera_recordings=True)
             return
@@ -5891,9 +6093,10 @@ class MainWindow(QMainWindow):
         if username is None:
             return
         if camera.uid == getattr(getattr(self, "selected_device", None), "uid", None):
-            self.enter_replay(None)
+            self.enter_replay(start)
             return
         self.pending_camera_replay = camera.uid
+        self.pending_camera_replay_start = start
         self.select_camera(username, camera.uid)
 
     def open_recordings_folder(self) -> None:
@@ -5927,22 +6130,25 @@ class MainWindow(QMainWindow):
     def visible_devices(self) -> list[AccountDevice | RtspCamera]:
         return [camera for camera in self.ordered_devices() if self.camera_visible(camera.uid)]
 
-    def save_camera_visibility(self, uid: str, enabled: bool) -> None:
+    def save_camera_visibility(self, visibility: dict[str, bool]) -> None:
         for camera in self.devices:
             setting = f"{CAMERA_VISIBLE_SETTING}/{camera.uid}"
             if not self.settings.contains(setting):
                 self.settings.setValue(setting, self.camera_visible(camera.uid))
-        self.settings.setValue(f"{CAMERA_VISIBLE_SETTING}/{uid}", enabled)
+        for uid, enabled in visibility.items():
+            self.settings.setValue(f"{CAMERA_VISIBLE_SETTING}/{uid}", enabled)
         self.settings.remove(MULTIVIEW_SETTING)
         self.settings.sync()
 
     def set_camera_visible(self, uid: str, enabled: bool) -> None:
-        if uid not in self.device_accounts:
-            return
+        if uid in self.device_accounts:
+            self.apply_camera_visibility({uid: enabled})
+
+    def apply_camera_visibility(self, visibility: dict[str, bool]) -> None:
         selected = getattr(self, "selected_device", None)
         selected_was_visible = selected is not None and self.camera_visible(selected.uid)
-        self.save_camera_visibility(uid, enabled)
-        if not enabled and self.pending_camera is not None and self.pending_camera[1] == uid:
+        self.save_camera_visibility(visibility)
+        if self.pending_camera is not None and not visibility.get(self.pending_camera[1], True):
             self.pending_camera = None
         if not selected_was_visible or not self.camera_visible(selected.uid):
             remaining = self.visible_devices()
@@ -5952,6 +6158,7 @@ class MainWindow(QMainWindow):
             else:
                 self.pending_camera = None
                 self.pending_camera_replay = None
+                self.pending_camera_replay_start = None
                 self.pending_selection_start = None
                 self.pending_replay = None
                 self.exit_replay(False)
@@ -6070,12 +6277,14 @@ class MainWindow(QMainWindow):
     def _finish_selected_camera(self) -> None:
         pending = self.pending_selection_start
         self.pending_selection_start = None
+        start = self.pending_camera_replay_start
+        self.pending_camera_replay_start = None
         if (pending is None or self.close_pending
                 or getattr(getattr(self, "selected_device", None), "uid", None) != pending[0]
                 or not self.camera_visible(pending[0])):
             return
         if pending[1]:
-            self.enter_replay(None)
+            self.enter_replay(start)
         else:
             self.watch_live()
 
@@ -6621,9 +6830,10 @@ class MainWindow(QMainWindow):
         if self.device_accounts.get(uid) != username:
             return
         if not self.camera_visible(uid):
-            self.save_camera_visibility(uid, True)
+            self.save_camera_visibility({uid: True})
         if uid != self.pending_camera_replay:
             self.pending_camera_replay = None
+            self.pending_camera_replay_start = None
         if getattr(self, "selected_device", None) is not None and self.selected_device.uid == uid:
             self.sync_previews()
             self.resume_live_if_idle()
@@ -6650,7 +6860,6 @@ class MainWindow(QMainWindow):
         self.settings.setValue("camera/selected_uid", uid)
         self.settings.setValue("camera/selected_account", username)
         self.settings.sync()
-        self.latest_detection = None
         self.rtsp_ptz_available = False
         self.on_capabilities_found([], None)
         self.rtsp_light_mode = None
@@ -7495,6 +7704,7 @@ def main() -> int:
         organize_events()
     except OSError as ex:
         LOG.warning("Could not organize local detections: %s", ex)
+    threading.Thread(target=add_missing_covers, daemon=True).start()
     try:
         directory = continuous_directory()
     except OSError:
