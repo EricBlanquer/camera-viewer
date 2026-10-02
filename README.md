@@ -194,13 +194,14 @@ The tray menu enables local detection of people, cats, dogs, and birds while con
 Use **Local detection cameras** to enable or disable analysis and notifications independently for each camera.
 The global detection switch preserves these camera choices; disabling a camera's detection keeps its video and continuous recording running.
 It analyzes one 640 × 360 frame per second with the SHA-256-verified OpenCV Zoo YOLOX-s model and confirms an event when the same object appears twice within two seconds.
+A person shape confirms an event only after its position or size changes, so motionless scenery that resembles a person is ignored.
 Nearby detections of the same animal retain a cat classification when the model briefly calls that animal a dog or bird; spatially separate animals retain their own types.
 Before saving a dog-only detection, Camera Viewer checks sampled frames from its recorded clip at a lower recognition threshold and classifies it as a cat when multiple frames show the same animal as a cat.
 Event excerpts include up to five seconds before and after the detected passage and are stored without audio in `Videos/O-KAM Linux/Detections`, using the system's configured Videos folder.
-The `Detections` folder groups excerpts in `cat`, `dog`, `bird`, and `person` folders; clips with multiple types use a combined folder such as `cat_person`, and each clip name starts with its type and camera name.
+The `Detections` folder groups excerpts by day in `YYYY-MM-DD` folders, then in `cat`, `dog`, `bird`, and `person` folders; clips with multiple types use a combined folder such as `cat_person`, and each clip name starts with its type and camera name.
 Local detections appear in red on the local playback timeline, and its Previous and Next buttons jump between detected passages.
 The notification opens the excerpt for the affected camera, including when the viewer was hidden in the notification area.
-Local detection clips and metadata are retained for 24 hours; turning off continuous recording pauses local analysis.
+Local detection clips and metadata are kept until deleted manually; the playback timeline shows detections from the last 24 hours, and turning off continuous recording pauses local analysis.
 
 For O-KAM cameras, the playback button switches the window to the recordings stored on the camera's microSD card, and **LIVE** returns to live video.
 In playback, the control bar shows a timeline with continuous recording in blue and detections in red; drag it or click a time to play from there, and use the wheel or the magnifier buttons to show a shorter or longer period.

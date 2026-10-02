@@ -105,7 +105,7 @@ from rtsp_tunnel import (
     RtspWebSocketTunnel, rtsp_certificate_sha256,
 )
 from local_detection import (
-    DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, organize_events, prune_events,
+    DetectionEngine, DetectionEvent, DetectionPipeline, load_events, model_path, organize_events,
 )
 from Xlib import X as X11, Xutil, display as xdisplay
 from Xlib.protocol import event as xevent
@@ -5329,10 +5329,6 @@ class MainWindow(QMainWindow):
         self.pending_local_detection: DetectionEvent | None = None
         self.local_detection_ready.connect(self.on_local_detection_ready)
         self.local_detection_failed.connect(self.on_local_detection_failed)
-        self.local_detection_prune_timer = QTimer(self)
-        self.local_detection_prune_timer.timeout.connect(prune_events)
-        self.local_detection_prune_timer.start(60 * 60 * 1000)
-        QTimer.singleShot(0, prune_events)
         self.detection_timer = QTimer(self)
         self.detection_timer.timeout.connect(self.check_detections)
         self.detection_timer.start(DETECTION_POLL_MS)

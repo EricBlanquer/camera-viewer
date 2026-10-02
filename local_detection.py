@@ -43,12 +43,15 @@ TRACK_NEARBY_AGE = timedelta(seconds=20)
 TRACK_OVERLAP_THRESHOLD = 0.25
 TRACK_DISTANCE_FACTOR = 1.1
 TRACK_AREA_RATIO_LIMIT = 2.5
+PERSON_MOVEMENT_FACTOR = 0.25
+PERSON_SCALE_LIMIT = 1.25
 MODEL_DOWNLOAD_LIMIT = MODEL_SIZE + 1
 REVIEW_MAX_SAMPLES = 12
 REVIEW_INTERVAL_SECONDS = 1
 REVIEW_MARGIN_SECONDS = 2
 REVIEW_CAT_DOG_RATIO = 0.5
-RETENTION = timedelta(hours=24)
+PLAYBACK_PERIOD = timedelta(hours=24)
+EVENT_DAY_FORMAT = "%Y-%m-%d"
 
 
 def model_path() -> Path:
@@ -139,7 +142,9 @@ class DetectionTrack:
     label: str
     box: tuple[float, float, float, float]
     last: datetime
+    anchor: tuple[float, float, float, float]
     cat_seen: datetime | None = None
+    moved: bool = False
 
 
 def box_overlap(first: tuple[float, float, float, float], second: tuple[float, float, float, float]) -> float:
@@ -162,6 +167,16 @@ def box_proximity(first: tuple[float, float, float, float], second: tuple[float,
     vertical = first[1] + first[3] / 2 - second[1] - second[3] / 2
     distance_squared = horizontal * horizontal + vertical * vertical
     return max(0.0, 1 - distance_squared / (distance_limit * distance_limit))
+
+
+def box_moved(anchor: tuple[float, float, float, float], box: tuple[float, float, float, float]) -> bool:
+    anchor_area = anchor[2] * anchor[3]
+    box_area = box[2] * box[3]
+    if min(anchor_area, box_area) <= 0 or max(anchor_area, box_area) / min(anchor_area, box_area) > PERSON_SCALE_LIMIT:
+        return True
+    horizontal = anchor[0] + anchor[2] / 2 - box[0] - box[2] / 2
+    vertical = anchor[1] + anchor[3] / 2 - box[1] - box[3] / 2
+    return math.hypot(horizontal, vertical) > max(anchor[2], anchor[3]) * PERSON_MOVEMENT_FACTOR
 
 
 def track_match_score(hit: DetectionHit, track: DetectionTrack, when: datetime) -> float:
@@ -214,7 +229,7 @@ class EventTracker:
             if match_score <= 0:
                 identifier = self.next_track_id
                 self.next_track_id += 1
-                self.tracks[identifier] = DetectionTrack(hit.name, hit.box, when)
+                self.tracks[identifier] = DetectionTrack(hit.name, hit.box, when, hit.box)
             track = self.tracks[identifier]
             if hit.name == CAT_CLASS:
                 track.label = CAT_CLASS
@@ -223,33 +238,42 @@ class EventTracker:
                 track.label = hit.name
             track.box = hit.box
             track.last = when
+            track.moved = track.moved or box_moved(track.anchor, hit.box)
             found[identifier] = max(found.get(identifier, 0.0), hit.score)
         return found
+
+    def _relevant(self, identifier: int) -> bool:
+        track = self.tracks.get(identifier)
+        return track is not None and (track.label != PERSON_CLASS or track.moved)
 
     def observe(self, when: datetime, hits: list[DetectionHit]) -> list[DetectionEvent]:
         completed = []
         if self.last is not None and (when - self.last).total_seconds() > EVENT_GAP_SECONDS:
             completed.append(self.finish())
         found = self._match(when, hits)
-        if not found:
-            return completed
+        relevant = {identifier: score for identifier, score in found.items() if self._relevant(identifier)}
         if self.first is not None:
+            if not relevant:
+                return completed
             self.last = when
-            for identifier in found:
+            for identifier in relevant:
                 self.active_hits[identifier] = self.active_hits.get(identifier, 0) + 1
-            self.score = max(self.score, *found.values())
+            self.score = max(self.score, *relevant.values())
             if (when - self.first).total_seconds() >= EVENT_MAX_SECONDS:
                 completed.append(self.finish())
+            return completed
+        if not found:
             return completed
         while self.candidate and (when - self.candidate[0][0]).total_seconds() > EVENT_CONFIRM_SECONDS:
             self.candidate.popleft()
         for start, earlier in self.candidate:
-            if earlier.keys() & found.keys():
+            confirmed = {identifier: score for identifier, score in earlier.items() if self._relevant(identifier)}
+            if confirmed.keys() & relevant.keys():
                 self.first = start
                 self.last = when
-                self.active_hits = {identifier: int(identifier in earlier) + int(identifier in found)
-                                    for identifier in earlier.keys() | found.keys()}
-                self.score = max(*earlier.values(), *found.values())
+                self.active_hits = {identifier: int(identifier in confirmed) + int(identifier in relevant)
+                                    for identifier in confirmed.keys() | relevant.keys()}
+                self.score = max(*confirmed.values(), *relevant.values())
                 self.candidate.clear()
                 return completed
         self.candidate.append((when, found))
@@ -328,17 +352,14 @@ class DogEventReviewer:
         self.primary: YoloXDetector | None = None
 
     def review(self, event: DetectionEvent) -> DetectionEvent:
-        if event.classes != (DOG_CLASS,) or event.clip is None:
+        if event.classes != (DOG_CLASS,) or event.clip is None or event.clip_start is None:
             return event
         if self.primary is None:
             self.primary = YoloXDetector(model_path(), REVIEW_SCORE_THRESHOLD)
         samples = _review_samples(event, self.primary)
         if not _animal_tracks_are_cats(samples):
             return event
-        folder = event_directory() / CAT_CLASS
-        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-        folder.chmod(0o700)
-        destination = folder / f"{CAT_CLASS}_{event.clip.name.removeprefix(f'{DOG_CLASS}_')}"
+        destination = _category_folder(event_directory(), event.clip_start, CAT_CLASS) / f"{CAT_CLASS}_{event.clip.name.removeprefix(f'{DOG_CLASS}_')}"
         if destination.exists():
             raise FileExistsError(destination)
         event.clip.replace(destination)
@@ -369,6 +390,23 @@ def _event_type(classes: tuple[str, ...]) -> str:
     if not names or not names.issubset(CLASS_NAMES.values()):
         raise ValueError("Unknown local detection type.")
     return "_".join(sorted(names))
+
+
+def _category_folder(root: Path, day: datetime, category: str) -> Path:
+    folder = root / day.strftime(EVENT_DAY_FORMAT) / category
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    folder.parent.chmod(0o700)
+    folder.chmod(0o700)
+    return folder
+
+
+def _move_clip(source: Path, destination: Path) -> None:
+    if source.is_file():
+        if destination.exists():
+            raise FileExistsError(destination)
+        source.replace(destination)
+    elif not destination.is_file():
+        raise FileNotFoundError(source)
 
 
 def _clip_path(directory: Path, name: str) -> Path:
@@ -414,16 +452,9 @@ def organize_events() -> None:
                     if Path(name).parent == Path("."):
                         source = _clip_path(directory, name)
                         category = _event_type(tuple(document["classes"]))
-                        folder = root / category
-                        folder.mkdir(mode=0o700, exist_ok=True)
-                        folder.chmod(0o700)
+                        folder = _category_folder(root, datetime.fromisoformat(document["clip_start"]), category)
                         destination = folder / f"{category}_{source.name}"
-                        if source.is_file():
-                            if destination.exists():
-                                raise FileExistsError(destination)
-                            source.replace(destination)
-                        elif not destination.is_file():
-                            raise FileNotFoundError(source)
+                        _move_clip(source, destination)
                         document["clip"] = destination.relative_to(root).as_posix()
                         _write_event_document(metadata, document)
                     elif not _clip_path(root, name).is_file():
@@ -438,12 +469,39 @@ def organize_events() -> None:
             directory.rmdir()
         except OSError:
             pass
+    _sort_events_by_day(root)
+
+
+def _sort_events_by_day(root: Path) -> None:
+    metadata_root = root / ".metadata"
+    if not metadata_root.is_dir():
+        return
+    for metadata in metadata_root.glob("*/*.json"):
+        try:
+            document = json.loads(metadata.read_text(encoding="utf-8"))
+            if document["status"] != "ready" or not document.get("clip"):
+                continue
+            source = _clip_path(root, document["clip"])
+            category = _event_type(tuple(document["classes"]))
+            folder = _category_folder(root, datetime.fromisoformat(document["clip_start"]), category)
+            destination = folder / source.name
+            if destination == source:
+                continue
+            _move_clip(source, destination)
+            document["clip"] = destination.relative_to(root).as_posix()
+            _write_event_document(metadata, document)
+            try:
+                source.parent.rmdir()
+            except OSError:
+                pass
+        except (OSError, ValueError, KeyError, TypeError) as ex:
+            LOG.warning("Could not sort local detection %s by day: %s", metadata, ex)
 
 
 def load_events(uid: str, now: datetime | None = None) -> list[DetectionEvent]:
     directory = _event_folder(uid)
     root = event_directory()
-    cutoff = (now or datetime.now()) - RETENTION
+    cutoff = (now or datetime.now()) - PLAYBACK_PERIOD
     if not directory.is_dir():
         return []
     events = []
@@ -461,27 +519,6 @@ def load_events(uid: str, now: datetime | None = None) -> list[DetectionEvent]:
         except (OSError, ValueError, KeyError, TypeError):
             LOG.warning("Invalid local detection event %s", path)
     return sorted(events, key=lambda event: event.first)
-
-
-def prune_events(now: datetime | None = None) -> None:
-    cutoff = (now or datetime.now()) - RETENTION
-    root = event_directory()
-    metadata_root = root / ".metadata"
-    if not metadata_root.is_dir():
-        return
-    for directory in metadata_root.iterdir():
-        if not directory.is_dir():
-            continue
-        for metadata in directory.glob("*.json"):
-            try:
-                document = json.loads(metadata.read_text(encoding="utf-8"))
-                if datetime.fromisoformat(document["first"]) >= cutoff:
-                    continue
-                if document.get("clip"):
-                    _clip_path(root, document["clip"]).unlink(missing_ok=True)
-                metadata.unlink(missing_ok=True)
-            except (OSError, ValueError, KeyError):
-                LOG.warning("Could not prune local detection %s", metadata)
 
 
 def _run(
@@ -568,10 +605,8 @@ def export_event(
     if not segments:
         raise OSError("No continuous recording covers the local detection.")
     category = _event_type(event.classes)
-    folder = event_directory() / category
-    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    folder.chmod(0o700)
     clip_start = max(first, segments[0][1])
+    folder = _category_folder(event_directory(), clip_start, category)
     clip = folder / f"{category}_{prefix}_{clip_start:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.mkv"
     with tempfile.TemporaryDirectory(prefix="intraswitch_camera_event_") as temporary:
         parts = []
@@ -762,7 +797,6 @@ class DetectionEngine:
                             if finished.clip != exported.clip:
                                 finished.clip.replace(exported.clip)
                             raise
-                        prune_events()
                         LOG.info("Saved local detection %s", finished.clip.name)
                         try:
                             callback(finished)

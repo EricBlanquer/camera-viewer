@@ -22,7 +22,7 @@ from app import (
 )
 from local_detection import (
     DetectionEvent, DetectionHit, DetectionPipeline, DogEventReviewer, EventTracker, _animal_tracks_are_cats,
-    export_event, install_model, load_events, organize_events, prune_events, save_event,
+    export_event, install_model, load_events, organize_events, save_event,
 )
 
 
@@ -36,9 +36,9 @@ class EventTrackerTest(unittest.TestCase):
         tracker = EventTracker("camera", "Garden")
         self.assertEqual(tracker.observe(start, [self.hit("person", .7)]), [])
         self.assertEqual(tracker.observe(start + timedelta(seconds=1), []), [])
-        self.assertEqual(tracker.observe(start + timedelta(seconds=2), [self.hit("person", .8)]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=2), [self.hit("person", .8, (20, 10, 20, 20))]), [])
         self.assertEqual(tracker.observe(start + timedelta(seconds=4), []), [])
-        self.assertEqual(tracker.observe(start + timedelta(seconds=5), [self.hit("person", .9)]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=5), [self.hit("person", .9, (30, 10, 20, 20))]), [])
         completed = tracker.observe(start + timedelta(seconds=9), [])
         self.assertEqual(len(completed), 1)
         self.assertEqual((completed[0].first, completed[0].last), (start, start + timedelta(seconds=5)))
@@ -50,6 +50,46 @@ class EventTrackerTest(unittest.TestCase):
         tracker = EventTracker("camera", "Garden")
         for seconds, found in ((0, [self.hit("person", .6)]), (1, [self.hit("bird", .6)]), (4, [])):
             self.assertEqual(tracker.observe(start + timedelta(seconds=seconds), found), [])
+
+    def test_motionless_person_shape_does_not_confirm_an_event(self):
+        start = datetime(2026, 10, 1, 6, 29, 57)
+        tracker = EventTracker("camera", "Entrance")
+        boxes = ((131, 133, 189, 172), (132, 132, 189, 174), (128, 132, 194, 174), (127, 133, 192, 173))
+        for seconds, box in enumerate(boxes):
+            self.assertEqual(tracker.observe(start + timedelta(seconds=seconds), [self.hit("person", .8, box)]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=10), []), [])
+        self.assertIsNone(tracker.first)
+
+    def test_person_crossing_in_two_frames_confirms_an_event(self):
+        start = datetime(2026, 10, 1, 7)
+        tracker = EventTracker("camera", "Entrance")
+        self.assertEqual(tracker.observe(start, [self.hit("person", .7, (100, 100, 60, 150))]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=1),
+                                         [self.hit("person", .8, (150, 100, 60, 150))]), [])
+        completed = tracker.observe(start + timedelta(seconds=5), [])
+        self.assertEqual([(event.first, event.classes, event.score) for event in completed],
+                         [(start, ("person",), .8)])
+
+    def test_approaching_person_confirms_an_event(self):
+        start = datetime(2026, 10, 1, 7)
+        tracker = EventTracker("camera", "Entrance")
+        self.assertEqual(tracker.observe(start, [self.hit("person", .7, (100, 100, 60, 150))]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=1),
+                                         [self.hit("person", .8, (95, 95, 70, 175))]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=5), [])[0].classes, ("person",))
+
+    def test_motionless_person_shape_does_not_label_or_extend_an_animal_event(self):
+        start = datetime(2026, 10, 1, 7)
+        tracker = EventTracker("camera", "Entrance")
+        statue = self.hit("person", .8, (131, 133, 189, 172))
+        for seconds, cat_box in enumerate(((400, 250, 60, 40), (410, 250, 60, 40))):
+            self.assertEqual(tracker.observe(start + timedelta(seconds=seconds),
+                                             [statue, self.hit("cat", .7, cat_box)]), [])
+        for seconds in range(2, 5):
+            self.assertEqual(tracker.observe(start + timedelta(seconds=seconds), [statue]), [])
+        completed = tracker.observe(start + timedelta(seconds=5), [statue])
+        self.assertEqual([(event.last, event.classes) for event in completed],
+                         [(start + timedelta(seconds=1), ("cat",))])
 
     def test_sustained_event_splits_before_unbounded_clip(self):
         start = datetime(2026, 9, 29, 17)
@@ -128,8 +168,8 @@ class DogEventReviewerTest(unittest.TestCase):
     def test_cat_evidence_in_recorded_frames_corrects_the_event_and_clip_folder(self):
         with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
             root = Path(directory)
-            dog_folder = root / "dog"
-            dog_folder.mkdir()
+            dog_folder = root / "2026-09-29" / "dog"
+            dog_folder.mkdir(parents=True)
             clip = dog_folder / "dog_Garden_20260929_205453_12345678.mkv"
             clip.write_bytes(b"cat video")
             first = datetime(2026, 9, 29, 20, 54, 58)
@@ -146,7 +186,7 @@ class DogEventReviewerTest(unittest.TestCase):
                     patch("local_detection.event_directory", return_value=root):
                 reviewed = reviewer.review(event)
             self.assertEqual(reviewed.classes, ("cat",))
-            self.assertEqual(reviewed.clip.parent, root / "cat")
+            self.assertEqual(reviewed.clip.parent, root / "2026-09-29" / "cat")
             self.assertEqual(reviewed.clip.read_bytes(), b"cat video")
             self.assertFalse(clip.exists())
 
@@ -260,7 +300,8 @@ class RecordingExcerptTest(unittest.TestCase):
                 finished = export_event(event, recordings, "Garden")
                 self.assertIsNotNone(finished.clip)
                 self.assertEqual(finished.clip_start, start + timedelta(seconds=4))
-                self.assertEqual(finished.clip.parent.name, "person")
+                self.assertEqual(finished.clip.parent,
+                                 root / "Detections" / f"{finished.clip_start:%Y-%m-%d}" / "person")
                 self.assertTrue(finished.clip.name.startswith("person_Garden_"))
                 metadata = root / "Detections" / ".metadata" / hashlib.sha256(b"camera").hexdigest()[:16] / "event.json"
                 metadata.parent.mkdir(parents=True)
@@ -317,7 +358,7 @@ class RecordingExcerptTest(unittest.TestCase):
                                                    ("dog",), .7), "pending")
                 organize_events()
                 organize_events()
-                relocated = root / "cat_person" / f"cat_person_{clip.name}"
+                relocated = root / f"{first - timedelta(seconds=5):%Y-%m-%d}" / "cat_person" / f"cat_person_{clip.name}"
                 relocated_metadata = root / ".metadata" / camera_folder.name / metadata.name
                 relocated_pending = relocated_metadata.with_name(pending.name)
                 self.assertEqual(relocated.read_bytes(), b"existing video")
@@ -325,12 +366,43 @@ class RecordingExcerptTest(unittest.TestCase):
                 self.assertFalse(metadata.exists())
                 self.assertEqual(json.loads(relocated_pending.read_text(encoding="utf-8"))["status"], "pending")
                 self.assertEqual(json.loads(relocated_metadata.read_text(encoding="utf-8"))["clip"],
-                                 f"cat_person/{relocated.name}")
+                                 relocated.relative_to(root).as_posix())
                 self.assertEqual(load_events("camera", first + timedelta(hours=1))[0].clip, relocated)
-                prune_events(first + timedelta(hours=25))
-                self.assertFalse(relocated.exists())
-                self.assertFalse(relocated_metadata.exists())
-                self.assertFalse(relocated_pending.exists())
+                self.assertEqual(load_events("camera", first + timedelta(hours=25)), [])
+                self.assertTrue(relocated.exists())
+                self.assertTrue(relocated_metadata.exists())
+
+    def test_type_folders_are_sorted_by_day_without_deleting_old_excerpts(self):
+        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
+            root = Path(directory) / "Detections"
+            metadata_folder = root / ".metadata" / hashlib.sha256(b"camera").hexdigest()[:16]
+            metadata_folder.mkdir(parents=True)
+            personal = root / "chambre-chat-2025-03"
+            personal.mkdir()
+            (personal / "kept.mkv").write_bytes(b"personal")
+            clips = []
+            with patch("local_detection.event_directory", return_value=root):
+                for index, clip_start in enumerate((datetime(2026, 9, 30, 23, 59, 58), datetime(2026, 10, 1, 6, 29, 52))):
+                    folder = root / "person"
+                    folder.mkdir(exist_ok=True)
+                    clip = folder / f"person_Entrance_{clip_start:%Y%m%d_%H%M%S}_{index}.mkv"
+                    clip.write_bytes(b"video %d" % index)
+                    first = clip_start + timedelta(seconds=5)
+                    save_event(metadata_folder / f"{index}.json", DetectionEvent(
+                        "camera", "Entrance", first, first + timedelta(seconds=2), ("person",), .8, clip, clip_start,
+                    ), "ready")
+                    clips.append(clip)
+                organize_events()
+                organize_events()
+                sorted_clips = [root / "2026-09-30" / "person" / clips[0].name,
+                                root / "2026-10-01" / "person" / clips[1].name]
+                self.assertEqual([path.read_bytes() for path in sorted_clips], [b"video 0", b"video 1"])
+                self.assertFalse((root / "person").exists())
+                self.assertEqual((personal / "kept.mkv").read_bytes(), b"personal")
+                self.assertEqual([json.loads((metadata_folder / f"{index}.json").read_text(encoding="utf-8"))["clip"]
+                                  for index in range(2)],
+                                 [path.relative_to(root).as_posix() for path in sorted_clips])
+                self.assertEqual([event.clip for event in load_events("camera", datetime(2026, 10, 1, 12))], sorted_clips)
 
     def test_disabled_continuous_recording_does_not_start_decoder(self):
         worker = SimpleNamespace(
