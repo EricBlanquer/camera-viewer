@@ -21,7 +21,7 @@ from app import (
     measured_video_rate, update_local_detector,
 )
 from local_detection import (
-    DetectionEvent, DetectionHit, DetectionPipeline, DogEventReviewer, EventTracker, _animal_tracks_are_cats,
+    SCORE_THRESHOLD, DetectionEngine, DetectionEvent, DetectionHit, DetectionPipeline, EventTracker, YoloXDetector,
     export_event, install_model, load_events, organize_events, save_event,
 )
 
@@ -48,7 +48,7 @@ class EventTrackerTest(unittest.TestCase):
     def test_different_single_classes_do_not_confirm_false_event(self):
         start = datetime(2026, 9, 29, 17)
         tracker = EventTracker("camera", "Garden")
-        for seconds, found in ((0, [self.hit("person", .6)]), (1, [self.hit("bird", .6)]), (4, [])):
+        for seconds, found in ((0, [self.hit("person", .6)]), (1, [self.hit("animal", .6)]), (4, [])):
             self.assertEqual(tracker.observe(start + timedelta(seconds=seconds), found), [])
 
     def test_motionless_person_shape_does_not_confirm_an_event(self):
@@ -84,66 +84,66 @@ class EventTrackerTest(unittest.TestCase):
         statue = self.hit("person", .8, (131, 133, 189, 172))
         for seconds, cat_box in enumerate(((400, 250, 60, 40), (410, 250, 60, 40))):
             self.assertEqual(tracker.observe(start + timedelta(seconds=seconds),
-                                             [statue, self.hit("cat", .7, cat_box)]), [])
+                                             [statue, self.hit("animal", .7, cat_box)]), [])
         for seconds in range(2, 5):
             self.assertEqual(tracker.observe(start + timedelta(seconds=seconds), [statue]), [])
         completed = tracker.observe(start + timedelta(seconds=5), [statue])
         self.assertEqual([(event.last, event.classes) for event in completed],
-                         [(start + timedelta(seconds=1), ("cat",))])
+                         [(start + timedelta(seconds=1), ("animal",))])
 
     def test_sustained_event_splits_before_unbounded_clip(self):
         start = datetime(2026, 9, 29, 17)
         tracker = EventTracker("camera", "Garden")
         events = []
         for seconds in range(121):
-            events += tracker.observe(start + timedelta(seconds=seconds), [self.hit("dog", .8)])
+            events += tracker.observe(start + timedelta(seconds=seconds), [self.hit("animal", .8)])
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].classes, ("dog",))
+        self.assertEqual(events[0].classes, ("animal",))
         self.assertLessEqual((events[0].last - events[0].first).total_seconds(), 120)
 
-    def test_one_cat_keeps_its_identity_when_the_model_calls_it_dog_or_bird(self):
-        start = datetime(2026, 9, 29, 20, 14)
-        tracker = EventTracker("camera", "Garden")
-        dog_box = (422, 248, 64, 46)
-        cat_box = (423, 250, 65, 43)
-        bird_box = (418, 226, 65, 68)
-        for seconds, hit in ((0, self.hit("dog", .64, dog_box)),
-                             (1, self.hit("dog", .69, dog_box)),
-                             (2, self.hit("cat", .62, cat_box)),
-                             (3, self.hit("dog", .74, dog_box))):
-            self.assertEqual(tracker.observe(start + timedelta(seconds=seconds), [hit]), [])
-        first = tracker.observe(start + timedelta(seconds=7), [])
-        self.assertEqual(first[0].classes, ("cat",))
-        self.assertEqual(tracker.observe(start + timedelta(seconds=21), [self.hit("bird", .59, bird_box)]), [])
-        self.assertEqual(tracker.observe(start + timedelta(seconds=22), [self.hit("bird", .61, bird_box)]), [])
-        second = tracker.observe(start + timedelta(seconds=26), [])
-        self.assertEqual(second[0].classes, ("cat",))
-        self.assertEqual(tracker.observe(start + timedelta(seconds=100), [self.hit("bird", .7, bird_box)]), [])
-        self.assertEqual(tracker.observe(start + timedelta(seconds=101), [self.hit("bird", .7, bird_box)]), [])
-        third = tracker.observe(start + timedelta(seconds=105), [])
-        self.assertEqual(third[0].classes, ("bird",))
-
-    def test_separate_cat_and_dog_remain_two_types(self):
-        start = datetime(2026, 9, 29, 20, 14)
-        tracker = EventTracker("camera", "Garden")
-        animals = [self.hit("cat", .8, (10, 10, 50, 50)), self.hit("dog", .9, (60, 10, 50, 50))]
-        self.assertEqual(tracker.observe(start, animals), [])
-        self.assertEqual(tracker.observe(start + timedelta(seconds=1), animals), [])
-        completed = tracker.observe(start + timedelta(seconds=5), [])
-        self.assertEqual(completed[0].classes, ("cat", "dog"))
-
-    def test_moving_cat_keeps_its_identity_after_a_short_detection_gap(self):
+    def test_animal_keeps_one_track_after_a_short_detection_gap(self):
         start = datetime(2026, 9, 29, 20, 25)
         tracker = EventTracker("camera", "Garden")
-        self.assertEqual(tracker.observe(start, [self.hit("cat", .7, (138, 127, 68, 36))]), [])
+        self.assertEqual(tracker.observe(start, [self.hit("animal", .7, (138, 127, 68, 36))]), [])
         self.assertEqual(tracker.observe(start + timedelta(seconds=1),
-                                         [self.hit("cat", .7, (132, 128, 67, 33))]), [])
-        self.assertEqual(tracker.observe(start + timedelta(seconds=5), [])[0].classes, ("cat",))
+                                         [self.hit("animal", .7, (132, 128, 67, 33))]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=5), [])[0].classes, ("animal",))
         self.assertEqual(tracker.observe(start + timedelta(seconds=18),
-                                         [self.hit("dog", .77, (85, 112, 45, 38))]), [])
+                                         [self.hit("animal", .77, (85, 112, 45, 38))]), [])
         self.assertEqual(tracker.observe(start + timedelta(seconds=19),
-                                         [self.hit("dog", .78, (87, 111, 46, 39))]), [])
-        self.assertEqual(tracker.observe(start + timedelta(seconds=23), [])[0].classes, ("cat",))
+                                         [self.hit("animal", .78, (87, 111, 46, 39))]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=23), [])[0].classes, ("animal",))
+        self.assertEqual(len(tracker.tracks), 1)
+
+    def test_motionless_animal_still_confirms_an_event(self):
+        start = datetime(2026, 10, 1, 5, 41, 43)
+        tracker = EventTracker("camera", "Garden")
+        for seconds in range(2):
+            self.assertEqual(tracker.observe(start + timedelta(seconds=seconds),
+                                             [self.hit("animal", .74, (405, 170, 48, 61))]), [])
+        self.assertEqual(tracker.observe(start + timedelta(seconds=5), [])[0].classes, ("animal",))
+
+
+class DetectorTest(unittest.TestCase):
+    def test_cat_and_dog_predictions_of_one_animal_form_one_animal_hit(self):
+        import numpy as np
+        detector = YoloXDetector.__new__(YoloXDetector)
+        detector.np = np
+        detector.threshold = SCORE_THRESHOLD
+        detector.grids = np.zeros((8400, 2))
+        detector.strides = np.full((8400, 1), 8)
+        output = np.zeros((8400, 85), np.float32)
+        output[:, 2:4] = -10
+        for row, index, score in ((0, 15, .6), (1, 16, .7), (2, 0, .9)):
+            output[row, :2] = (50, 20)
+            output[row, 2:4] = np.log(10)
+            output[row, 4] = 1
+            output[row, 5 + index] = score
+        detector.net = SimpleNamespace(setInput=lambda blob: None, forward=lambda: output)
+        import cv2
+        detector.cv2 = cv2
+        hits = detector.infer(bytes(640 * 360 * 3))
+        self.assertEqual(sorted((hit.name, round(hit.score, 2)) for hit in hits), [("animal", .7), ("person", .9)])
 
 
 class ModelInstallationTest(unittest.TestCase):
@@ -162,82 +162,6 @@ class ModelInstallationTest(unittest.TestCase):
                     patch("local_detection.urllib.request.urlopen", return_value=io.BytesIO(b"good")):
                 self.assertEqual(install_model(destination), destination)
             self.assertEqual(destination.read_bytes(), b"good")
-
-
-class DogEventReviewerTest(unittest.TestCase):
-    def test_cat_evidence_in_recorded_frames_corrects_the_event_and_clip_folder(self):
-        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
-            root = Path(directory)
-            dog_folder = root / "2026-09-29" / "dog"
-            dog_folder.mkdir(parents=True)
-            clip = dog_folder / "dog_Garden_20260929_205453_12345678.mkv"
-            clip.write_bytes(b"cat video")
-            first = datetime(2026, 9, 29, 20, 54, 58)
-            event = DetectionEvent("camera", "Garden", first, first + timedelta(seconds=6),
-                                   ("dog",), .7, clip, first - timedelta(seconds=5))
-            box = (93, 107, 45, 39)
-            samples = [
-                (first, [DetectionHit("dog", .7, box), DetectionHit("cat", .4, box)]),
-                (first + timedelta(seconds=5), [DetectionHit("dog", .6, box), DetectionHit("cat", .35, box)]),
-            ]
-            reviewer = DogEventReviewer()
-            reviewer.primary = SimpleNamespace(infer=lambda frame: [])
-            with patch("local_detection._review_samples", return_value=samples), \
-                    patch("local_detection.event_directory", return_value=root):
-                reviewed = reviewer.review(event)
-            self.assertEqual(reviewed.classes, ("cat",))
-            self.assertEqual(reviewed.clip.parent, root / "2026-09-29" / "cat")
-            self.assertEqual(reviewed.clip.read_bytes(), b"cat video")
-            self.assertFalse(clip.exists())
-
-    def test_primary_model_cat_evidence_corrects_later_dog_frames(self):
-        first = datetime(2026, 9, 29, 21, 19, 58)
-        box = (434, 259, 56, 37)
-        samples = [
-            (first, [DetectionHit("dog", .6, box)]),
-            (first + timedelta(seconds=10), [DetectionHit("dog", .6, box)]),
-            (first + timedelta(seconds=30), [DetectionHit("cat", .6, box)]),
-            (first + timedelta(seconds=31), [DetectionHit("cat", .6, box)]),
-        ]
-        self.assertTrue(_animal_tracks_are_cats(samples))
-
-    def test_one_weak_cat_frame_does_not_override_a_dog_event(self):
-        first = datetime(2026, 9, 29, 21, 19, 58)
-        box = (434, 259, 56, 37)
-        samples = [
-            (first, [DetectionHit("dog", .6, box)]),
-            (first + timedelta(seconds=1), [DetectionHit("cat", .2, box)]),
-            (first + timedelta(seconds=2), [DetectionHit("dog", .6, box)]),
-        ]
-        self.assertFalse(_animal_tracks_are_cats(samples))
-
-    def test_repeated_weak_cat_scores_do_not_override_stronger_dog_scores(self):
-        first = datetime(2026, 9, 29, 21, 19, 58)
-        box = (434, 259, 56, 37)
-        samples = [
-            (first, [DetectionHit("dog", .7, box), DetectionHit("cat", .2, box)]),
-            (first + timedelta(seconds=1), [DetectionHit("dog", .7, box), DetectionHit("cat", .2, box)]),
-        ]
-        self.assertFalse(_animal_tracks_are_cats(samples))
-
-    def test_unrelated_cat_without_a_recorded_dog_is_not_enough(self):
-        first = datetime(2026, 9, 29, 21, 19, 58)
-        box = (434, 259, 56, 37)
-        samples = [
-            (first, [DetectionHit("cat", .7, box)]),
-            (first + timedelta(seconds=1), [DetectionHit("cat", .7, box)]),
-        ]
-        self.assertFalse(_animal_tracks_are_cats(samples))
-
-    def test_spatially_separate_dog_is_preserved(self):
-        first = datetime(2026, 9, 29, 21, 19, 58)
-        samples = [
-            (first, [DetectionHit("dog", .7, (10, 10, 40, 40)),
-                     DetectionHit("cat", .8, (200, 10, 40, 40))]),
-            (first + timedelta(seconds=5), [DetectionHit("dog", .7, (10, 10, 40, 40)),
-                                                DetectionHit("cat", .8, (200, 10, 40, 40))]),
-        ]
-        self.assertFalse(_animal_tracks_are_cats(samples))
 
 
 class RecordingExcerptTest(unittest.TestCase):
@@ -300,10 +224,10 @@ class RecordingExcerptTest(unittest.TestCase):
                 finished = export_event(event, recordings, "Garden")
                 self.assertIsNotNone(finished.clip)
                 self.assertEqual(finished.clip_start, start + timedelta(seconds=4))
-                self.assertEqual(finished.clip.parent,
-                                 root / "Detections" / f"{finished.clip_start:%Y-%m-%d}" / "person")
+                day = root / "Detections" / f"{event.first:%Y-%m-%d}"
+                self.assertEqual(finished.clip.parent, day / "person")
                 self.assertTrue(finished.clip.name.startswith("person_Garden_"))
-                metadata = root / "Detections" / ".metadata" / hashlib.sha256(b"camera").hexdigest()[:16] / "event.json"
+                metadata = day / ".metadata" / hashlib.sha256(b"camera").hexdigest()[:16] / "event.json"
                 metadata.parent.mkdir(parents=True)
                 save_event(metadata, finished, "ready")
                 self.assertEqual(load_events("camera", start + timedelta(seconds=20)), [finished])
@@ -327,7 +251,7 @@ class RecordingExcerptTest(unittest.TestCase):
             ], check=True, capture_output=True, timeout=15)
             os.utime(source, (start.timestamp() + 30, start.timestamp() + 30))
             event = DetectionEvent("camera", "Garden", start + timedelta(seconds=20),
-                                   start + timedelta(seconds=22), ("cat",), .8)
+                                   start + timedelta(seconds=22), ("animal",), .8)
             with patch("local_detection.event_directory", return_value=root / "Detections"):
                 finished = export_event(event, recordings, "Garden")
                 self.assertEqual(finished.clip_start, start + timedelta(seconds=15))
@@ -358,12 +282,11 @@ class RecordingExcerptTest(unittest.TestCase):
                                                    ("dog",), .7), "pending")
                 organize_events()
                 organize_events()
-                relocated = root / f"{first - timedelta(seconds=5):%Y-%m-%d}" / "cat_person" / f"cat_person_{clip.name}"
-                relocated_metadata = root / ".metadata" / camera_folder.name / metadata.name
+                relocated = root / f"{first:%Y-%m-%d}" / "animal_person" / f"animal_person_{clip.name}"
+                relocated_metadata = root / f"{first:%Y-%m-%d}" / ".metadata" / camera_folder.name / metadata.name
                 relocated_pending = relocated_metadata.with_name(pending.name)
                 self.assertEqual(relocated.read_bytes(), b"existing video")
-                self.assertFalse(clip.exists())
-                self.assertFalse(metadata.exists())
+                self.assertFalse(camera_folder.exists())
                 self.assertEqual(json.loads(relocated_pending.read_text(encoding="utf-8"))["status"], "pending")
                 self.assertEqual(json.loads(relocated_metadata.read_text(encoding="utf-8"))["clip"],
                                  relocated.relative_to(root).as_posix())
@@ -382,7 +305,7 @@ class RecordingExcerptTest(unittest.TestCase):
             (personal / "kept.mkv").write_bytes(b"personal")
             clips = []
             with patch("local_detection.event_directory", return_value=root):
-                for index, clip_start in enumerate((datetime(2026, 9, 30, 23, 59, 58), datetime(2026, 10, 1, 6, 29, 52))):
+                for index, clip_start in enumerate((datetime(2026, 9, 30, 23, 59, 58), datetime(2026, 9, 30, 6, 29, 52))):
                     folder = root / "person"
                     folder.mkdir(exist_ok=True)
                     clip = folder / f"person_Entrance_{clip_start:%Y%m%d_%H%M%S}_{index}.mkv"
@@ -392,17 +315,56 @@ class RecordingExcerptTest(unittest.TestCase):
                         "camera", "Entrance", first, first + timedelta(seconds=2), ("person",), .8, clip, clip_start,
                     ), "ready")
                     clips.append(clip)
+                dog_folder = root / "dog"
+                dog_folder.mkdir()
+                dog_clip = dog_folder / "dog_Garden_20261001_054138_cfa036ea.mkv"
+                dog_clip.write_bytes(b"black cat")
+                dog_start = datetime(2026, 10, 1, 5, 41, 38)
+                save_event(metadata_folder / "2.json", DetectionEvent(
+                    "camera", "Garden", dog_start + timedelta(seconds=5), dog_start + timedelta(seconds=26),
+                    ("dog",), .71, dog_clip, dog_start,
+                ), "ready")
                 organize_events()
                 organize_events()
-                sorted_clips = [root / "2026-09-30" / "person" / clips[0].name,
-                                root / "2026-10-01" / "person" / clips[1].name]
+                sorted_clips = [root / "2026-10-01" / "person" / clips[0].name,
+                                root / "2026-09-30" / "person" / clips[1].name]
+                animal_clip = root / "2026-10-01" / "animal" / "animal_Garden_20261001_054138_cfa036ea.mkv"
+                documents = [root / day / ".metadata" / metadata_folder.name / f"{index}.json"
+                             for index, day in enumerate(("2026-10-01", "2026-09-30", "2026-10-01"))]
                 self.assertEqual([path.read_bytes() for path in sorted_clips], [b"video 0", b"video 1"])
+                self.assertEqual(animal_clip.read_bytes(), b"black cat")
+                self.assertFalse((root / ".metadata").exists())
+                animal_document = json.loads(documents[2].read_text(encoding="utf-8"))
+                self.assertEqual((animal_document["clip"], animal_document["classes"]),
+                                 (animal_clip.relative_to(root).as_posix(), ["animal"]))
                 self.assertFalse((root / "person").exists())
+                self.assertFalse(dog_folder.exists())
                 self.assertEqual((personal / "kept.mkv").read_bytes(), b"personal")
-                self.assertEqual([json.loads((metadata_folder / f"{index}.json").read_text(encoding="utf-8"))["clip"]
+                self.assertEqual([json.loads(documents[index].read_text(encoding="utf-8"))["clip"]
                                   for index in range(2)],
                                  [path.relative_to(root).as_posix() for path in sorted_clips])
-                self.assertEqual([event.clip for event in load_events("camera", datetime(2026, 10, 1, 12))], sorted_clips)
+                self.assertEqual([event.clip for event in load_events("camera", datetime(2026, 10, 1, 12))],
+                                 [sorted_clips[0], animal_clip])
+
+    def test_pending_detection_without_kept_recording_is_discarded(self):
+        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
+            root = Path(directory) / "Detections"
+            engine = SimpleNamespace(_enqueue=Mock())
+            pipeline = SimpleNamespace(uid="camera", prefix="Garden", on_event=Mock())
+            now = datetime.now()
+            with patch("local_detection.event_directory", return_value=root):
+                paths = []
+                for name, last in (("expired", now - timedelta(hours=25)), ("recent", now - timedelta(hours=1))):
+                    metadata = root / f"{last:%Y-%m-%d}" / ".metadata" / hashlib.sha256(b"camera").hexdigest()[:16]
+                    metadata.mkdir(parents=True, exist_ok=True)
+                    paths.append(metadata / f"{name}.json")
+                    save_event(paths[-1], DetectionEvent(
+                        "camera", "Garden", last - timedelta(seconds=5), last, ("cat",), .8,
+                    ), "pending")
+                DetectionEngine.recover(engine, pipeline)
+            self.assertEqual([path.exists() for path in paths], [False, True])
+            self.assertEqual([(call.args[0].name, call.args[1].classes) for call in engine._enqueue.call_args_list],
+                             [("recent.json", ("animal",))])
 
     def test_disabled_continuous_recording_does_not_start_decoder(self):
         worker = SimpleNamespace(

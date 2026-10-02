@@ -14,7 +14,7 @@ import time
 import urllib.request
 import uuid
 from collections import OrderedDict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -25,12 +25,10 @@ MODEL_URL = "https://huggingface.co/opencv/opencv_zoo/resolve/main/models/object
 MODEL_SHA256 = "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063"
 MODEL_SIZE = 35858002
 PERSON_CLASS = "person"
-CAT_CLASS = "cat"
-DOG_CLASS = "dog"
-ANIMAL_KIND = "animal"
-CLASS_NAMES = {0: PERSON_CLASS, 14: "bird", 15: CAT_CLASS, 16: DOG_CLASS}
+ANIMAL_CLASS = "animal"
+CLASS_NAMES = {0: PERSON_CLASS, 14: ANIMAL_CLASS, 15: ANIMAL_CLASS, 16: ANIMAL_CLASS}
+LEGACY_ANIMAL_CLASSES = frozenset({"bird", "cat", "dog"})
 SCORE_THRESHOLD = 0.55
-REVIEW_SCORE_THRESHOLD = 0.15
 SAMPLE_WIDTH = 640
 SAMPLE_HEIGHT = 360
 SAMPLE_BYTES = SAMPLE_WIDTH * SAMPLE_HEIGHT * 3
@@ -46,12 +44,10 @@ TRACK_AREA_RATIO_LIMIT = 2.5
 PERSON_MOVEMENT_FACTOR = 0.25
 PERSON_SCALE_LIMIT = 1.25
 MODEL_DOWNLOAD_LIMIT = MODEL_SIZE + 1
-REVIEW_MAX_SAMPLES = 12
-REVIEW_INTERVAL_SECONDS = 1
-REVIEW_MARGIN_SECONDS = 2
-REVIEW_CAT_DOG_RATIO = 0.5
 PLAYBACK_PERIOD = timedelta(hours=24)
+RECORDING_RETENTION = timedelta(hours=24)
 EVENT_DAY_FORMAT = "%Y-%m-%d"
+METADATA_FOLDER = ".metadata"
 
 
 def model_path() -> Path:
@@ -112,21 +108,23 @@ class YoloXDetector:
         output = self.net.forward().reshape(-1, 85)
         scores = output[:, 4:5] * output[:, 5:]
         classes = np.argmax(scores, axis=1)
+        best = scores[np.arange(len(scores)), classes]
         found = []
-        for index, name in CLASS_NAMES.items():
-            matches = np.where((classes == index) & (scores[:, index] >= self.threshold))[0]
+        for name in sorted(set(CLASS_NAMES.values())):
+            indices = [index for index, label in CLASS_NAMES.items() if label == name]
+            matches = np.where(np.isin(classes, indices) & (best >= self.threshold))[0]
             if not len(matches):
                 continue
             centers = (output[matches, :2] + self.grids[matches]) * self.strides[matches]
             sizes = np.exp(output[matches, 2:4]) * self.strides[matches]
             boxes = np.concatenate((centers - sizes / 2, sizes), axis=1)
-            kept = cv2.dnn.NMSBoxes(boxes.tolist(), scores[matches, index].tolist(), self.threshold, 0.5)
+            kept = cv2.dnn.NMSBoxes(boxes.tolist(), best[matches].tolist(), self.threshold, 0.5)
             if len(kept):
                 for row in np.asarray(kept).flatten():
                     position = int(row)
                     box = tuple(float(value) for value in boxes[position])
                     if box[1] < SAMPLE_HEIGHT:
-                        found.append(DetectionHit(name, float(scores[matches[position], index]), box))
+                        found.append(DetectionHit(name, float(best[matches[position]]), box))
         return found
 
 
@@ -143,7 +141,6 @@ class DetectionTrack:
     box: tuple[float, float, float, float]
     last: datetime
     anchor: tuple[float, float, float, float]
-    cat_seen: datetime | None = None
     moved: bool = False
 
 
@@ -180,8 +177,7 @@ def box_moved(anchor: tuple[float, float, float, float], box: tuple[float, float
 
 
 def track_match_score(hit: DetectionHit, track: DetectionTrack, when: datetime) -> float:
-    kind = PERSON_CLASS if hit.name == PERSON_CLASS else ANIMAL_KIND
-    if (PERSON_CLASS if track.label == PERSON_CLASS else ANIMAL_KIND) != kind or when - track.last > TRACK_MAX_AGE:
+    if track.label != hit.name or when - track.last > TRACK_MAX_AGE:
         return 0.0
     overlap = box_overlap(hit.box, track.box)
     if overlap >= TRACK_OVERLAP_THRESHOLD:
@@ -231,11 +227,6 @@ class EventTracker:
                 self.next_track_id += 1
                 self.tracks[identifier] = DetectionTrack(hit.name, hit.box, when, hit.box)
             track = self.tracks[identifier]
-            if hit.name == CAT_CLASS:
-                track.label = CAT_CLASS
-                track.cat_seen = when
-            elif track.cat_seen is None or when - track.cat_seen > TRACK_MAX_AGE:
-                track.label = hit.name
             track.box = hit.box
             track.last = when
             track.moved = track.moved or box_moved(track.anchor, hit.box)
@@ -292,80 +283,6 @@ class EventTracker:
         return event
 
 
-def _review_samples(event: DetectionEvent, detector: YoloXDetector) -> list[tuple[datetime, list[DetectionHit]]]:
-    import cv2
-    if event.clip is None or event.clip_start is None:
-        return []
-    capture = cv2.VideoCapture(str(event.clip))
-    try:
-        fps = capture.get(cv2.CAP_PROP_FPS)
-        frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
-        if fps <= 0 or frames <= 0:
-            raise OSError("The detection excerpt cannot be inspected.")
-        duration = frames / fps
-        first = max(0.0, (event.first - event.clip_start).total_seconds() - REVIEW_MARGIN_SECONDS)
-        last = min(duration, (event.last - event.clip_start).total_seconds() + REVIEW_MARGIN_SECONDS)
-        if first >= last:
-            return []
-        interval = max(REVIEW_INTERVAL_SECONDS, math.ceil((last - first) / (REVIEW_MAX_SAMPLES - 1)))
-        samples = []
-        offset = first
-        while offset < last:
-            if not capture.set(cv2.CAP_PROP_POS_MSEC, offset * 1000):
-                raise OSError("The detection excerpt cannot be positioned.")
-            valid, frame = capture.read()
-            if valid:
-                image = cv2.resize(frame, (SAMPLE_WIDTH, SAMPLE_HEIGHT))
-                samples.append((event.clip_start + timedelta(seconds=offset), detector.infer(image.tobytes())))
-            offset += interval
-        return samples
-    finally:
-        capture.release()
-
-
-def _animal_tracks_are_cats(samples: list[tuple[datetime, list[DetectionHit]]]) -> bool:
-    tracker = EventTracker("review", "review")
-    tracks = {}
-    cat_frames = 0
-    dog_frames = 0
-    for when, detected in samples:
-        dogs = [hit for hit in detected if hit.name == DOG_CLASS]
-        if dogs:
-            dog_frames += 1
-        cats = []
-        for hit in detected:
-            if hit.name != CAT_CLASS:
-                continue
-            competing = [dog.score for dog in dogs if box_overlap(dog.box, hit.box) >= TRACK_OVERLAP_THRESHOLD]
-            if not competing or hit.score >= max(competing) * REVIEW_CAT_DOG_RATIO:
-                cats.append(hit)
-        hits = dogs + cats
-        if cats:
-            cat_frames += 1
-        tracker._match(when, hits)
-        tracks.update(tracker.tracks)
-    return dog_frames > 0 and cat_frames >= 2 and {track.label for track in tracks.values()} == {CAT_CLASS}
-
-
-class DogEventReviewer:
-    def __init__(self) -> None:
-        self.primary: YoloXDetector | None = None
-
-    def review(self, event: DetectionEvent) -> DetectionEvent:
-        if event.classes != (DOG_CLASS,) or event.clip is None or event.clip_start is None:
-            return event
-        if self.primary is None:
-            self.primary = YoloXDetector(model_path(), REVIEW_SCORE_THRESHOLD)
-        samples = _review_samples(event, self.primary)
-        if not _animal_tracks_are_cats(samples):
-            return event
-        destination = _category_folder(event_directory(), event.clip_start, CAT_CLASS) / f"{CAT_CLASS}_{event.clip.name.removeprefix(f'{DOG_CLASS}_')}"
-        if destination.exists():
-            raise FileExistsError(destination)
-        event.clip.replace(destination)
-        return replace(event, classes=(CAT_CLASS,), clip=destination)
-
-
 def event_directory() -> Path:
     from PyQt6.QtCore import QStandardPaths
     videos = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.MoviesLocation)
@@ -375,14 +292,25 @@ def event_directory() -> Path:
     return directory
 
 
-def _event_folder(uid: str) -> Path:
-    metadata = event_directory() / ".metadata"
-    metadata.mkdir(parents=True, exist_ok=True, mode=0o700)
-    metadata.chmod(0o700)
-    directory = metadata / hashlib.sha256(uid.encode("utf-8")).hexdigest()[:16]
-    directory.mkdir(exist_ok=True, mode=0o700)
-    directory.chmod(0o700)
-    return directory
+def _camera_key(uid: str) -> str:
+    return hashlib.sha256(uid.encode("utf-8")).hexdigest()[:16]
+
+
+def _private_folder(root: Path, *parts: str) -> Path:
+    folder = root
+    for part in parts:
+        folder = folder / part
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        folder.chmod(0o700)
+    return folder
+
+
+def _event_folder(root: Path, uid: str, day: datetime) -> Path:
+    return _private_folder(root, day.strftime(EVENT_DAY_FORMAT), METADATA_FOLDER, _camera_key(uid))
+
+
+def _current_classes(names: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(sorted({ANIMAL_CLASS if name in LEGACY_ANIMAL_CLASSES else name for name in names}))
 
 
 def _event_type(classes: tuple[str, ...]) -> str:
@@ -393,11 +321,16 @@ def _event_type(classes: tuple[str, ...]) -> str:
 
 
 def _category_folder(root: Path, day: datetime, category: str) -> Path:
-    folder = root / day.strftime(EVENT_DAY_FORMAT) / category
-    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    folder.parent.chmod(0o700)
-    folder.chmod(0o700)
-    return folder
+    return _private_folder(root, day.strftime(EVENT_DAY_FORMAT), category)
+
+
+def _remove_empty_folders(root: Path, folder: Path) -> None:
+    while folder != root and folder.is_relative_to(root):
+        try:
+            folder.rmdir()
+        except OSError:
+            return
+        folder = folder.parent
 
 
 def _move_clip(source: Path, destination: Path) -> None:
@@ -439,73 +372,53 @@ def save_event(path: Path, event: DetectionEvent, status: str) -> None:
 
 def organize_events() -> None:
     root = event_directory()
-    for directory in root.iterdir():
-        if not directory.is_dir():
-            continue
-        for metadata in directory.glob("*.json"):
-            try:
-                document = json.loads(metadata.read_text(encoding="utf-8"))
-                name = document.get("clip")
-                if directory.name != hashlib.sha256(document["uid"].encode("utf-8")).hexdigest()[:16]:
-                    raise ValueError("Invalid local detection camera folder.")
-                if document["status"] == "ready" and name:
-                    if Path(name).parent == Path("."):
-                        source = _clip_path(directory, name)
-                        category = _event_type(tuple(document["classes"]))
-                        folder = _category_folder(root, datetime.fromisoformat(document["clip_start"]), category)
-                        destination = folder / f"{category}_{source.name}"
-                        _move_clip(source, destination)
-                        document["clip"] = destination.relative_to(root).as_posix()
-                        _write_event_document(metadata, document)
-                    elif not _clip_path(root, name).is_file():
-                        raise FileNotFoundError(_clip_path(root, name))
-                destination = _event_folder(document["uid"]) / metadata.name
-                if destination.exists():
-                    raise FileExistsError(destination)
-                metadata.replace(destination)
-            except (OSError, ValueError, KeyError, TypeError) as ex:
-                LOG.warning("Could not organize local detection %s: %s", metadata, ex)
+    documents = [
+        *root.glob("*/*.json"), *root.glob(f"{METADATA_FOLDER}/*/*.json"),
+        *root.glob(f"*/{METADATA_FOLDER}/*/*.json"),
+    ]
+    for metadata in documents:
         try:
-            directory.rmdir()
-        except OSError:
-            pass
-    _sort_events_by_day(root)
-
-
-def _sort_events_by_day(root: Path) -> None:
-    metadata_root = root / ".metadata"
-    if not metadata_root.is_dir():
-        return
-    for metadata in metadata_root.glob("*/*.json"):
-        try:
-            document = json.loads(metadata.read_text(encoding="utf-8"))
-            if document["status"] != "ready" or not document.get("clip"):
-                continue
-            source = _clip_path(root, document["clip"])
-            category = _event_type(tuple(document["classes"]))
-            folder = _category_folder(root, datetime.fromisoformat(document["clip_start"]), category)
-            destination = folder / source.name
-            if destination == source:
-                continue
-            _move_clip(source, destination)
-            document["clip"] = destination.relative_to(root).as_posix()
-            _write_event_document(metadata, document)
-            try:
-                source.parent.rmdir()
-            except OSError:
-                pass
+            _organize_event(root, metadata)
         except (OSError, ValueError, KeyError, TypeError) as ex:
-            LOG.warning("Could not sort local detection %s by day: %s", metadata, ex)
+            LOG.warning("Could not organize local detection %s: %s", metadata, ex)
+
+
+def _organize_event(root: Path, metadata: Path) -> None:
+    document = json.loads(metadata.read_text(encoding="utf-8"))
+    if metadata.parent.name != _camera_key(document["uid"]):
+        raise ValueError("Invalid local detection camera folder.")
+    day = datetime.fromisoformat(document["first"])
+    classes = list(_current_classes(document["classes"]))
+    changed = classes != document["classes"]
+    document["classes"] = classes
+    name = document.get("clip")
+    if document["status"] == "ready" and name:
+        source = _clip_path(metadata.parent if Path(name).parent == Path(".") else root, name)
+        category = _event_type(tuple(classes))
+        destination = _category_folder(root, day, category) / f"{category}_{source.name.removeprefix(f'{source.parent.name}_')}"
+        if destination != source:
+            _move_clip(source, destination)
+            _remove_empty_folders(root, source.parent)
+            document["clip"] = destination.relative_to(root).as_posix()
+            changed = True
+    if changed:
+        _write_event_document(metadata, document)
+    target = _event_folder(root, document["uid"], day) / metadata.name
+    if target != metadata:
+        if target.exists():
+            raise FileExistsError(target)
+        metadata.replace(target)
+        _remove_empty_folders(root, metadata.parent)
 
 
 def load_events(uid: str, now: datetime | None = None) -> list[DetectionEvent]:
-    directory = _event_folder(uid)
     root = event_directory()
-    cutoff = (now or datetime.now()) - PLAYBACK_PERIOD
-    if not directory.is_dir():
-        return []
+    current = now or datetime.now()
+    cutoff = current - PLAYBACK_PERIOD
+    days = [cutoff + timedelta(days=offset) for offset in range((current.date() - cutoff.date()).days + 1)]
     events = []
-    for path in directory.glob("*.json"):
+    for path in (path for day in days
+                 for path in (root / day.strftime(EVENT_DAY_FORMAT) / METADATA_FOLDER / _camera_key(uid)).glob("*.json")):
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
             first = datetime.fromisoformat(document["first"])
@@ -513,7 +426,7 @@ def load_events(uid: str, now: datetime | None = None) -> list[DetectionEvent]:
             if document["uid"] == uid and first >= cutoff and document["status"] == "ready" and clip is not None and clip.is_file():
                 events.append(DetectionEvent(
                     uid, document["camera"], first, datetime.fromisoformat(document["last"]),
-                    tuple(document["classes"]), float(document["score"]), clip,
+                    _current_classes(document["classes"]), float(document["score"]), clip,
                     datetime.fromisoformat(document["clip_start"]),
                 ))
         except (OSError, ValueError, KeyError, TypeError):
@@ -606,7 +519,7 @@ def export_event(
         raise OSError("No continuous recording covers the local detection.")
     category = _event_type(event.classes)
     clip_start = max(first, segments[0][1])
-    folder = _category_folder(event_directory(), clip_start, category)
+    folder = _category_folder(event_directory(), event.first, category)
     clip = folder / f"{category}_{prefix}_{clip_start:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.mkv"
     with tempfile.TemporaryDirectory(prefix="intraswitch_camera_event_") as temporary:
         parts = []
@@ -681,7 +594,6 @@ class DetectionEngine:
         self.processed: dict[str, int] = {}
         self.exports: queue.Queue[tuple[Path, DetectionEvent, str, Callable[[DetectionEvent], None]]] = queue.Queue(maxsize=32)
         self.scheduled_paths: set[Path] = set()
-        self.dog_reviewer = DogEventReviewer()
         self.stopped = threading.Event()
         self.inference = threading.Thread(target=self._infer, daemon=True)
         self.exporter = threading.Thread(target=self._export, daemon=True)
@@ -706,8 +618,7 @@ class DetectionEngine:
             self.schedule(tracker.finish(), pipeline.prefix, pipeline.on_event)
 
     def schedule(self, event: DetectionEvent, prefix: str, callback: Callable[[DetectionEvent], None]) -> None:
-        directory = _event_folder(event.uid)
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = _event_folder(event_directory(), event.uid, event.first)
         identifier = f"{event.first:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
         path = directory / f"{identifier}.json"
         save_event(path, event, "pending")
@@ -726,18 +637,19 @@ class DetectionEngine:
             LOG.warning("Local detection export queue is full; event remains pending: %s", path)
 
     def recover(self, pipeline: DetectionPipeline) -> None:
-        directory = _event_folder(pipeline.uid)
-        if not directory.is_dir():
-            return
-        for path in directory.glob("*.json"):
+        for path in event_directory().glob(f"*/{METADATA_FOLDER}/{_camera_key(pipeline.uid)}/*.json"):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if data["status"] != "pending" or data["uid"] != pipeline.uid:
                     continue
                 event = DetectionEvent(
                     pipeline.uid, data["camera"], datetime.fromisoformat(data["first"]),
-                    datetime.fromisoformat(data["last"]), tuple(data["classes"]), float(data["score"]),
+                    datetime.fromisoformat(data["last"]), _current_classes(data["classes"]), float(data["score"]),
                 )
+                if datetime.now() - event.last > RECORDING_RETENTION:
+                    path.unlink()
+                    LOG.info("Discarded local detection %s because its recording is no longer kept", path)
+                    continue
                 self._enqueue(path, event, pipeline.prefix, pipeline.on_event)
             except (OSError, ValueError, KeyError):
                 LOG.warning("Could not recover local detection %s", path)
@@ -785,18 +697,8 @@ class DetectionEngine:
                     if self.stopped.is_set():
                         break
                     try:
-                        exported = export_event(event, self.recordings, prefix, self.stopped)
-                        finished = exported
-                        try:
-                            finished = self.dog_reviewer.review(finished)
-                        except Exception as ex:
-                            LOG.warning("Could not review local detection %s: %s", finished.clip, ex)
-                        try:
-                            save_event(path, finished, "ready")
-                        except OSError:
-                            if finished.clip != exported.clip:
-                                finished.clip.replace(exported.clip)
-                            raise
+                        finished = export_event(event, self.recordings, prefix, self.stopped)
+                        save_event(path, finished, "ready")
                         LOG.info("Saved local detection %s", finished.clip.name)
                         try:
                             callback(finished)

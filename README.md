@@ -190,15 +190,15 @@ Closing the window hides it; live video keeps running in the background so conti
 Clicking the tray icon brings a window behind other applications to the front; clicking it while Camera Viewer is active hides it.
 Camera selection, connection retries, and account errors preserve the window's visibility, minimization, and focus.
 Video controls and status messages remain hidden while Camera Viewer is behind another application, minimized, or hidden; current messages reappear when its window becomes active.
-The tray menu enables local detection of people, cats, dogs, and birds while continuous recording is on.
+The tray menu enables local detection of people and animals while continuous recording is on.
 Use **Local detection cameras** to enable or disable analysis and notifications independently for each camera.
 The global detection switch preserves these camera choices; disabling a camera's detection keeps its video and continuous recording running.
 It analyzes one 640 × 360 frame per second with the SHA-256-verified OpenCV Zoo YOLOX-s model and confirms an event when the same object appears twice within two seconds.
 A person shape confirms an event only after its position or size changes, so motionless scenery that resembles a person is ignored.
-Nearby detections of the same animal retain a cat classification when the model briefly calls that animal a dog or bird; spatially separate animals retain their own types.
-Before saving a dog-only detection, Camera Viewer checks sampled frames from its recorded clip at a lower recognition threshold and classifies it as a cat when multiple frames show the same animal as a cat.
+Cats, dogs, and birds recognized by the model are reported as animals without naming the species, because dark animals in infrared images are often confused.
 Event excerpts include up to five seconds before and after the detected passage and are stored without audio in `Videos/O-KAM Linux/Detections`, using the system's configured Videos folder.
-The `Detections` folder groups excerpts by day in `YYYY-MM-DD` folders, then in `cat`, `dog`, `bird`, and `person` folders; clips with multiple types use a combined folder such as `cat_person`, and each clip name starts with its type and camera name.
+The `Detections` folder groups excerpts by day in `YYYY-MM-DD` folders, then in `animal` and `person` folders; clips with both types use the `animal_person` folder, and each clip name starts with its type and camera name.
+Each day folder also contains a hidden `.metadata` folder describing its detections for the playback timeline.
 Local detections appear in red on the local playback timeline, and its Previous and Next buttons jump between detected passages.
 The notification opens the excerpt for the affected camera, including when the viewer was hidden in the notification area.
 Local detection clips and metadata are kept until deleted manually; the playback timeline shows detections from the last 24 hours, and turning off continuous recording pauses local analysis.
