@@ -31,7 +31,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import BinaryIO, Callable
 from datetime import datetime, timedelta, timezone
 
-from PyQt6.QtCore import QEvent, QMetaType, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QEvent, QMargins, QMetaType, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
     QAction,
     QDesktopServices,
@@ -135,6 +135,9 @@ CAMERA_PROFILES_SETTING = "view/camera_profiles"
 CAMERA_PROFILE_NAME_LIMIT = 60
 CAMERA_PROFILE_NAME_MESSAGE = "Enter a profile name."
 CAMERA_PROFILE_REPLACE_MESSAGE = "The existing profile with this name will be replaced."
+FULLSCREEN_ALIGNMENT_SETTING = "view/fullscreen_alignment"
+FULLSCREEN_ALIGNMENTS = ("top", "center", "bottom")
+FULLSCREEN_DEFAULT_ALIGNMENT = "center"
 LOG = logging.getLogger("okam-linux")
 LOG_DIRECTORY = Path.home() / ".cache/okam-linux"
 LOG_FILE_NAME = "okam-linux.log"
@@ -835,6 +838,42 @@ def save_camera_profiles(settings: QSettings, profiles: list[CameraProfile]) -> 
     ordered = sorted(profiles, key=lambda profile: profile.name.casefold())
     settings.setValue(CAMERA_PROFILES_SETTING, json.dumps([asdict(profile) for profile in ordered], ensure_ascii=False))
     settings.sync()
+
+
+def fullscreen_alignment_records(settings: QSettings) -> list[dict]:
+    try:
+        records = json.loads(settings.value(FULLSCREEN_ALIGNMENT_SETTING, "[]", str))
+    except (ValueError, TypeError):
+        return []
+    return [
+        record for record in records if isinstance(record, dict) and record.get("layout") in CAMERA_LAYOUT_VALUES
+        and isinstance(record.get("cameras"), list) and record.get("alignment") in FULLSCREEN_ALIGNMENTS
+    ] if isinstance(records, list) else []
+
+
+def load_fullscreen_alignment(settings: QSettings, layout: str, cameras: tuple[str, ...]) -> str:
+    key = sorted(cameras)
+    return next((record["alignment"] for record in fullscreen_alignment_records(settings)
+                 if record["layout"] == layout and record["cameras"] == key), FULLSCREEN_DEFAULT_ALIGNMENT)
+
+
+def save_fullscreen_alignment(settings: QSettings, layout: str, cameras: tuple[str, ...], alignment: str) -> None:
+    key = sorted(cameras)
+    records = [record for record in fullscreen_alignment_records(settings)
+               if record["layout"] != layout or record["cameras"] != key]
+    if alignment != FULLSCREEN_DEFAULT_ALIGNMENT:
+        records.append({"layout": layout, "cameras": key, "alignment": alignment})
+    settings.setValue(FULLSCREEN_ALIGNMENT_SETTING, json.dumps(records))
+    settings.sync()
+
+
+def dragged_fullscreen_alignment(alignment: str, slack: int, dy: int) -> str:
+    index = FULLSCREEN_ALIGNMENTS.index(alignment)
+    candidates = range(index) if dy < 0 else range(index + 1, len(FULLSCREEN_ALIGNMENTS))
+    if not dy or not candidates:
+        return alignment
+    position = index * slack / 2 + dy
+    return FULLSCREEN_ALIGNMENTS[min(candidates, key=lambda candidate: abs(candidate * slack / 2 - position))]
 
 
 def camera_continuous_allowed(camera: AccountDevice | RtspCamera) -> bool:
@@ -2646,7 +2685,7 @@ class VideoWidget(QWidget):
     drag_moved = pyqtSignal(int, int)
     wheel_zoomed = pyqtSignal(int, int, int)
     double_clicked = pyqtSignal(int, int)
-    camera_drop_requested = pyqtSignal(str, QPoint)
+    camera_drop_requested = pyqtSignal(str, QPoint, QPoint)
 
     def __init__(self) -> None:
         super().__init__()
@@ -2856,7 +2895,7 @@ class VideoWidget(QWidget):
             self.unsetCursor()
             if self.drag_exceeded or abs(dx) + abs(dy) >= QApplication.startDragDistance():
                 self.click_timer.stop()
-                self.camera_drop_requested.emit(self.drag_camera_uid, self.mapToGlobal(QPoint(x, y)))
+                self.camera_drop_requested.emit(self.drag_camera_uid, self.mapToGlobal(QPoint(x, y)), QPoint(dx, dy))
                 return
         if self.drag_button == Qt.MouseButton.RightButton:
             if abs(dx) >= DRAG_PIXELS_PER_STEP // 2 or abs(dy) >= DRAG_PIXELS_PER_STEP // 2:
@@ -6204,6 +6243,7 @@ class MainWindow(QMainWindow):
 
     def update_camera_mask(self) -> None:
         self.video_grid.activate()
+        self.align_fullscreen_videos()
         self.place_video_overlays()
         count = len(self.visible_devices())
         if self.isFullScreen() or self.effective_camera_layout() != "grid" or not count:
@@ -6245,7 +6285,7 @@ class MainWindow(QMainWindow):
         self.settings.sync()
         self.sync_previews()
 
-    def drop_camera(self, source_uid: str, position: QPoint) -> None:
+    def drop_camera(self, source_uid: str, position: QPoint, offset: QPoint) -> None:
         visible = self.visible_devices()
         if not self.isVisible() or len(visible) < 2 or source_uid not in {camera.uid for camera in visible}:
             return
@@ -6255,6 +6295,43 @@ class MainWindow(QMainWindow):
             if pane is not None and pane.isVisible() and QRect(pane.mapToGlobal(QPoint()), pane.size()).contains(position):
                 self.swap_cameras(source_uid, camera.uid)
                 return
+        self.drop_fullscreen_videos(position, offset)
+
+    def fullscreen_alignment(self) -> str:
+        cameras, layout = self.current_camera_view()
+        return load_fullscreen_alignment(self.settings, layout, cameras)
+
+    def fullscreen_video_slack(self) -> int:
+        self.video_grid.activate()
+        if not self.isFullScreen() or not self.visible_devices():
+            return 0
+        area = self.video_grid.geometry()
+        columns, rows = self.camera_grid_dimensions()
+        height = rows * round(area.width() / columns * VIDEO_ASPECT_HEIGHT / VIDEO_ASPECT_WIDTH)
+        return max(0, area.height() - height)
+
+    def align_fullscreen_videos(self) -> None:
+        slack = self.fullscreen_video_slack()
+        top = FULLSCREEN_ALIGNMENTS.index(self.fullscreen_alignment()) * slack // 2
+        margins = QMargins(0, top, 0, slack - top)
+        if self.video_grid.contentsMargins() != margins:
+            self.video_grid.setContentsMargins(margins)
+            self.video_grid.activate()
+            self.layout().activate()
+
+    def drop_fullscreen_videos(self, position: QPoint, offset: QPoint) -> None:
+        slack = self.fullscreen_video_slack()
+        origin = self.centralWidget().mapToGlobal(QPoint())
+        area = self.video_grid.geometry().translated(origin)
+        if not slack or not area.contains(position) or self.video_grid.contentsRect().translated(origin).contains(position):
+            return
+        current = self.fullscreen_alignment()
+        alignment = dragged_fullscreen_alignment(current, slack, offset.y())
+        if alignment == current:
+            return
+        cameras, layout = self.current_camera_view()
+        save_fullscreen_alignment(self.settings, layout, cameras, alignment)
+        self.update_camera_mask()
 
     def _retire_preview(self, preview: CameraPreview) -> None:
         self.close_local_replay(preview.camera.uid)
@@ -7380,6 +7457,7 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.Type.WindowStateChange:
             self.centralWidget().setStyleSheet("background-color: black;" if self.isFullScreen()
                                               else "background-color: #171717;")
+            self.align_fullscreen_videos()
             self.camera_mask_timer.start(0)
             if self.isMinimized():
                 self.overlay_timer.stop()

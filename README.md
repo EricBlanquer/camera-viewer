@@ -95,6 +95,9 @@ Use the right mouse button to drag the zoomed image or move a supported camera w
 The camera panes share the available space equally in a side-by-side layout.
 Each camera has its own local playback, photo, recording, and zoom controls.
 Double-click a live or playback video to enter or leave full-screen view.
+Full-screen view centers the videos vertically when the screen leaves space above or below them.
+With multiple cameras displayed, drag a video into the space above or below the videos to align them at the top, center, or bottom; the position nearest to the drop in the drag direction is chosen.
+The vertical position is remembered for each camera layout and set of displayed cameras, regardless of their order.
 Control overlays use the same width and height for equal-sized live videos, with spacing and button widths adapting to fit inside each video.
 All panes use the same inline movement panel and translucent controls, with directions and saved positions shown according to the connected camera's capabilities.
 Compatible RTSP panes also have sound and vertical tilt, native iCam365 panes have pan-and-tilt and their camera's saved positions, and O-KAM panes have pan-and-tilt, saved positions, and light when supported.
