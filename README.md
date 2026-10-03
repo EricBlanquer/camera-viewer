@@ -172,9 +172,12 @@ Each camera keeps its 16:9 ratio in single-camera and multi-camera views, includ
 Connection state, playback loading, and errors appear over the affected video.
 Click the video to show or hide the translucent control bar.
 Live video starts automatically, and the viewer reconnects by itself after a network or transport interruption.
+RTSP and native iCam365 live views stay close to real time: when received video waits in the player, playback runs up to 1.5 times faster until only the buffer covering the camera's network pauses of the last twelve seconds remains.
+A muted camera plays without its audio track, so its picture follows the computer clock instead of the camera's audio clock; turning the sound on plays picture and sound in sync.
 RTSP and native iCam365 live views also reconnect when playback accumulates at least six seconds of additional delay for three seconds.
 The delay is measured against monotonic elapsed time and the fastest observed playback position, independently of the camera's displayed clock and initial connection delay.
 Reconnecting closes the current recording segment and starts a fresh transport, player, and continuous recording segment.
+An O-KAM camera closes a live session that sends it no request for two minutes; the viewer requests the camera status every 45 seconds to keep each O-KAM live session open.
 Each video keeps its last decoded camera image during reconnection and replaces it when the new player has a frame.
 The connection message identifies this paused image; changing or stopping a camera clears it.
 Use **Full screen** to expand the viewer.

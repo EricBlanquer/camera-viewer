@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from app import LiveLatencyGuard, RtspCamera, RtspStreamWorker
+from app import LiveCatchUp, LiveLatencyGuard, RtspCamera, RtspStreamWorker
 
 
 class LiveLatencyGuardTest(unittest.TestCase):
@@ -52,6 +52,33 @@ class LiveLatencyGuardTest(unittest.TestCase):
                 guard.observe(7, 114)
 
 
+class LiveCatchUpTest(unittest.TestCase):
+    def test_buffered_delay_speeds_playback_after_the_observation_period(self):
+        catch_up = LiveCatchUp()
+        self.assertEqual([catch_up.speed(3.0, now) for now in (100, 102, 104.9)], [1.0, 1.0, 1.0])
+        self.assertEqual(catch_up.speed(3.0, 105), 1.5)
+        self.assertEqual(catch_up.speed(0.9, 106), 1.15)
+        self.assertEqual(catch_up.speed(0.36, 107), 1.05)
+        self.assertEqual(catch_up.speed(0.35, 108), 1.0)
+
+    def test_recent_low_buffer_keeps_normal_speed_until_it_leaves_the_window(self):
+        catch_up = LiveCatchUp()
+        catch_up.speed(0.1, 100)
+        for now in range(101, 113):
+            self.assertEqual(catch_up.speed(2.0, now), 1.0)
+        self.assertEqual(catch_up.speed(2.0, 112.1), 1.45)
+
+    def test_unavailable_or_invalid_buffer_restarts_the_observation(self):
+        for missing in (None, "unknown", True, float("nan"), float("inf")):
+            catch_up = LiveCatchUp()
+            catch_up.speed(3.0, 100)
+            self.assertEqual(catch_up.speed(3.0, 105), 1.5)
+            self.assertEqual(catch_up.speed(missing, 106), 1.0)
+            self.assertEqual(catch_up.speed(3.0, 107), 1.0)
+            self.assertEqual(catch_up.speed(3.0, 111.9), 1.0)
+            self.assertEqual(catch_up.speed(3.0, 112), 1.5)
+
+
 class StreamClock:
     def __init__(self):
         self.now = 100.0
@@ -64,7 +91,7 @@ class StreamClock:
 
 
 class LiveLatencyWorkerTest(unittest.TestCase):
-    def test_advancing_but_delayed_video_reconnects_and_closes_transport(self):
+    def run_worker(self, properties):
         clock = StreamClock()
         worker = RtspStreamWorker(
             RtspCamera("test", "Entrance", "rtsp://example.invalid/live"),
@@ -73,12 +100,14 @@ class LiveLatencyWorkerTest(unittest.TestCase):
         worker.stop_requested = clock
         failures = []
         worker.failed.connect(failures.append)
+        speeds = []
 
         def request(path, command):
-            if command == ["get_property", "vo-configured"]:
-                return True, True
-            if command == ["get_property", "time-pos"]:
-                return True, (clock.now - 100) / 2
+            if command[:2] == ["set_property", "speed"]:
+                speeds.append(command[2])
+                return True, None
+            if command[0] == "get_property" and command[1] in properties:
+                return True, properties[command[1]](clock.now)
             return False, None
 
         with patch("app.get_bridge", return_value=None), \
@@ -91,10 +120,26 @@ class LiveLatencyWorkerTest(unittest.TestCase):
                 patch("app.time.monotonic", side_effect=lambda: clock.now), \
                 patch.object(worker, "_stop_recording") as stop_recording:
             worker.run()
+        return failures, speeds, close_bridge, stop_recording
+
+    def test_advancing_but_delayed_video_reconnects_and_closes_transport(self):
+        failures, _, close_bridge, stop_recording = self.run_worker({
+            "vo-configured": lambda now: True,
+            "time-pos": lambda now: (now - 100) / 2,
+        })
         self.assertEqual(len(failures), 1)
         self.assertIn("playback delay", failures[0])
         close_bridge.assert_called_once_with("test")
         stop_recording.assert_called_once_with()
+
+    def test_buffered_live_video_plays_faster_until_it_reaches_live(self):
+        failures, speeds, _, _ = self.run_worker({
+            "vo-configured": lambda now: True,
+            "time-pos": lambda now: now - 100,
+            "demuxer-cache-duration": lambda now: 2.0 if now < 110 else 0.2,
+        })
+        self.assertEqual(failures, [])
+        self.assertEqual(speeds, [1.45, 1.0])
 
 
 if __name__ == "__main__":

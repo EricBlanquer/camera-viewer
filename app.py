@@ -176,9 +176,21 @@ DRAG_PIXELS_PER_STEP = 90
 MAX_DRAG_STEPS = 4
 VIDEO_READ_TIMEOUT_SECONDS = 2
 VIDEO_STALL_SECONDS = 12
+CAMERA_KEEP_ALIVE_SECONDS = 45
 RTSP_STALL_SECONDS = 10
 RTSP_MAX_ACCUMULATED_DELAY_SECONDS = 6
 RTSP_DELAY_CONFIRM_SECONDS = 3
+LIVE_READAHEAD_SECONDS = 10
+LIVE_BUFFER_SECONDS = 0.25
+LIVE_BUFFER_TOLERANCE_SECONDS = 0.1
+LIVE_BUFFER_WINDOW_SECONDS = 12
+LIVE_BUFFER_OBSERVATION_SECONDS = 5
+LIVE_BOOST_PER_BUFFERED_SECOND = 0.25
+LIVE_MIN_BOOST = 0.05
+LIVE_MAX_BOOST = 0.5
+LIVE_SPEED_STEP = 0.05
+MPV_AUDIO_TRACK_ON = "auto"
+MPV_AUDIO_TRACK_OFF = "no"
 RTSP_AUDIO_FILTER = "--af=lavfi=[volume=25dB,alimiter=limit=0.95]"
 AUDIO_RESPONSE_COMMAND = 0x6031
 RECONNECT_MAX_SECONDS = 30
@@ -703,6 +715,8 @@ def mpv_rtsp_command(
     command.remove("--untimed")
     command.remove("--no-audio")
     command.insert(-1, "--mute=no" if sound_enabled else "--mute=yes")
+    command.insert(-1, f"--aid={MPV_AUDIO_TRACK_ON if sound_enabled else MPV_AUDIO_TRACK_OFF}")
+    command.insert(-1, f"--demuxer-readahead-secs={LIVE_READAHEAD_SECONDS}")
     command.insert(-1, RTSP_AUDIO_FILTER)
     command.insert(-1, RTSP_DENOISE_FILTER)
     if camera.provider == IMOU_ACCOUNT_PROVIDER:
@@ -1128,6 +1142,11 @@ def dragged_video_pan(
 ) -> tuple[float, float]:
     scale = 2 ** (level / 2)
     return (pan[0] + dx / max(1, width * scale), pan[1] + dy / max(1, height * scale))
+
+
+def set_mpv_sound(command: Callable[[list[object]], bool], enabled: bool) -> bool:
+    return (command(["set_property", "aid", MPV_AUDIO_TRACK_ON if enabled else MPV_AUDIO_TRACK_OFF])
+            and command(["set_property", "mute", not enabled]))
 
 
 def apply_mpv_video_pan(
@@ -1978,12 +1997,16 @@ class StreamWorker(QThread):
                 raise P2PError("The camera rejected the live stream request.")
             received_video = False
             last_video = time.monotonic()
+            last_keep_alive = last_video
             frame_reader = CameraFrameReader()
             while not self.stop_requested.is_set():
                 self._process_control(session, login.user, login.password)
                 self._process_setting(session, login.user, login.password)
                 self._process_detections(session, login.user, login.password)
                 self._update_sound(session, login.user, login.password)
+                if time.monotonic() - last_keep_alive >= CAMERA_KEEP_ALIVE_SECONDS:
+                    self._keep_session_open(session, login.user, login.password)
+                    last_keep_alive = time.monotonic()
                 try:
                     frame, frame_type = frame_reader.read(session)
                 except CS2Timeout:
@@ -2052,6 +2075,10 @@ class StreamWorker(QThread):
                 except CS2Error:
                     pass
             session.close()
+
+    def _keep_session_open(self, session: CS2Session, user: str, password: str) -> None:
+        write_command(session, make_cgi_request(CAMERA_STATUS_PATH, user, password))
+        read_response_fields(session, LOGIN_RESPONSE_COMMAND, {}, SETTING_RESPONSE_SECONDS)
 
     def _process_detections(self, session: CS2Session, user: str, password: str) -> None:
         days = self.detection_days
@@ -3493,6 +3520,24 @@ class LiveLatencyGuard:
             raise OSError(f"Live playback delay increased by {delay:.1f}s. Reconnecting to live video.")
 
 
+class LiveCatchUp:
+    def __init__(self) -> None:
+        self.levels: deque[tuple[float, float]] = deque()
+
+    def speed(self, buffered: object, now: float) -> float:
+        if not isinstance(buffered, (int, float)) or isinstance(buffered, bool) or not math.isfinite(buffered):
+            self.levels.clear()
+            return 1.0
+        self.levels.append((now, buffered))
+        while now - self.levels[0][0] > LIVE_BUFFER_WINDOW_SECONDS:
+            self.levels.popleft()
+        excess = min(level for _, level in self.levels) - LIVE_BUFFER_SECONDS
+        if now - self.levels[0][0] < LIVE_BUFFER_OBSERVATION_SECONDS or excess <= LIVE_BUFFER_TOLERANCE_SECONDS:
+            return 1.0
+        boost = min(LIVE_MAX_BOOST, max(LIVE_MIN_BOOST, excess * LIVE_BOOST_PER_BUFFERED_SECOND))
+        return round(1 + round(boost / LIVE_SPEED_STEP) * LIVE_SPEED_STEP, 2)
+
+
 class RtspStreamWorker(QThread):
     status_changed = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -3827,6 +3872,8 @@ class RtspStreamWorker(QThread):
             last_position = None
             last_progress_at = time.monotonic()
             latency_guard = LiveLatencyGuard()
+            catch_up = LiveCatchUp()
+            playback_speed = 1.0
             pending_light = None
             pending_ptz = None
             while not self.stop_requested.is_set():
@@ -3844,6 +3891,7 @@ class RtspStreamWorker(QThread):
                     try:
                         self._change_imou_quality(quality)
                         latency_guard = LiveLatencyGuard()
+                        catch_up = LiveCatchUp()
                         last_progress_at = time.monotonic()
                         self.setting_completed.emit(setting, quality)
                     except OSError as ex:
@@ -3914,6 +3962,10 @@ class RtspStreamWorker(QThread):
                     last_progress_at = time.monotonic()
                 elif time.monotonic() - last_progress_at > RTSP_STALL_SECONDS:
                     raise OSError("The RTSP video stream stopped producing frames.")
+                buffer_ready, buffered = mpv_request(self.socket_path, ["get_property", "demuxer-cache-duration"])
+                speed = catch_up.speed(buffered if buffer_ready else None, time.monotonic())
+                if speed != playback_speed and mpv_request(self.socket_path, ["set_property", "speed", speed])[0]:
+                    playback_speed = speed
                 self._update_continuous(time.monotonic())
                 update_local_detector(self, self.camera, self._local_detection_source)
                 if self.recording_request != self.recording_path:
@@ -4400,7 +4452,7 @@ class CameraPreview(QWidget):
 
     def toggle_sound(self) -> None:
         if isinstance(self.worker, RtspStreamWorker):
-            if self._mpv_command(["set_property", "mute", self.sound_enabled]):
+            if set_mpv_sound(self._mpv_command, not self.sound_enabled):
                 self._on_sound_changed(not self.sound_enabled)
             else:
                 self._on_sound_failed("Unable to change camera sound")
@@ -7556,7 +7608,7 @@ class MainWindow(QMainWindow):
 
     def toggle_sound(self) -> None:
         if isinstance(self.stream_worker, RtspStreamWorker):
-            if self._mpv_command(["set_property", "mute", self.sound_enabled]):
+            if set_mpv_sound(self._mpv_command, not self.sound_enabled):
                 self.on_sound_changed(not self.sound_enabled)
             else:
                 self.on_sound_failed("Unable to change camera sound.")

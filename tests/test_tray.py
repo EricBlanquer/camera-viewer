@@ -184,6 +184,8 @@ class TrayTest(unittest.TestCase):
         command = mpv_rtsp_command(Path("/tmp/control.sock"), 1, True, camera)
         self.assertIn("--rtsp-transport=tcp", command)
         self.assertIn("--mute=yes", command)
+        self.assertIn("--aid=no", command)
+        self.assertIn("--demuxer-readahead-secs=10", command)
         self.assertIn(RTSP_DENOISE_FILTER, command)
         self.assertNotIn("--no-audio", command)
         with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:
@@ -202,6 +204,7 @@ class TrayTest(unittest.TestCase):
         self.assertTrue(restarted.sound_enabled)
         command = mpv_rtsp_command(Path("/tmp/control.sock"), 1, True, camera, restarted.sound_enabled)
         self.assertIn("--mute=no", command)
+        self.assertIn("--aid=auto", command)
         self.assertIn("--af=lavfi=[volume=25dB,alimiter=limit=0.95]", command)
         restarted.close()
         self.window.selected_device = camera
@@ -224,7 +227,7 @@ class TrayTest(unittest.TestCase):
         def request(_socket: Path, command: list[object]) -> tuple[bool, object]:
             if command[1] == "time-pos":
                 positions.append(True)
-            return True, {"vo-configured": True, "track-list": [], "time-pos": 0}[command[1]]
+            return True, {"vo-configured": True, "track-list": [], "time-pos": 0, "demuxer-cache-duration": 0}[command[1]]
         with patch("app.mpv_request", side_effect=request), patch("app.icam365_light_request", return_value=False), patch(
             "app.prune_continuous_recordings"
         ), patch("app.time.monotonic", side_effect=itertools.count(100, 5).__next__):
@@ -496,7 +499,16 @@ class TrayTest(unittest.TestCase):
         self.assertFalse(preview.sound_button.isHidden())
         with patch("app.mpv_request", return_value=(True, None)) as request:
             preview.sound_button.click()
-            self.assertEqual(request.call_args.args[1], ["set_property", "mute", False])
+            self.assertEqual(
+                [call.args[1] for call in request.call_args_list[-2:]],
+                [["set_property", "aid", "auto"], ["set_property", "mute", False]],
+            )
+            preview.sound_button.click()
+            self.assertEqual(
+                [call.args[1] for call in request.call_args_list[-2:]],
+                [["set_property", "aid", "no"], ["set_property", "mute", True]],
+            )
+            preview.sound_button.click()
         self.assertTrue(preview.sound_enabled)
         fullscreen: list[bool] = []
         preview.fullscreen_requested.connect(lambda: fullscreen.append(True))
