@@ -228,6 +228,7 @@ The check uses the live connection.
 Camera Viewer records every checked live camera continuously on this computer, in ten-minute Matroska files in the desktop's `Videos/O-KAM Linux/Continuous` folder, and deletes files older than 24 hours.
 This keeps a copy of the last day even if the camera and its microSD card are taken, as long as the computer and the application are running.
 The tray menu switches continuous recording on or off and opens the recordings folder.
+If a camera's recording process stops, that camera's recording restarts after five seconds; only the tray menu changes the continuous recording setting.
 A segment interrupted by a crash or power loss is recovered at the next start.
 The first check only records the latest existing detection, so older events are not announced.
 

@@ -339,6 +339,7 @@ CONTINUOUS_TIME_FORMAT = "%Y%m%d_%H%M%S"
 CONTINUOUS_NAME_PATTERN = re.compile(r"[^/]+_(\d{8}_\d{6})\.mkv")
 CONTINUOUS_SEGMENT_SECONDS = 10 * 60
 CONTINUOUS_RETENTION = timedelta(hours=24)
+CONTINUOUS_RETRY_SECONDS = 5
 REPLAY_FILE_IDLE_SECONDS = 5
 CONTINUOUS_SETTING = "recording/continuous"
 DETECTION_SETTING = "detections/last_seen"
@@ -3528,6 +3529,7 @@ class RtspStreamWorker(QThread):
         self.recording_path: Path | None = None
         self.recording_announced = False
         self.continuous: subprocess.Popen[bytes] | None = None
+        self.continuous_retry_at = 0.0
         self.light_lock = threading.Lock()
         self.light_request: str | None = None
         self.ptz_lock = threading.Lock()
@@ -3738,6 +3740,27 @@ class RtspStreamWorker(QThread):
             if tunnel is not None:
                 tunnel.close()
 
+    def _update_continuous(self, now: float) -> None:
+        if self.continuous is not None and self.continuous.poll() is not None:
+            exit_code = self.continuous.returncode
+            self._finish_recording_process(self.continuous)
+            self.continuous = None
+            self.continuous_retry_at = now + CONTINUOUS_RETRY_SECONDS
+            LOG.info("Continuous RTSP recording stopped for %s with exit code %s", self.camera.name, exit_code)
+            self.continuous_failed.emit("Continuous RTSP recording stopped.")
+        if self.continuous_enabled.is_set() and self.continuous is None and now >= self.continuous_retry_at:
+            try:
+                directory = continuous_directory()
+                pattern = directory / f"{safe_camera_name(self.camera.name)}_{self.camera.uid[5:13]}_%Y%m%d_%H%M%S.mkv"
+                self.continuous = self._ffmpeg(pattern, True)
+            except OSError as ex:
+                self.continuous_retry_at = now + CONTINUOUS_RETRY_SECONDS
+                LOG.info("Continuous RTSP recording could not start: %s", ex)
+                self.continuous_failed.emit("Unable to start continuous RTSP recording.")
+        elif not self.continuous_enabled.is_set() and self.continuous is not None:
+            self._finish_recording_process(self.continuous)
+            self.continuous = None
+
     def _stop_recording(self) -> None:
         process = self.recording
         path = self.recording_path
@@ -3891,23 +3914,7 @@ class RtspStreamWorker(QThread):
                     last_progress_at = time.monotonic()
                 elif time.monotonic() - last_progress_at > RTSP_STALL_SECONDS:
                     raise OSError("The RTSP video stream stopped producing frames.")
-                if self.continuous_enabled.is_set() and self.continuous is None:
-                    try:
-                        directory = continuous_directory()
-                        pattern = directory / f"{safe_camera_name(self.camera.name)}_{self.camera.uid[5:13]}_%Y%m%d_%H%M%S.mkv"
-                        self.continuous = self._ffmpeg(pattern, True)
-                    except OSError as ex:
-                        self.continuous_enabled.clear()
-                        LOG.info("Continuous RTSP recording could not start: %s", ex)
-                        self.continuous_failed.emit("Unable to start continuous RTSP recording.")
-                elif not self.continuous_enabled.is_set() and self.continuous is not None:
-                    self._finish_recording_process(self.continuous)
-                    self.continuous = None
-                if self.continuous is not None and self.continuous.poll() is not None:
-                    self._finish_recording_process(self.continuous)
-                    self.continuous = None
-                    self.continuous_enabled.clear()
-                    self.continuous_failed.emit("Continuous RTSP recording stopped.")
+                self._update_continuous(time.monotonic())
                 update_local_detector(self, self.camera, self._local_detection_source)
                 if self.recording_request != self.recording_path:
                     self._stop_recording()
@@ -7385,10 +7392,6 @@ class MainWindow(QMainWindow):
         self.show_notice(message)
 
     def on_continuous_failed(self, message: str) -> None:
-        if hasattr(self, "continuous_action"):
-            self.continuous_action.setChecked(False)
-        else:
-            self.set_continuous_recording(False)
         self.show_notice(message)
 
     def change_zoom(self, step: int, x: int | None = None, y: int | None = None) -> None:

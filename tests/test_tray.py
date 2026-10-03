@@ -683,6 +683,61 @@ class TrayTest(unittest.TestCase):
         self.window.set_continuous_recording(True)
         self.assertTrue(preview.continuous_enabled)
 
+    def test_selected_camera_recording_failure_keeps_continuous_recording_enabled(self) -> None:
+        entrance = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
+        garden = RtspCamera("rtsp:garden", "Jardin", "rtsp://192.0.2.11:8001/0")
+        self.window.devices = [entrance, garden]
+        self.window.selected_device = entrance
+        with patch.object(CameraPreview, "start"):
+            self.window.sync_previews()
+        self.window.continuous_action.setChecked(True)
+        self.window.on_continuous_failed("Continuous RTSP recording stopped.")
+        self.assertTrue(self.window.continuous_action.isChecked())
+        self.assertTrue(self.window.continuous_recording_enabled())
+        self.assertTrue(self.window.previews[garden.uid].continuous_enabled)
+
+    def test_stopped_continuous_rtsp_recording_restarts_after_a_delay(self) -> None:
+        camera = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
+        worker = RtspStreamWorker(camera, Mock(), Path("/tmp/intraswitch_okam_test.sock"))
+        worker.set_continuous(True)
+        failures = []
+        worker.continuous_failed.connect(failures.append)
+        stopped = Mock(returncode=1)
+        stopped.poll.return_value = 1
+        restarted = Mock()
+        restarted.poll.return_value = None
+        with patch.object(worker, "_ffmpeg", side_effect=[stopped, restarted]) as ffmpeg, patch.object(
+            worker, "_finish_recording_process"
+        ), patch("app.continuous_directory", return_value=Path(self.settings_directory.name)):
+            worker._update_continuous(100.0)
+            self.assertIs(worker.continuous, stopped)
+            worker._update_continuous(101.0)
+            self.assertIsNone(worker.continuous)
+            self.assertEqual(failures, ["Continuous RTSP recording stopped."])
+            self.assertTrue(worker.continuous_enabled.is_set())
+            worker._update_continuous(105.9)
+            self.assertEqual(ffmpeg.call_count, 1)
+            worker._update_continuous(106.0)
+        self.assertIs(worker.continuous, restarted)
+        self.assertEqual(ffmpeg.call_count, 2)
+
+    def test_continuous_rtsp_recording_start_failure_is_retried(self) -> None:
+        camera = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
+        worker = RtspStreamWorker(camera, Mock(), Path("/tmp/intraswitch_okam_test.sock"))
+        worker.set_continuous(True)
+        restarted = Mock()
+        restarted.poll.return_value = None
+        with patch.object(worker, "_ffmpeg", side_effect=[OSError("ffmpeg unavailable"), restarted]), patch(
+            "app.continuous_directory", return_value=Path(self.settings_directory.name)
+        ):
+            worker._update_continuous(100.0)
+            self.assertIsNone(worker.continuous)
+            self.assertTrue(worker.continuous_enabled.is_set())
+            worker._update_continuous(104.9)
+            self.assertIsNone(worker.continuous)
+            worker._update_continuous(105.0)
+        self.assertIs(worker.continuous, restarted)
+
     def test_local_replay_stays_in_its_camera_pane(self) -> None:
         camera = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
         recording = Path(self.settings_directory.name) / "Entrée_entrance_20260927_180000.mkv"
