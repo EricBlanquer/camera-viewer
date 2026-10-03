@@ -21,6 +21,8 @@
 
 namespace {
 const size_t MAX_FRAME_BYTES = 8 * 1024 * 1024;
+const int MAX_OUTPUT_WIDTH = 1920;
+const int MAX_OUTPUT_HEIGHT = 1080;
 uint16_t NetworkOrder(uint16_t value) { return static_cast<uint16_t>((value >> 8) | (value << 8)); }
 std::string BufferBytes(const pp::Var& value) {
   if (!value.is_array_buffer()) return std::string();
@@ -148,11 +150,15 @@ class Transport : public pp::Instance {
       pp::Var generation = message.Get("generation");
       pp::Var key = message.Get("key");
       pp::Var burst = message.Get("burst");
+      pp::Var max_width = message.Get("max_width");
+      pp::Var max_height = message.Get("max_height");
       if (!codec.is_int() || (codec.AsInt() != 27 && codec.AsInt() != 36) || !generation.is_int() || !key.is_bool()) return;
+      if (!max_width.is_int() || max_width.AsInt() < 1 || max_width.AsInt() > MAX_OUTPUT_WIDTH) return;
+      if (!max_height.is_int() || max_height.AsInt() < 1 || max_height.AsInt() > MAX_OUTPUT_HEIGHT) return;
       std::string data = BufferBytes(message.Get("data"));
       if (data.empty() || data.size() > MAX_FRAME_BYTES) return;
       if (!decoders_.count(stream)) decoders_[stream].reset(new VideoDecoder(this, stream));
-      decoders_[stream]->Submit(data, codec.AsInt(), generation.AsInt(), key.AsBool(), burst.is_bool() && burst.AsBool());
+      decoders_[stream]->Submit(data, codec.AsInt(), generation.AsInt(), key.AsBool(), burst.is_bool() && burst.AsBool(), max_width.AsInt(), max_height.AsInt());
     }
   }
   void TcpData(int id, const char* bytes, size_t size) {

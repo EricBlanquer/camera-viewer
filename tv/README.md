@@ -25,7 +25,7 @@ The Imou decoder can queue up to 32 frames for TCP bursts, with a 16 MiB compres
 Entrée (iCam365, HEVC main stream), Jardin (O-KAM, H.264), Salon (local Imou Life, HEVC main stream), and Cuisine (local Imou Life, TLS and HEVC main stream) were connected simultaneously from a Samsung QE55Q85RATXXC with Tizen 5.0.
 The iCam365 session selects the same HD stream as the desktop viewer after each successful authentication.
 Simultaneous playback through AVPlay on this TV stopped one feed while packets continued arriving.
-The application therefore decodes the feeds on the TV using FFmpeg workers and renders them to independent canvases, at up to 960 × 540 pixels per cell.
+The application therefore decodes the feeds on the TV using FFmpeg workers and renders them to independent canvases, at up to 960 × 540 pixels per cell and 1920 × 1080 pixels in full screen.
 Four distinct camera connections and advancing decoded images were verified; remote networks remain unverified.
 Audio, PTZ, playback, recording, detection, and an on-TV account setup interface are outside this application's current scope.
 
@@ -103,7 +103,9 @@ Renew the provisioned iCam365 account session when its account token expires.
 
 ## Remote control
 
-The arrow keys select a cell, OK reconnects the selected camera, and Back exits the application.
+The arrow keys select a cell, and OK shows the selected camera in full screen.
+Back returns from full screen to the grid; from the grid, it exits the application.
+Other cameras stay connected in full screen, so the grid reappears without reconnecting.
 Hiding the application stops its sessions; returning to it connects again.
 Camera stop commands are acknowledged for up to five seconds before closing the native socket.
 

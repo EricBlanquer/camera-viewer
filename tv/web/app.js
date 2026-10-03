@@ -4,10 +4,16 @@ const debugPanel = document.getElementById("debug-panel");
 const logElement = document.getElementById("log");
 const STORAGE_KEY = "camera-viewer-config-v1";
 const GRID_SIZE = 4;
+const SCREEN_WIDTH = 1920;
+const SCREEN_HEIGHT = 1080;
+const KEY_ENTER = 13;
+const KEY_BACK = 10009;
+const FULL_SCREEN_CLASS = "full-screen";
 const events = [];
 let nativeReady = false;
 let cameras = [];
 let selected = 0;
+let fullScreen = null;
 function log(message) {
   events.push({ time: Date.now(), message });
   if (events.length > 100) events.shift();
@@ -43,6 +49,7 @@ function configure(configuration) {
   validateConfiguration(configuration);
   localStorage.setItem(STORAGE_KEY, JSON.stringify(configuration));
   cameras = configuration;
+  showGrid();
   connect();
   return cameras.length;
 }
@@ -115,11 +122,14 @@ class CameraPane {
     );
   }
   rectangle() {
+    if (fullScreen === this.index) {
+      return { x: 0, y: 0, width: SCREEN_WIDTH, height: SCREEN_HEIGHT };
+    }
     return {
-      x: this.index % 2 * 960,
-      y: Math.floor(this.index / 2) * 540,
-      width: 960,
-      height: 540,
+      x: this.index % 2 * SCREEN_WIDTH / 2,
+      y: Math.floor(this.index / 2) * SCREEN_HEIGHT / 2,
+      width: SCREEN_WIDTH / 2,
+      height: SCREEN_HEIGHT / 2,
     };
   }
   sameCamera(camera) {
@@ -184,6 +194,7 @@ class CameraPane {
     if (this.lastProgress === null) this.lastProgress = performance.now();
     this.metrics.frames++;
     this.metrics.bytes += payload.length;
+    const area = this.rectangle();
     transport.postMessage({
       command: "decode-video",
       stream: this.index,
@@ -191,6 +202,8 @@ class CameraPane {
       codec,
       key: CameraProtocol.isKeyframe(payload, codec),
       burst: this.camera.type === "imou",
+      max_width: area.width,
+      max_height: area.height,
       data: payload.buffer.slice(
         payload.byteOffset,
         payload.byteOffset + payload.byteLength,
@@ -318,11 +331,25 @@ function select(index) {
     pane.element.classList.toggle("selected", position === selected)
   );
 }
+function showFullScreen(index) {
+  if (!panes[index].camera) return;
+  fullScreen = index;
+  document.getElementById("grid").classList.add(FULL_SCREEN_CLASS);
+  panes[index].element.classList.add(FULL_SCREEN_CLASS);
+}
+function showGrid() {
+  if (fullScreen === null) return;
+  panes[fullScreen].element.classList.remove(FULL_SCREEN_CLASS);
+  document.getElementById("grid").classList.remove(FULL_SCREEN_CLASS);
+  fullScreen = null;
+}
 document.addEventListener("keydown", (event) => {
-  if (event.keyCode === 10009) {
+  if (event.keyCode === KEY_BACK && fullScreen !== null) showGrid();
+  else if (event.keyCode === KEY_BACK) {
     stop();
     tizen.application.getCurrentApplication().exit();
-  } else if (event.keyCode === 13) panes[selected].connect(cameras[selected]);
+  } else if (fullScreen !== null) return;
+  else if (event.keyCode === KEY_ENTER) showFullScreen(selected);
   else if ([37, 39].includes(event.keyCode)) select(selected ^ 1);
   else if ([38, 40].includes(event.keyCode)) select(selected ^ 2);
 });

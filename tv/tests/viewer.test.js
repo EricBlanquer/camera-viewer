@@ -9,6 +9,8 @@ function viewer() {
   const listeners = {};
   const intervals = [];
   const sessions = [];
+  const messages = [];
+  let exits = 0;
   let now = 0;
   function element() {
     const classes = new Set();
@@ -32,7 +34,7 @@ function viewer() {
       (id) => [id, element()],
     ),
   );
-  nodes.transport.postMessage = () => {};
+  nodes.transport.postMessage = (message) => messages.push(message);
   const document = {
     hidden: false,
     getElementById: (id) => nodes[id],
@@ -98,6 +100,15 @@ function viewer() {
     CameraProtocol: Object.assign({}, protocol, { NativeSession: Session }),
     ImouVideo: Object.assign({}, imou, { Session: ImouSession }),
     webapis: { network: { getIp: () => "192.0.2.10" } },
+    tizen: {
+      application: {
+        getCurrentApplication: () => ({
+          exit: () => {
+            exits++;
+          },
+        }),
+      },
+    },
     setInterval: (callback) => intervals.push(callback),
     clearInterval: () => {},
     setTimeout: () => 1,
@@ -144,6 +155,9 @@ function viewer() {
     nodes,
     sessions,
     intervals,
+    messages,
+    exits: () => exits,
+    press: (keyCode) => listeners.keydown({ keyCode }),
     pane: (index) => vm.runInContext("panes[" + index + "]", context),
     setTime: (value) => {
       now = value;
@@ -306,4 +320,68 @@ test("local Imou reconnects retain images only for the same local camera and cha
     await pane.connect({ ...camera, local: { ...camera.local, ...change } });
     assert.equal(pane.canvas.image, null);
   }
+});
+test("OK shows the selected camera in full screen and Back returns to the grid", async () => {
+  const app = viewer();
+  app.context.window.cameraViewer.configure([app.camera, {
+    ...app.camera,
+    name: "Garden",
+    p2p_id: "TEST-2-ABCDE",
+  }]);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  const garden = app.pane(1);
+  const session = garden.session;
+  const generation = garden.generation;
+  const decodeSize = () => {
+    session.callbacks.video(new Uint8Array([0, 0, 0, 1, 0x65, 0]), 27);
+    const message = app.messages.at(-1);
+    return [message.stream, message.max_width, message.max_height];
+  };
+  assert.deepEqual(decodeSize(), [1, 960, 540]);
+  app.press(39);
+  app.press(13);
+  assert.equal(app.nodes.grid.classList.contains("full-screen"), true);
+  assert.equal(garden.element.classList.contains("full-screen"), true);
+  assert.equal(app.pane(0).element.classList.contains("full-screen"), false);
+  assert.equal(garden.session, session);
+  assert.equal(garden.generation, generation);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(app.context.window.cameraViewer.state()[1]))
+      .rectangle,
+    { x: 0, y: 0, width: 1920, height: 1080 },
+  );
+  assert.deepEqual(decodeSize(), [1, 1920, 1080]);
+  app.press(37);
+  assert.equal(garden.element.classList.contains("selected"), true);
+  assert.equal(garden.element.classList.contains("full-screen"), true);
+  app.press(10009);
+  assert.equal(app.nodes.grid.classList.contains("full-screen"), false);
+  assert.equal(garden.element.classList.contains("full-screen"), false);
+  assert.equal(app.exits(), 0);
+  assert.equal(garden.session, session);
+  assert.deepEqual(decodeSize(), [1, 960, 540]);
+  app.press(10009);
+  assert.equal(app.exits(), 1);
+});
+test("OK on an unused cell keeps the grid", async () => {
+  const app = viewer();
+  app.context.window.cameraViewer.configure([app.camera]);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  app.press(40);
+  app.press(13);
+  assert.equal(app.nodes.grid.classList.contains("full-screen"), false);
+  assert.equal(app.pane(2).element.classList.contains("full-screen"), false);
+});
+test("a new camera configuration returns to the grid", async () => {
+  const app = viewer();
+  app.context.window.cameraViewer.configure([app.camera]);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  app.press(13);
+  assert.equal(app.pane(0).element.classList.contains("full-screen"), true);
+  app.context.window.cameraViewer.configure([app.camera]);
+  assert.equal(app.nodes.grid.classList.contains("full-screen"), false);
+  assert.equal(app.pane(0).element.classList.contains("full-screen"), false);
 });

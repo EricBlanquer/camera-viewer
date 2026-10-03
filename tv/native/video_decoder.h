@@ -22,7 +22,7 @@ class VideoDecoder {
     callbacks_.CancelAll();
     Release();
   }
-  void Submit(const std::string& bytes, int codec, int generation, bool key, bool burst) {
+  void Submit(const std::string& bytes, int codec, int generation, bool key, bool burst, int max_width, int max_height) {
     if (!running_) { Error("Decoder worker unavailable", generation); return; }
     if (generation != input_generation_) { input_generation_ = generation; waiting_key_ = true; }
     if (pending_.load() >= (burst ? MAX_BURST_PENDING : MAX_PENDING) || pending_bytes_.load() + bytes.size() > MAX_PENDING_BYTES) { waiting_key_ = true; return; }
@@ -31,14 +31,14 @@ class VideoDecoder {
     waiting_key_ = false;
     pending_++;
     pending_bytes_ += bytes.size();
-    auto callback = callbacks_.NewCallback(&VideoDecoder::Decode, DecodeRequest{bytes, codec, generation, reset});
+    auto callback = callbacks_.NewCallback(&VideoDecoder::Decode, DecodeRequest{bytes, codec, generation, reset, max_width, max_height});
     if (worker_.message_loop().PostWork(callback) != PP_OK) { Complete(bytes.size()); Error("Decoder worker stopped", generation); }
   }
  private:
   static const int MAX_PENDING = 4;
   static const int MAX_BURST_PENDING = 32;
   static const size_t MAX_PENDING_BYTES = 16 * 1024 * 1024;
-  struct DecodeRequest { std::string bytes; int codec; int generation; bool reset; };
+  struct DecodeRequest { std::string bytes; int codec; int generation; bool reset; int max_width; int max_height; };
   void Complete(size_t size) { pending_bytes_ -= size; pending_--; }
   void Release() {
     avcodec_free_context(&context_);
@@ -81,18 +81,19 @@ class VideoDecoder {
     if (!packet || av_new_packet(packet, bytes.size()) < 0) { av_packet_free(&packet); Error("Video decoder allocation failed", generation); Complete(bytes.size()); return; }
     std::memcpy(packet->data, bytes.data(), bytes.size());
     int code = avcodec_send_packet(context_, packet);
-    if (code == AVERROR(EAGAIN)) { Drain(generation); code = avcodec_send_packet(context_, packet); }
+    if (code == AVERROR(EAGAIN)) { Drain(request); code = avcodec_send_packet(context_, packet); }
     av_packet_free(&packet);
     if (code < 0 && code != AVERROR(EAGAIN)) { Error("Camera video could not be decoded", generation); Complete(bytes.size()); return; }
-    Drain(generation);
+    Drain(request);
     Complete(bytes.size());
   }
-  void Drain(int generation) { while (avcodec_receive_frame(context_, frame_) == 0) Render(generation); }
-  void Render(int generation) {
+  void Drain(const DecodeRequest& request) { while (avcodec_receive_frame(context_, frame_) == 0) Render(request.generation, request.max_width, request.max_height); }
+  void Render(int generation, int max_width, int max_height) {
     if (frame_->width < 1 || frame_->height < 1 || frame_->width > 4096 || frame_->height > 4096) { Error("Camera image dimensions are unsupported", generation); return; }
-    int width = frame_->width > 960 ? 960 : frame_->width;
+    int width = frame_->width > max_width ? max_width : frame_->width;
     int height = frame_->height * width / frame_->width;
-    if (height > 540) { height = 540; width = frame_->width * height / frame_->height; }
+    if (height > max_height) { height = max_height; width = frame_->width * height / frame_->height; }
+    if (width < 1 || height < 1) { Error("Camera image dimensions are unsupported", generation); return; }
     scaler_ = sws_getCachedContext(scaler_, frame_->width, frame_->height, static_cast<AVPixelFormat>(frame_->format), width, height, AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
     if (!scaler_) { Error("Camera image conversion failed", generation); return; }
     pp::VarArrayBuffer pixels(width * height * 4);
