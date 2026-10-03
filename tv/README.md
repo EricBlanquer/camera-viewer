@@ -18,13 +18,17 @@ Changing or removing a camera clears its previous image.
 The diagnostic panel hides as soon as a decoded image appears.
 No rendered image for twelve seconds triggers a new connection; compressed and decoded buffers are bounded to limit accumulated delay.
 An O-KAM camera closes a live session that sends it no request for two minutes; each O-KAM session requests the camera status every 45 seconds to stay open.
+O-KAM video packets are acknowledged in encrypted groups, at most 10 ms after reception and 32 packets at a time, which limits the traffic sent to the camera and the packets it repeats on a weak Wi-Fi link.
+In the grid, each camera sends its secondary stream: 640 × 360 for iCam365 and O-KAM, 640 × 480 for local Imou Life.
+The camera shown in full screen sends its main stream; the other cameras keep their secondary stream.
+iCam365 and O-KAM sessions change stream without reconnecting, and Imou Life sessions reconnect on the other stream while their last image stays visible.
 Decoders wait for an image keyframe at startup and after dropping compressed packets.
 The Imou decoder can queue up to 32 frames for TCP bursts, with a 16 MiB compressed-data limit; UDP decoders retain their four-frame limit.
 
 ## Compatibility and verified behavior
 
-Entrée (iCam365, HEVC main stream), Jardin (O-KAM, H.264), Salon (local Imou Life, HEVC main stream), and Cuisine (local Imou Life, TLS and HEVC main stream) were connected simultaneously from a Samsung QE55Q85RATXXC with Tizen 5.0.
-The iCam365 session selects the same HD stream as the desktop viewer after each successful authentication.
+Entrée (iCam365, HEVC), Jardin (O-KAM, H.264), Salon (local Imou Life, HEVC), and Cuisine (local Imou Life, TLS and HEVC) were connected simultaneously on their main streams from a Samsung QE55Q85RATXXC with Tizen 5.0.
+The secondary and main streams of the four cameras, and the iCam365 and O-KAM stream changes inside a session, were verified with this application's session code running on a computer; they remain unverified on the TV.
 Simultaneous playback through AVPlay on this TV stopped one feed while packets continued arriving.
 The application therefore decodes the feeds on the TV using FFmpeg workers and renders them to independent canvases, at up to 960 × 540 pixels per cell and 1920 × 1080 pixels in full screen.
 Four distinct camera connections and advancing decoded images were verified; remote networks remain unverified.
@@ -77,12 +81,12 @@ Its optional `cloud_session` uses the same private metadata described in the roo
 An O-KAM entry contains `type: "okam"`, `name`, the resolved fifteen-character `uid`, `service_parameter`, and its device `password`.
 For local Imou Life access, an entry contains `type: "imou"`, `name`, and `local` with `host` (an RFC 1918 IPv4 address), `port` (usually `554`), `channel` (usually `1`), `username`, and `password` (the device password, which can differ from the account password).
 TLS cameras additionally require `local.certificate_sha256`, the lowercase 64-character SHA-256 fingerprint verified during desktop camera setup.
-The TV authenticates its RTSP requests using Digest authentication and receives the HD main stream at `/cam/realmonitor?channel=<channel>&subtype=0`.
+The TV authenticates its RTSP requests using Digest authentication and receives `/cam/realmonitor?channel=<channel>&subtype=1` in the grid and the HD main stream at `subtype=0` in full screen.
 Local access requires the TV to reach the camera's private address and has no cloud fallback.
 The Linux viewer's saved camera settings and desktop keyring can supply the local connection and credential during setup.
 
 For cloud Imou Life access, an entry contains `type: "imou"`, `name`, `device_id`, `channel_id` (a string, usually `"0"`), and `account` with `app_id`, `app_secret`, and `region` (`"Europe"`, `"Singapore"`, or `"North America"`).
-The default `stream_id: 1` selects the secondary stream to reduce decoding load and cloud traffic in the grid; `stream_id: 0` selects the HD main stream and can reduce frame rate on older TVs.
+Cloud access requests the secondary stream 1 in the grid and the HD main stream 0 in full screen.
 IoT devices can additionally specify `product_id`.
 Use keys registered for your account in the [Imou Open Platform](https://open.imoulife.com/book/http/develop.html) and the device identity returned by authenticated discovery.
 Imou video uses the TV's Web Crypto API for HMAC-SHA256 signing and the native transport for RTSP interleaved H.264/HEVC video; audio tracks are ignored.
@@ -104,7 +108,7 @@ Renew the provisioned iCam365 account session when its account token expires.
 
 ## Remote control
 
-The arrow keys select a cell, and OK shows the selected camera in full screen.
+The arrow keys select a cell, and OK shows the selected camera in full screen on its main stream.
 Back returns from full screen to the grid; from the grid, it exits the application.
 Other cameras stay connected in full screen, so the grid reappears without reconnecting.
 Hiding the application stops its sessions; returning to it connects again.

@@ -5,6 +5,13 @@
   const DIRECTORY_PORT = 32100;
   const OKAM_STATUS_REQUEST = "get_status.cgi?name=admin&";
   const OKAM_KEEP_ALIVE_MS = 45000;
+  const OKAM_HD_SUBSTREAM = 2;
+  const OKAM_SD_SUBSTREAM = 4;
+  const ICAM_QUALITY_COMMAND = 0x320;
+  const ICAM_HD_QUALITY = 1;
+  const ICAM_SD_QUALITY = 5;
+  const ACKNOWLEDGEMENT_DELAY_MS = 10;
+  const MAX_ACKNOWLEDGED_PACKETS = 32;
   const SHUFFLE_HEX =
     "7c9ce84a13dedcb22f2123e4307b3d8cbc0b270c3cf79ae7087196009785efc11fc4dba1c2ebd901faba3b05b81587832872d18b5ad6da9358feaacc6e1bf0a388ab43c00db545384f502266207f075b14981d9ba72ab9a8cbf1fc4947063eb10e043a945eee541134dd4df9ecc7c9e3781a6f706ba4bda95dd5f8e5bb26af4237d8e1020aae5f1cc573094e6924906d12b319ad748a2940f52dbea559e0f479d24bce8982488425c6912ba2fb8fe9a6b09e3f65f603312eac0f952c5ced39b7336c567eb4a0fd7a815351868d9f77ff6a80dfe2bf10d775645776f355cdd0c818e6364162cf99f2324c67606192cad3ea637d16b68ed46835c3529d46441e17";
   const LOOKUP_HEX =
@@ -255,6 +262,7 @@
       this.native = native;
       this.callbacks = callbacks;
       this.okam = config.type === "okam";
+      this.hd = Boolean(config.hd);
       if (!["okam", "icam365"].includes(config.type)) {
         throw new Error("Unsupported camera type");
       }
@@ -289,6 +297,8 @@
       this.audio = new MediaFrames("icam");
       this.sequence = 0;
       this.pending = new Map();
+      this.unacknowledged = new Map();
+      this.acknowledgeTimer = null;
       this.targets = [];
       this.relays = [];
       this.state = "closed";
@@ -334,7 +344,7 @@
         post(data);
         return;
       }
-      const dual = [0x41, 0x42, 0x43, 0x80, 0x83, 0xd1, 0xe1].includes(data[1]);
+      const dual = [0x41, 0x42, 0x43, 0x80, 0x83, 0xe1].includes(data[1]);
       const encrypted = [
         0,
         0x20,
@@ -546,12 +556,7 @@
       ) {
         const channel = data[5];
         const index = view(data).getUint16(6);
-        this.send(
-          packet(
-            0xd1,
-            Uint8Array.of(0xd1, channel, 0, 1, index >> 8, index & 255),
-          ),
-        );
+        this.acknowledge(channel, index);
         if (this.state === "closing") return;
         for (
           const chunk of this.channels[channel].feed(index, data.subarray(8))
@@ -575,6 +580,43 @@
           }
         }
       }
+    }
+    acknowledge(channel, index) {
+      if (!this.okam) {
+        this.send(
+          packet(
+            0xd1,
+            Uint8Array.of(0xd1, channel, 0, 1, index >> 8, index & 255),
+          ),
+        );
+        return;
+      }
+      if (!this.unacknowledged.has(channel)) {
+        this.unacknowledged.set(channel, new Set());
+      }
+      const indexes = this.unacknowledged.get(channel);
+      indexes.add(index);
+      if (indexes.size >= MAX_ACKNOWLEDGED_PACKETS) this.sendAcknowledgements();
+      else if (this.acknowledgeTimer === null) {
+        this.acknowledgeTimer = setTimeout(
+          () => this.sendAcknowledgements(),
+          ACKNOWLEDGEMENT_DELAY_MS,
+        );
+      }
+    }
+    sendAcknowledgements() {
+      clearTimeout(this.acknowledgeTimer);
+      this.acknowledgeTimer = null;
+      this.unacknowledged.forEach((indexes, channel) => {
+        const body = new Uint8Array(4 + indexes.size * 2);
+        body.set([0xd1, channel]);
+        view(body).setUint16(2, indexes.size);
+        Array.from(indexes).forEach((index, position) =>
+          view(body).setUint16(4 + position * 2, index)
+        );
+        this.send(packet(0xd1, body));
+      });
+      this.unacknowledged.clear();
     }
     write(payload) {
       for (let offset = 0; offset < payload.length; offset += 1024) {
@@ -608,6 +650,27 @@
       view(header).setUint16(4, request.length, true);
       this.write(concat(header, request));
     }
+    selectStream() {
+      if (this.okam) {
+        this.cgi(
+          "livestream.cgi?streamid=10&substream=" +
+            (this.hd ? OKAM_HD_SUBSTREAM : OKAM_SD_SUBSTREAM) + "&",
+        );
+      } else {
+        this.command(
+          ICAM_QUALITY_COMMAND,
+          concat(
+            word32(0),
+            word32(this.hd ? ICAM_HD_QUALITY : ICAM_SD_QUALITY),
+          ),
+        );
+      }
+    }
+    setQuality(hd) {
+      if (this.hd === hd) return;
+      this.hd = hd;
+      if (this.authenticated && this.state === "streaming") this.selectStream();
+    }
     commands() {
       while (this.commandBuffer.length >= 8) {
         const header = view(this.commandBuffer.peek(8));
@@ -638,13 +701,12 @@
           this.state = "streaming";
           this.lastVideo = performance.now();
           this.lastKeepAlive = this.lastVideo;
-          if (this.okam) this.cgi("livestream.cgi?streamid=10&substream=2&");
-          else {
+          if (!this.okam) {
             this.command(0x8024);
             this.command(0x8012, new Uint8Array(8));
             this.command(0x1ff, concat(word32(2), word32(0)));
-            this.command(0x320, concat(word32(0), word32(1)));
           }
+          this.selectStream();
           this.callbacks.status("Authenticated, waiting for live video");
         } else if (
           this.okam && [0x6037, 0x60d1].includes(command) && result &&
@@ -750,6 +812,7 @@
     finishClose() {
       if (this.state === "closed") return;
       clearInterval(this.timer);
+      this.sendAcknowledgements();
       this.native.removeEventListener("message", this.closeListener);
       if (this.peer) this.send(packet(0xf0));
       this.targets.forEach((target) => this.send(packet(0xf0), target));

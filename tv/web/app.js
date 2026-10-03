@@ -179,6 +179,7 @@ class CameraPane {
     try {
       config = Object.assign({}, config, {
         local_host: webapis.network.getIp(),
+        hd: fullScreen === this.index,
       });
       this.session = createSession(config, {
         status: (message) => this.status(message),
@@ -269,6 +270,12 @@ class CameraPane {
     this.element.classList.toggle("reconnecting", this.hasImage);
     refreshOverlay();
   }
+  applyQuality() {
+    if (!this.session) return;
+    if (this.session.setQuality) {
+      this.session.setQuality(fullScreen === this.index);
+    } else this.connect(this.camera);
+  }
   check() {
     if (
       this.lastProgress !== null &&
@@ -336,16 +343,20 @@ function showFullScreen(index) {
   fullScreen = index;
   document.getElementById("grid").classList.add(FULL_SCREEN_CLASS);
   panes[index].element.classList.add(FULL_SCREEN_CLASS);
+  panes[index].applyQuality();
 }
 function showGrid() {
-  if (fullScreen === null) return;
-  panes[fullScreen].element.classList.remove(FULL_SCREEN_CLASS);
+  if (fullScreen === null) return null;
+  const pane = panes[fullScreen];
+  pane.element.classList.remove(FULL_SCREEN_CLASS);
   document.getElementById("grid").classList.remove(FULL_SCREEN_CLASS);
   fullScreen = null;
+  return pane;
 }
 document.addEventListener("keydown", (event) => {
-  if (event.keyCode === KEY_BACK && fullScreen !== null) showGrid();
-  else if (event.keyCode === KEY_BACK) {
+  if (event.keyCode === KEY_BACK && fullScreen !== null) {
+    showGrid().applyQuality();
+  } else if (event.keyCode === KEY_BACK) {
     stop();
     tizen.application.getCurrentApplication().exit();
   } else if (fullScreen !== null) return;

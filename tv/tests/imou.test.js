@@ -52,6 +52,7 @@ test("Imou signature matches the official HMAC-SHA256 vector", async () => {
 });
 test("account shares authentication, refreshes an expired token, and signs each request", async () => {
   const calls = [];
+  const streams = [];
   let expired = true;
   const client = new imou.Account(account, async (host, method, body) => {
     assert.equal(host, "openapi-fk.easy4ip.com");
@@ -78,7 +79,7 @@ test("account shares authentication, refreshes an expired token, and signs each 
     }
     assert.ok(body.params.token.startsWith("testToken"));
     assert.equal(body.params.deviceId, camera.device_id);
-    assert.equal(body.params.streamId, 1);
+    streams.push(body.params.streamId);
     if (expired) {
       expired = false;
       return { result: { code: "TK1002" } };
@@ -96,6 +97,8 @@ test("account shares authentication, refreshes an expired token, and signs each 
   ]);
   await client.stream(camera);
   assert.equal(calls.filter((method) => method === "accessToken").length, 2);
+  await client.stream(camera, true);
+  assert.deepEqual(streams, [1, 1, 1, 0]);
 });
 test("account rejects unknown gateways and hides vendor response messages", async () => {
   const client = new imou.Account(
@@ -141,10 +144,6 @@ test("camera and stream validation reject credentials in URLs and untrusted host
   }
   assert.throws(
     () => imou.validate({ ...camera, channel_id: "0\r\n" }),
-    /Invalid Imou/,
-  );
-  assert.throws(
-    () => imou.validate({ ...camera, stream_id: 2 }),
     /Invalid Imou/,
   );
   assert.throws(
@@ -522,9 +521,13 @@ test("local Imou configuration permits private addresses and enforces camera cre
   const endpoint = imou.localUrl(localCamera);
   assert.equal(
     endpoint.href,
-    "rtsp://192.168.1.210:554/cam/realmonitor?channel=1&subtype=0",
+    "rtsp://192.168.1.210:554/cam/realmonitor?channel=1&subtype=1",
   );
   assert.equal(endpoint.local, true);
+  assert.equal(
+    imou.localUrl(localCamera, true).href,
+    "rtsp://192.168.1.210:554/cam/realmonitor?channel=1&subtype=0",
+  );
   for (
     const change of [
       { host: "127.0.0.1" },
@@ -726,4 +729,15 @@ test("Digest responses support MD5 and SHA-256 session algorithms with and witho
       'Digest realm="Login", nonce="n"\r\nInjected: value',
     ]
   ) assert.throws(() => imou.challenge(value), /authentication/);
+});
+test("local sessions open the secondary stream for the grid and the main stream for full screen", async (t) => {
+  for (const [hd, subtype] of [[undefined, 1], [false, 1], [true, 0]]) {
+    const f = fixture({ ...localCamera, hd });
+    t.after(() => f.session.finishClose());
+    await f.session.open();
+    assert.equal(
+      f.session.url.href,
+      "rtsp://192.168.1.210:554/cam/realmonitor?channel=1&subtype=" + subtype,
+    );
+  }
 });

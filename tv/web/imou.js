@@ -6,6 +6,10 @@
   const { bytes, text, concat, view, ByteQueue, isKeyframe } = protocol;
   const MAX_FRAME = 8 * 1024 * 1024;
   const MAX_RESPONSE = 65536;
+  const LOCAL_HD_SUBTYPE = 0;
+  const LOCAL_SD_SUBTYPE = 1;
+  const CLOUD_HD_STREAM = 0;
+  const CLOUD_SD_STREAM = 1;
   const REGIONS = {
     Europe: "openapi-fk.easy4ip.com",
     Singapore: "openapi-sg.easy4ip.com",
@@ -93,7 +97,6 @@
       !/^[A-Za-z0-9_-]{1,128}$/.test(camera.device_id) ||
       typeof camera.channel_id !== "string" ||
       !/^\d{1,5}$/.test(camera.channel_id) ||
-      (camera.stream_id !== undefined && ![0, 1].includes(camera.stream_id)) ||
       (camera.product_id !== undefined &&
         (typeof camera.product_id !== "string" ||
           camera.product_id.length > 128))
@@ -112,12 +115,13 @@
     return parts[0] === 10 || parts[0] === 192 && parts[1] === 168 ||
       parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31;
   }
-  function localUrl(camera) {
+  function localUrl(camera, hd = false) {
     validate(camera);
     const local = camera.local;
     return streamUrl(
       "rtsp://" + local.host + ":" + local.port +
-        "/cam/realmonitor?channel=" + local.channel + "&subtype=0",
+        "/cam/realmonitor?channel=" + local.channel + "&subtype=" +
+        (hd ? LOCAL_HD_SUBTYPE : LOCAL_SD_SUBTYPE),
       true,
     );
   }
@@ -276,11 +280,11 @@
         this.authentication = null;
       }
     }
-    async stream(camera) {
+    async stream(camera, hd = false) {
       const params = {
         deviceId: camera.device_id,
         channelId: camera.channel_id,
-        streamId: camera.stream_id === undefined ? 1 : camera.stream_id,
+        streamId: hd ? CLOUD_HD_STREAM : CLOUD_SD_STREAM,
       };
       if (camera.product_id) params.productId = camera.product_id;
       return (await this.call("getStreamUrl", params)).url;
@@ -629,7 +633,8 @@
         }
       }, 1000);
       try {
-        if (this.config.local) this.url = localUrl(this.config);
+        const hd = Boolean(this.config.hd);
+        if (this.config.local) this.url = localUrl(this.config, hd);
         else {
           const config = this.config.account;
           let account = accounts.get(config.app_id);
@@ -640,7 +645,7 @@
             account = new Account(config);
             accounts.set(config.app_id, account);
           }
-          const value = await account.stream(this.config);
+          const value = await account.stream(this.config, hd);
           if (this.state !== "account") return;
           this.url = streamUrl(value);
         }

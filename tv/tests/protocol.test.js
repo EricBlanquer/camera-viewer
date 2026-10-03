@@ -3,7 +3,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const p = require("../web/protocol.js");
 const hex = (bytes) => Buffer.from(bytes).toString("hex");
-function session(type = "icam365") {
+function session(type = "icam365", options = {}) {
   const sent = [];
   const listeners = new Set();
   const native = {
@@ -25,7 +25,7 @@ function session(type = "icam365") {
       password: "test",
     };
   const video = [];
-  const connection = new p.NativeSession(config, native, {
+  const connection = new p.NativeSession({ ...config, ...options }, native, {
     status: () => {},
     video: (...frame) => video.push(frame),
     error: () => {},
@@ -193,23 +193,140 @@ test("queue bounds reject oversized or distant packets", () => {
   buffer.append(new Uint8Array(8 * 1024 * 1024));
   assert.throws(() => buffer.append(Uint8Array.of(1)), /buffer/);
 });
-test("iCam365 authentication starts video and selects the desktop HD stream", () => {
+test("iCam365 authentication starts video on the grid stream and switches quality in session", () => {
+  const authenticate = (connection) => {
+    const commands = [];
+    connection.command = (command, body) => commands.push([command, body]);
+    connection.commandBuffer.append(
+      p.concat(p.word32(0x8003), p.word32(4), p.word32(0)),
+    );
+    connection.commands();
+    return commands;
+  };
   const { connection } = session();
-  const commands = [];
-  connection.command = (command, body) => commands.push([command, body]);
-  connection.commandBuffer.append(
-    p.concat(p.word32(0x8003), p.word32(4), p.word32(0)),
-  );
-  connection.commands();
+  connection.setQuality(false);
+  const commands = authenticate(connection);
   assert.deepEqual(commands.map(([command]) => command), [
     0x8024,
     0x8012,
     0x1ff,
     0x320,
   ]);
-  assert.deepEqual(Array.from(commands.at(-1)[1]), [0, 0, 0, 0, 1, 0, 0, 0]);
+  assert.deepEqual(Array.from(commands.at(-1)[1]), [0, 0, 0, 0, 5, 0, 0, 0]);
   connection.commands();
   assert.equal(commands.length, 4);
+  connection.setQuality(true);
+  assert.deepEqual(Array.from(commands.at(-1)[1]), [0, 0, 0, 0, 1, 0, 0, 0]);
+  connection.setQuality(true);
+  assert.equal(commands.length, 5);
+  connection.setQuality(false);
+  assert.deepEqual(Array.from(commands.at(-1)[1]), [0, 0, 0, 0, 5, 0, 0, 0]);
+  const full = session("icam365", { hd: true }).connection;
+  full.setQuality(true);
+  assert.deepEqual(Array.from(authenticate(full).at(-1)[1]), [
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+  ]);
+  const late = session().connection;
+  const requested = [];
+  late.command = (command) => requested.push(command);
+  late.setQuality(true);
+  assert.deepEqual(requested, []);
+  assert.deepEqual(Array.from(authenticate(late).at(-1)[1]), [
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+  ]);
+});
+test("O-KAM sessions request the grid or full-screen stream and switch without reconnecting", () => {
+  const authenticate = (connection) => {
+    const requests = [];
+    connection.cgi = (path) => requests.push(path);
+    const response = p.bytes("result=0;");
+    const header = new Uint8Array(8);
+    p.view(header).setUint16(0, 0x0a01, true);
+    p.view(header).setUint16(2, 0x6001, true);
+    p.view(header).setUint16(4, response.length, true);
+    connection.commandBuffer.append(p.concat(header, response));
+    connection.commands();
+    return requests;
+  };
+  const requests = authenticate(session("okam").connection);
+  assert.deepEqual(requests, ["livestream.cgi?streamid=10&substream=4&"]);
+  const full = session("okam", { hd: true }).connection;
+  const fullRequests = authenticate(full);
+  assert.deepEqual(fullRequests, ["livestream.cgi?streamid=10&substream=2&"]);
+  full.setQuality(false);
+  full.setQuality(false);
+  full.setQuality(true);
+  assert.deepEqual(fullRequests.slice(1), [
+    "livestream.cgi?streamid=10&substream=4&",
+    "livestream.cgi?streamid=10&substream=2&",
+  ]);
+});
+test("O-KAM media is acknowledged in encrypted groups and iCam365 media per packet", async () => {
+  const peer = { host: "192.0.2.2", port: 40000 };
+  const data = (channel, index) =>
+    p.packet(0xd0, Uint8Array.of(0xd1, channel, index >> 8, index & 255, 7));
+  const acknowledgements = (sent, key) =>
+    sent.filter((item) => item.command === "udp-send").map((item) =>
+      new Uint8Array(item.data)
+    ).map((bytes) =>
+      key && bytes[0] !== 0xf1 ? p.cipher(bytes, key, true) : bytes
+    )
+      .filter((bytes) => bytes[1] === 0xd1).map((bytes) => Array.from(bytes));
+  const okam = session("okam");
+  okam.connection.peer = peer;
+  okam.connection.state = "streaming";
+  okam.connection.receive(data(2, 0), peer);
+  okam.connection.receive(data(2, 1), peer);
+  okam.connection.receive(data(2, 1), peer);
+  assert.deepEqual(acknowledgements(okam.sent), []);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const raw = okam.sent.filter((item) => item.command === "udp-send");
+  assert.equal(raw.length, 1);
+  assert.notEqual(new Uint8Array(raw[0].data)[0], 0xf1);
+  assert.deepEqual(acknowledgements(okam.sent, okam.connection.key), [[
+    0xf1,
+    0xd1,
+    0,
+    8,
+    0xd1,
+    2,
+    0,
+    2,
+    0,
+    0,
+    0,
+    1,
+  ]]);
+  for (let index = 2; index < 34; index++) {
+    okam.connection.receive(data(2, index), peer);
+  }
+  assert.equal(
+    acknowledgements(okam.sent, okam.connection.key).at(-1).length,
+    8 + 32 * 2,
+  );
+  const icam = session();
+  icam.connection.peer = peer;
+  icam.connection.state = "streaming";
+  icam.connection.receive(data(2, 0), peer);
+  icam.connection.receive(data(2, 1), peer);
+  assert.deepEqual(acknowledgements(icam.sent), [
+    [0xf1, 0xd1, 0, 6, 0xd1, 2, 0, 1, 0, 0],
+    [0xf1, 0xd1, 0, 6, 0xd1, 2, 0, 1, 0, 1],
+  ]);
 });
 test("O-KAM live sessions request the camera status every 45 seconds", () => {
   const { connection } = session("okam");
@@ -224,7 +341,7 @@ test("O-KAM live sessions request the camera status every 45 seconds", () => {
   connection.commandBuffer.append(p.concat(header, response));
   connection.commands();
   connection.tick();
-  assert.deepEqual(requests, ["livestream.cgi?streamid=10&substream=2&"]);
+  assert.deepEqual(requests, ["livestream.cgi?streamid=10&substream=4&"]);
   connection.lastKeepAlive = performance.now() - 45001;
   connection.tick();
   connection.tick();

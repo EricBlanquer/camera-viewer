@@ -173,10 +173,10 @@ If the camera rejects the connection, `.venv/bin/python app.py --camera-password
 
 The [Samsung TV application](tv/README.md) connects from the TV to iCam365, O-KAM, and Imou Life cameras and displays a fixed four-cell grid with an opaque black background.
 Each camera occupies one quarter of the screen, and the diagnostic panel hides when live video appears.
-The remote's OK button shows the selected camera in full screen, and Back returns to the grid.
+The grid uses each camera's secondary stream; the remote's OK button shows the selected camera in full screen on its main stream, and Back returns to the grid.
 The last image remains visible during reconnection, and the grid omits camera titles and unused-cell labels.
 The ARM NaCl build was tested with Entrée, Jardin, Salon, and Cuisine on a 2019 Samsung QE55Q85R running Tizen 5.0; video decoding runs on the TV without a PC gateway.
-Salon and Cuisine use authenticated local HD RTSP connections, with pinned TLS for Cuisine and no Imou cloud video quota consumption.
+Salon and Cuisine use authenticated local RTSP connections, with pinned TLS for Cuisine and no Imou cloud video quota consumption.
 The TV launcher uses the same camera icon as the desktop application.
 Build, signing, private configuration, and remote-control instructions are in the TV guide.
 

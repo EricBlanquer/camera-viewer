@@ -65,6 +65,7 @@ function viewer() {
   class Session {
     constructor(config, native, callbacks) {
       new protocol.NativeSession(config, native, callbacks);
+      this.config = config;
       this.callbacks = callbacks;
     }
     open() {
@@ -75,6 +76,15 @@ function viewer() {
       this.peer = null;
     }
     event() {}
+  }
+  class NativeSession extends Session {
+    constructor(config, native, callbacks) {
+      super(config, native, callbacks);
+      this.qualities = [];
+    }
+    setQuality(hd) {
+      this.qualities.push(hd);
+    }
   }
   class ImouSession extends Session {
     constructor(config, native, callbacks) {
@@ -89,6 +99,7 @@ function viewer() {
         callbacks,
       );
       imou.validate(config);
+      this.config = config;
     }
   }
   const context = vm.createContext({
@@ -97,7 +108,7 @@ function viewer() {
     console: { log: () => {} },
     performance: { now: () => now },
     localStorage: { getItem: () => null, setItem: () => {} },
-    CameraProtocol: Object.assign({}, protocol, { NativeSession: Session }),
+    CameraProtocol: Object.assign({}, protocol, { NativeSession }),
     ImouVideo: Object.assign({}, imou, { Session: ImouSession }),
     webapis: { network: { getIp: () => "192.0.2.10" } },
     tizen: {
@@ -339,8 +350,10 @@ test("OK shows the selected camera in full screen and Back returns to the grid",
     return [message.stream, message.max_width, message.max_height];
   };
   assert.deepEqual(decodeSize(), [1, 960, 540]);
+  assert.equal(session.config.hd, false);
   app.press(39);
   app.press(13);
+  assert.deepEqual(session.qualities, [true]);
   assert.equal(app.nodes.grid.classList.contains("full-screen"), true);
   assert.equal(garden.element.classList.contains("full-screen"), true);
   assert.equal(app.pane(0).element.classList.contains("full-screen"), false);
@@ -360,6 +373,7 @@ test("OK shows the selected camera in full screen and Back returns to the grid",
   assert.equal(garden.element.classList.contains("full-screen"), false);
   assert.equal(app.exits(), 0);
   assert.equal(garden.session, session);
+  assert.deepEqual(session.qualities, [true, false]);
   assert.deepEqual(decodeSize(), [1, 960, 540]);
   app.press(10009);
   assert.equal(app.exits(), 1);
@@ -384,4 +398,49 @@ test("a new camera configuration returns to the grid", async () => {
   app.context.window.cameraViewer.configure([app.camera]);
   assert.equal(app.nodes.grid.classList.contains("full-screen"), false);
   assert.equal(app.pane(0).element.classList.contains("full-screen"), false);
+});
+test("an Imou camera reconnects on its main stream in full screen and on its secondary stream in the grid", async () => {
+  const app = viewer();
+  const kitchen = {
+    type: "imou",
+    name: "Kitchen",
+    local: {
+      host: "192.168.1.210",
+      port: 554,
+      channel: 1,
+      username: "admin",
+      password: "test",
+    },
+  };
+  app.context.window.cameraViewer.configure([kitchen]);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  const pane = app.pane(0);
+  const grid = pane.session;
+  assert.equal(grid.config.hd, false);
+  app.render(0);
+  const image = pane.canvas.image;
+  app.press(13);
+  await Promise.resolve();
+  await Promise.resolve();
+  const full = pane.session;
+  assert.notEqual(full, grid);
+  assert.equal(grid.peer, null);
+  assert.equal(full.config.hd, true);
+  assert.equal(pane.canvas.image, image);
+  app.press(10009);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.notEqual(pane.session, full);
+  assert.equal(full.peer, null);
+  assert.equal(pane.session.config.hd, false);
+});
+test("a camera connected while it is in full screen starts on its main stream", async () => {
+  const app = viewer();
+  app.context.window.cameraViewer.configure([app.camera]);
+  app.press(13);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  assert.equal(app.pane(0).session.config.hd, true);
+  assert.deepEqual(app.pane(0).session.qualities, []);
 });
