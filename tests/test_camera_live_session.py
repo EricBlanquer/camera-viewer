@@ -7,16 +7,15 @@ from unittest.mock import Mock, patch
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from okam_native.cs2 import LOGIN_RESPONSE_COMMAND
+from okam_native.p2p import P2PError
 
-from app import CAMERA_STATUS_PATH, StreamWorker
+from app import CAMERA_STATUS_PATH, CameraFrameReader, StreamWorker
 
 
-class CameraKeepAliveTest(unittest.TestCase):
+class CameraLiveSessionTest(unittest.TestCase):
     def test_live_session_requests_camera_status_before_the_camera_closes_it(self) -> None:
         clock = SimpleNamespace(now=100.0)
         worker = StreamWorker(SimpleNamespace(uid="uid", name="Garden", device_password=""), "", io.BytesIO())
-        requests: list[str] = []
-        responses: list[int] = []
 
         def read(_reader: object, _session: object) -> tuple[bytes, int]:
             clock.now += 10
@@ -24,6 +23,33 @@ class CameraKeepAliveTest(unittest.TestCase):
                 worker.stop_requested.set()
             return b"frame", 0
 
+        requests, responses = self.stream(worker, clock, read)
+        self.assertEqual(requests, [
+            "livestream.cgi?streamid=10&substream=2&",
+            CAMERA_STATUS_PATH,
+            CAMERA_STATUS_PATH,
+            "livestream.cgi?streamid=16&substream=0&",
+        ])
+        self.assertEqual(responses, [LOGIN_RESPONSE_COMMAND] * 2)
+
+    def test_live_session_ends_when_camera_frames_keep_arriving_late(self) -> None:
+        clock = SimpleNamespace(now=100.0)
+        worker = StreamWorker(SimpleNamespace(uid="uid", name="Garden", device_password=""), "", io.BytesIO())
+
+        def read(reader: CameraFrameReader, _session: object) -> tuple[bytes, int]:
+            clock.now += 1
+            reader.timestamp = 5000 + (clock.now - 100) / 2
+            if clock.now >= 140:
+                worker.stop_requested.set()
+            return b"frame", 0
+
+        with self.assertRaisesRegex(P2PError, "playback delay increased by 7.5s"):
+            self.stream(worker, clock, read)
+        self.assertEqual(clock.now, 116)
+
+    def stream(self, worker: StreamWorker, clock: SimpleNamespace, read: object) -> tuple[list[str], list[int]]:
+        requests: list[str] = []
+        responses: list[int] = []
         with patch("app.prepare_camera_connection", return_value=("client", "service")), \
                 patch("app.select_camera_password", return_value="password"), \
                 patch("app.open_camera_session", return_value=Mock()), \
@@ -38,13 +64,7 @@ class CameraKeepAliveTest(unittest.TestCase):
                 patch("app.time.monotonic", side_effect=lambda: clock.now), \
                 patch.object(worker, "_read_capabilities"):
             worker._stream()
-        self.assertEqual(requests, [
-            "livestream.cgi?streamid=10&substream=2&",
-            CAMERA_STATUS_PATH,
-            CAMERA_STATUS_PATH,
-            "livestream.cgi?streamid=16&substream=0&",
-        ])
-        self.assertEqual(responses, [LOGIN_RESPONSE_COMMAND] * 2)
+        return requests, responses
 
 
 if __name__ == "__main__":

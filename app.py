@@ -12,6 +12,7 @@ import math
 import os
 import queue
 import re
+import select
 import shutil
 import signal
 import socket
@@ -82,6 +83,7 @@ from okam_native.cs2 import (
     CS2Timeout,
     CameraLoginRejected,
     authenticate_camera,
+    encrypt_packet,
     inspect_h264,
     make_cgi_request,
     parse_result,
@@ -298,6 +300,8 @@ DIRECT_CONNECT_SECONDS = 10
 RELAY_CONNECT_SECONDS = 55
 SEQUENCE_HALF_RANGE = 0x8000
 MAX_OUT_OF_ORDER_PACKETS = 4096
+ACKNOWLEDGEMENT_DELAY_SECONDS = 0.01
+MAX_ACKNOWLEDGED_PACKETS = 32
 KEY_FRAME_TYPE = 0x00
 MATROSKA_SUFFIX = ".mkv"
 PACER_IDLE_SECONDS = 0.1
@@ -619,7 +623,8 @@ class ImouAccountWorker(QThread):
 
 class CameraFrameReader:
     def __init__(self) -> None:
-        self.pending_frame: tuple[int, int] | None = None
+        self.pending_frame: tuple[int, int, float] | None = None
+        self.timestamp: float | None = None
 
     def read(self, session: CS2Session) -> tuple[bytes, int]:
         if self.pending_frame is None:
@@ -629,9 +634,12 @@ class CameraFrameReader:
             length = int.from_bytes(header[16:20], "little")
             if not 0 < length <= MAX_FRAME_BYTES:
                 raise CS2Error("camera video frame is invalid")
-            self.pending_frame = (length, header[4])
+            self.pending_frame = (
+                length, header[4], int.from_bytes(header[8:12], "little") + int.from_bytes(header[6:8], "little") / 1000,
+            )
         frame = session.read_exact(1, self.pending_frame[0], timeout=VIDEO_READ_TIMEOUT_SECONDS)
         frame_type = self.pending_frame[1]
+        self.timestamp = self.pending_frame[2]
         self.pending_frame = None
         return frame, frame_type
 
@@ -1565,6 +1573,11 @@ class VideoStatusOverlay(ControlsOverlay):
 
 
 class ReliableCS2Session(CS2Session):
+    def __init__(self, *arguments: object, **options: object) -> None:
+        super().__init__(*arguments, **options)
+        self._unacknowledged: dict[int, dict[int, None]] = {}
+        self._acknowledge_at: float | None = None
+
     def discard_channel(self, channel: int, quiet_seconds: float, limit_seconds: float) -> None:
         deadline = time.monotonic() + limit_seconds
         last_size = -1
@@ -1603,8 +1616,7 @@ class ReliableCS2Session(CS2Session):
             waiting[sequence] = body[4:]
         self._count(f"channel{channel}_packets")
         self._count(f"channel{channel}_bytes", len(body) - 4)
-        assert self._peer is not None
-        self._send_clear(b"\xf1\xd1\x00\x06\xd1" + bytes([channel]) + b"\x00\x01" + body[2:4], self._peer)
+        self._acknowledge(channel, sequence)
         if distance != 0:
             return
         self._channel_buffers[channel].extend(body[4:])
@@ -1613,6 +1625,36 @@ class ReliableCS2Session(CS2Session):
             self._channel_buffers[channel].extend(waiting.pop(expected))
             expected = (expected + 1) & 0xFFFF
         self._incoming_sequence[channel] = expected
+
+    def _acknowledge(self, channel: int, sequence: int) -> None:
+        sequences = self._unacknowledged.setdefault(channel, {})
+        sequences[sequence] = None
+        now = time.monotonic()
+        if self._acknowledge_at is None:
+            self._acknowledge_at = now + ACKNOWLEDGEMENT_DELAY_SECONDS
+        if now >= self._acknowledge_at or len(sequences) >= MAX_ACKNOWLEDGED_PACKETS:
+            self._send_acknowledgements()
+
+    def _send_acknowledgements(self) -> None:
+        unacknowledged = self._unacknowledged
+        self._unacknowledged = {}
+        self._acknowledge_at = None
+        if self._socket is None or self._peer is None:
+            raise CS2Error("P2P socket is unavailable")
+        for channel, sequences in unacknowledged.items():
+            body = (b"\xd1" + bytes([channel]) + len(sequences).to_bytes(2, "big")
+                    + b"".join(sequence.to_bytes(2, "big") for sequence in sequences))
+            try:
+                self._socket.sendto(encrypt_packet(self.key, b"\xf1\xd1" + len(body).to_bytes(2, "big") + body), self._peer)
+            except OSError:
+                raise CS2Error("native P2P send failed") from None
+
+    def _pump(self) -> None:
+        if self._acknowledge_at is not None and self._socket is not None:
+            remaining = self._acknowledge_at - time.monotonic()
+            if remaining <= 0 or not select.select([self._socket], [], [], remaining)[0]:
+                self._send_acknowledgements()
+        super()._pump()
 
 
 def open_camera_session(client_id: str, service_parameter: object) -> ReliableCS2Session:
@@ -1966,6 +2008,7 @@ class StreamWorker(QThread):
             if not self.stop_requested.is_set():
                 print(f"Camera stream error: {type(ex).__name__}: {ex}", file=sys.stderr, flush=True)
                 message = str(ex) if isinstance(ex, (CS2Error, P2PError, WakeError)) else "Camera connection failed."
+                LOG.info("Camera stream stopped: %s", message)
                 self.failed.emit(message)
         except Exception as ex:
             if not self.stop_requested.is_set():
@@ -2000,6 +2043,7 @@ class StreamWorker(QThread):
             received_video = False
             last_video = time.monotonic()
             last_keep_alive = last_video
+            latency_guard = LiveLatencyGuard()
             frame_reader = CameraFrameReader()
             while not self.stop_requested.is_set():
                 self._process_control(session, login.user, login.password)
@@ -2024,6 +2068,10 @@ class StreamWorker(QThread):
                 if not valid:
                     continue
                 last_video = time.monotonic()
+                try:
+                    latency_guard.observe(frame_reader.timestamp, last_video)
+                except OSError as ex:
+                    raise P2PError(str(ex)) from None
                 self.local_frame_times.append(last_video)
                 self._record_frame(frame, keyframe, last_video)
                 if self.continuous is not None:

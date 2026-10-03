@@ -178,6 +178,8 @@ RTSP and native iCam365 live views also reconnect when playback accumulates at l
 The delay is measured against monotonic elapsed time and the fastest observed playback position, independently of the camera's displayed clock and initial connection delay.
 Reconnecting closes the current recording segment and starts a fresh transport, player, and continuous recording segment.
 An O-KAM camera closes a live session that sends it no request for two minutes; the viewer requests the camera status every 45 seconds to keep each O-KAM live session open.
+O-KAM live views reconnect under the same six-second rule, measured against the capture time stamped on each camera frame.
+O-KAM video packets are acknowledged in encrypted groups, at most 10 ms after reception and 32 packets at a time, which limits the traffic sent to the camera and the packets it repeats on a weak Wi-Fi link.
 Each video keeps its last decoded camera image during reconnection and replaces it when the new player has a frame.
 The connection message identifies this paused image; changing or stopping a camera clears it.
 Use **Full screen** to expand the viewer.

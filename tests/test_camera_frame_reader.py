@@ -43,6 +43,15 @@ class CameraFrameReaderTest(unittest.TestCase):
         self.assertEqual(reader.read(session), (b"abc", 12))
         self.assertEqual(session.sizes, [32, 32, 3])
 
+    def test_frame_keeps_the_camera_timestamp_of_its_header(self) -> None:
+        stamped = bytearray(header(1, 2))
+        stamped[6:8] = (250).to_bytes(2, "little")
+        stamped[8:12] = (1791070198).to_bytes(4, "little")
+        reader = CameraFrameReader()
+        self.assertIsNone(reader.timestamp)
+        reader.read(FakeSession([bytes(stamped), b"ab"]))
+        self.assertEqual(reader.timestamp, 1791070198.25)
+
     def test_invalid_header_is_rejected(self) -> None:
         session = FakeSession([bytes(32)])
         with self.assertRaises(CS2Error):
