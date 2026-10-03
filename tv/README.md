@@ -17,6 +17,7 @@ During reconnection, the last decoded image remains visible with a small connect
 Changing or removing a camera clears its previous image.
 The diagnostic panel hides as soon as a decoded image appears.
 No rendered image for twelve seconds triggers a new connection; compressed and decoded buffers are bounded to limit accumulated delay.
+An O-KAM camera closes a live session that sends it no request for two minutes; each O-KAM session requests the camera status every 45 seconds to stay open.
 Decoders wait for an image keyframe at startup and after dropping compressed packets.
 The Imou decoder can queue up to 32 frames for TCP bursts, with a 16 MiB compressed-data limit; UDP decoders retain their four-frame limit.
 
