@@ -181,6 +181,7 @@ RTSP_STALL_SECONDS = 10
 RTSP_MAX_ACCUMULATED_DELAY_SECONDS = 6
 RTSP_DELAY_CONFIRM_SECONDS = 3
 LIVE_READAHEAD_SECONDS = 10
+LIVE_AUDIO_BUFFER_SECONDS = 0.2
 LIVE_BUFFER_SECONDS = 0.25
 LIVE_BUFFER_TOLERANCE_SECONDS = 0.1
 LIVE_BUFFER_WINDOW_SECONDS = 12
@@ -717,6 +718,7 @@ def mpv_rtsp_command(
     command.insert(-1, "--mute=no" if sound_enabled else "--mute=yes")
     command.insert(-1, f"--aid={MPV_AUDIO_TRACK_ON if sound_enabled else MPV_AUDIO_TRACK_OFF}")
     command.insert(-1, f"--demuxer-readahead-secs={LIVE_READAHEAD_SECONDS}")
+    command.insert(-1, f"--audio-buffer={LIVE_AUDIO_BUFFER_SECONDS}")
     command.insert(-1, RTSP_AUDIO_FILTER)
     command.insert(-1, RTSP_DENOISE_FILTER)
     if camera.provider == IMOU_ACCOUNT_PROVIDER:

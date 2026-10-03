@@ -205,6 +205,8 @@ class TrayTest(unittest.TestCase):
         command = mpv_rtsp_command(Path("/tmp/control.sock"), 1, True, camera, restarted.sound_enabled)
         self.assertIn("--mute=no", command)
         self.assertIn("--aid=auto", command)
+        self.assertIn("--audio-buffer=0.2", command)
+        self.assertLess(command.index("--profile=low-latency"), command.index("--audio-buffer=0.2"))
         self.assertIn("--af=lavfi=[volume=25dB,alimiter=limit=0.95]", command)
         restarted.close()
         self.window.selected_device = camera
