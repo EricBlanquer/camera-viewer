@@ -98,11 +98,12 @@ class CloudCredentialTest(unittest.TestCase):
                 bridge.process = None
                 bridge.server = MagicMock()
                 bridge.error = None
+                bridge.main_stream = True
                 bridge._start_muxer = MagicMock(return_value=[])
                 session = MagicMock()
                 session.authenticated = False
                 session.receive.return_value = ([], [(0x8003, b"\0" * 4)])
-                session.start_media.side_effect = bridge.stopped.set
+                session.start_media.side_effect = lambda main_stream: bridge.stopped.set()
                 opener = self.opener(self.response())
                 if unavailable:
                     opener.open.side_effect = OSError("Network unavailable")
@@ -111,7 +112,7 @@ class CloudCredentialTest(unittest.TestCase):
                         bridge._run()
                 expected = "old-password" if unavailable else "new-password"
                 self.assertEqual(native.call_args.args[0].password, expected)
-                session.start_media.assert_called_once()
+                session.start_media.assert_called_once_with(True)
                 session.close.assert_called_once()
                 self.assertIsNone(bridge.error)
 

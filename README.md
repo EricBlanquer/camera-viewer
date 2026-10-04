@@ -7,7 +7,7 @@ It does not require Home Assistant, Wine, Waydroid, or the phone while viewing.
 
 ## Install
 
-Requirements: Python 3.11 or newer, PyQt6, python3-xlib, mpv, ffmpeg with ffplay, Git, OpenCV, and NumPy.
+Requirements: Python 3.11 or newer, PyQt6, python3-xlib, mpv, ffmpeg with ffplay, Git, OpenCV, NumPy, and the `ping` command for standby.
 O-KAM and Imou accounts also require `secret-tool` with an unlocked desktop keyring and network access to their account services.
 On this computer these programs are already installed.
 
@@ -87,6 +87,14 @@ Choosing a saved profile restores that selection, order, and layout; the profile
 Saving under an existing name, ignoring case, replaces that profile, and **Remove profile** deletes one.
 Cameras removed since a profile was saved are ignored when it is applied.
 The grid keeps its saved layout when docked.
+Use **Secondary stream cameras** to check the cameras that display their secondary stream outside full-screen view: 640 × 360 for O-KAM and native iCam365 cameras, and the secondary stream of Imou Life account cameras, displayed in 16:9.
+Checked cameras display their main stream while the window is in full-screen view, and unchecked cameras always display it.
+O-KAM and native iCam365 sessions change stream without reconnecting; Imou Life cameras reopen their video on the other stream.
+Continuous recording stores the displayed stream, and a recording segment ends when the stream changes, so each segment has a single video format.
+Use **Standby while a computer is on...** to enter the host name or IP address of another computer.
+While that computer answers the system `ping` command, Camera Viewer closes its live connections, recordings, local detection, and microSD detection checks, and each video displays the standby state; the window and its layout stay in place.
+The address is checked every ten seconds; connections reopen after three consecutive checks without an answer, and at startup they wait for the first check.
+Playback opened from a camera pane remains available during standby, and an empty address turns standby off.
 Camera videos appear without names, title bars, borders, or gaps between their panes.
 Embedded video players synchronize with their pane size after mapping and resizing, while preserving the selected zoom and pan.
 With multiple cameras displayed, drag one video onto another with the left mouse button to exchange their positions; the order is remembered without restarting either stream.
@@ -196,7 +204,7 @@ For compatible iCam365 cameras, **PTZ** offers the movements available through t
 The title bar provides the desktop's minimize, maximize, and close buttons, and the window remains available from the taskbar.
 The application and desktop launcher share the `camera-viewer` identity so the taskbar uses the Camera Viewer icon.
 When the desktop provides a notification area, Camera Viewer also shows an icon there.
-Click the icon to show or hide the window, or open its menu for camera selection, layout, camera setup, recording, and local detection settings.
+Click the icon to show or hide the window, or open its menu for camera selection, layout, stream choice, standby, camera setup, recording, and local detection settings.
 Playback and camera controls are available in each camera's video pane.
 Opening Camera Viewer again from the application menu shows the running instance instead of starting a second one.
 Closing the window hides it; live video keeps running in the background so continuous recording and detection checks continue.

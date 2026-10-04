@@ -47,6 +47,30 @@ class CameraLiveSessionTest(unittest.TestCase):
             self.stream(worker, clock, read)
         self.assertEqual(clock.now, 116)
 
+    def test_live_session_starts_on_the_requested_stream_and_changes_it_without_reconnecting(self) -> None:
+        clock = SimpleNamespace(now=100.0)
+        continuous = Mock()
+        worker = StreamWorker(SimpleNamespace(uid="uid", name="Garden", device_password=""), "", io.BytesIO(), continuous)
+        worker.set_continuous(True)
+        worker.set_main_stream(False)
+
+        def read(_reader: object, _session: object) -> tuple[bytes, int]:
+            clock.now += 1
+            if clock.now == 103:
+                worker.set_main_stream(True)
+            if clock.now >= 106:
+                worker.stop_requested.set()
+            return b"frame", 0
+
+        requests, _ = self.stream(worker, clock, read)
+        self.assertEqual(requests, [
+            "livestream.cgi?streamid=10&substream=4&",
+            "livestream.cgi?streamid=10&substream=2&",
+            "livestream.cgi?streamid=16&substream=0&",
+        ])
+        self.assertEqual(continuous.write.call_count, 6)
+        continuous.close.assert_called_once_with()
+
     def stream(self, worker: StreamWorker, clock: SimpleNamespace, read: object) -> tuple[list[str], list[int]]:
         requests: list[str] = []
         responses: list[int] = []

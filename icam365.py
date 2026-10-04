@@ -39,6 +39,9 @@ LIVE_MEDIA_OUTPUT_OPTIONS = (
 )
 AAC_SAMPLE_RATE = 8000
 AAC_FRAME_SAMPLES = 1024
+QUALITY_COMMAND = 0x320
+MAIN_STREAM_QUALITY = 1
+SECONDARY_STREAM_QUALITY = 5
 PTZ_COMMAND = 0x1001
 PTZ_POSITION_COMMAND = 0x0408
 PRESETS_REQUEST_COMMAND = 0x0452
@@ -181,6 +184,10 @@ class MediaFrames:
         return frames
 
 
+def stream_quality(main_stream: bool) -> bytes:
+    return struct.pack("<II", 0, MAIN_STREAM_QUALITY if main_stream else SECONDARY_STREAM_QUALITY)
+
+
 class NativePpppSession(PpppSession):
     def _recv(self, timeout: float = 0.4) -> list[tuple[bytes, tuple[str, int]]]:
         packets = super()._recv(timeout)
@@ -301,12 +308,12 @@ class NativeSession:
             del self.control_buffer[:8 + size]
         return media, commands
 
-    def start_media(self) -> None:
+    def start_media(self, main_stream: bool = True) -> None:
         self.authenticated = True
         self.send(0x8024)
         self.send(0x8012, b"\0" * 8)
         self.send(0x1FF, struct.pack("<II", 2, 0))
-        self.send(0x320, struct.pack("<II", 0, 1))
+        self.send(QUALITY_COMMAND, stream_quality(main_stream))
         self.send(0x300, struct.pack("<II", 1, 0))
 
     def close(self) -> None:
@@ -410,6 +417,7 @@ class NativeBridge:
         self.light_supported = False
         self.ptz_supported = False
         self.pan_supported = False
+        self.main_stream = True
         self.presets: dict[str, NativePreset] = {}
         self.subscribers: set[queue.Queue] = set()
         self.subscriber_lock = threading.Lock()
@@ -428,6 +436,10 @@ class NativeBridge:
             return True
         except queue.Full:
             return False
+
+    def set_main_stream(self, enabled: bool) -> None:
+        if enabled != self.main_stream and self.control(QUALITY_COMMAND, stream_quality(enabled)):
+            self.main_stream = enabled
 
     def move_camera(self, direction: str) -> bool:
         if not self.ptz_supported:
@@ -524,7 +536,7 @@ class NativeBridge:
                         if len(payload) < 4 or struct.unpack_from("<i", payload)[0] != 0:
                             raise OSError(refresh_error or "The iCam365 camera rejected authentication.")
                         if not session.authenticated:
-                            session.start_media()
+                            session.start_media(self.main_stream)
                             threads = self._start_muxer()
                             last_video = time.monotonic()
                     elif command == 0x8025:

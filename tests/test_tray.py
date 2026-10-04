@@ -16,7 +16,7 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QPushButton, QSystemTrayIcon, QWidget
 
-from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
+from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, IMOU_ACCOUNT_PROVIDER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
 from icam365 import NativePreset
 
 
@@ -47,6 +47,8 @@ class TrayTest(unittest.TestCase):
             "Cameras",
             "Camera layout",
             "Camera profiles",
+            "Secondary stream cameras",
+            "Standby while a computer is on...",
             "Add camera",
             "Continuous recording (24 h)",
             "Detect people and animals locally",
@@ -752,6 +754,102 @@ class TrayTest(unittest.TestCase):
             worker._update_continuous(105.0)
         self.assertIs(worker.continuous, restarted)
 
+    def test_secondary_stream_cameras_use_the_main_stream_only_in_full_screen(self) -> None:
+        garden = SimpleNamespace(name="Jardin", uid="garden")
+        entrance = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
+        kitchen = RtspCamera("rtsp:kitchen", "Cuisine", "rtsp://192.0.2.11:554/live", provider=IMOU_ACCOUNT_PROVIDER)
+        plain = RtspCamera("rtsp:plain", "Garage", "rtsp://192.0.2.12:554/live")
+        self.window.devices = [garden, entrance, kitchen, plain]
+        self.window.selected_device = garden
+        self.window.stream_worker = Mock()
+        with patch.object(CameraPreview, "start"):
+            self.window.sync_previews()
+        with patch("app.load_icam365_config", side_effect=lambda uid: object() if uid == entrance.uid else None):
+            self.window.update_secondary_stream_menu()
+        actions = {action.text(): action for action in self.window.secondary_stream_menu.actions()}
+        self.assertEqual(list(actions), ["Jardin", "Entrée", "Cuisine"])
+        self.assertFalse(actions["Entrée"].isChecked())
+        self.assertTrue(self.window.previews[entrance.uid].main_stream)
+        actions["Entrée"].setChecked(True)
+        actions["Jardin"].setChecked(True)
+        self.assertTrue(self.window.camera_secondary_stream_enabled(entrance.uid))
+        self.assertFalse(self.window.previews[entrance.uid].main_stream)
+        self.assertTrue(self.window.previews[kitchen.uid].main_stream)
+        self.window.stream_worker.set_main_stream.assert_called_with(False)
+        with patch.object(self.window, "isFullScreen", return_value=True):
+            self.window.apply_stream_quality()
+        self.assertTrue(self.window.previews[entrance.uid].main_stream)
+        self.window.stream_worker.set_main_stream.assert_called_with(True)
+        self.window.apply_stream_quality()
+        self.assertFalse(self.window.previews[entrance.uid].main_stream)
+        self.window.show()
+        self.window.toggle_fullscreen()
+        self.application.processEvents()
+        self.assertTrue(self.window.previews[entrance.uid].main_stream)
+        self.window.stream_worker.set_main_stream.assert_called_with(True)
+        self.window.toggle_fullscreen()
+        self.application.processEvents()
+        self.assertFalse(self.window.previews[entrance.uid].main_stream)
+        self.window.stream_worker.set_main_stream.assert_called_with(False)
+        self.window.stream_worker = None
+
+    def test_camera_pane_starts_and_switches_its_worker_on_the_requested_stream(self) -> None:
+        entrance = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
+        preview = CameraPreview(entrance)
+        preview.set_main_stream(False)
+        preview.worker = Mock()
+        preview.set_main_stream(True)
+        preview.worker.set_main_stream.assert_called_once_with(True)
+        preview.worker = None
+        preview.close()
+
+    def test_rtsp_worker_changes_the_native_stream_and_restarts_its_recording(self) -> None:
+        camera = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
+        worker = RtspStreamWorker(camera, Mock(), Path("/tmp/intraswitch_okam_test.sock"), "SD")
+        worker.native_bridge = Mock(main_stream=True)
+        worker.set_continuous(True)
+        recording = Mock()
+        worker.continuous = recording
+        player = SimpleNamespace(height=1296)
+        with patch.object(worker, "_finish_recording_process") as finish, patch.object(worker, "_ffmpeg") as recorder, \
+                patch("app.mpv_request", side_effect=lambda socket_path, command: (True, player.height)), \
+                patch("app.continuous_directory", return_value=Path("/tmp")), \
+                patch("app.time.monotonic", return_value=100.0):
+            worker._select_native_stream()
+            worker.native_bridge.set_main_stream.assert_called_once_with(False)
+            finish.assert_called_once_with(recording)
+            self.assertIsNone(worker.continuous)
+            worker.native_bridge.main_stream = False
+            worker._select_native_stream()
+            worker.native_bridge.set_main_stream.assert_called_once_with(False)
+            worker._update_continuous(101.0)
+            player.height = None
+            worker._update_continuous(102.0)
+            recorder.assert_not_called()
+            player.height = 360
+            worker._update_continuous(103.0)
+            recorder.assert_called_once()
+            self.assertIs(worker.continuous, recorder.return_value)
+            worker.set_main_stream(True)
+            worker._select_native_stream()
+            worker.native_bridge.set_main_stream.assert_called_with(True)
+            finish.assert_called_with(recorder.return_value)
+            worker._update_continuous(114.9)
+            recorder.assert_called_once()
+            worker._update_continuous(115.0)
+            self.assertEqual(recorder.call_count, 2)
+
+    def test_imou_worker_queues_each_stream_change_once(self) -> None:
+        camera = RtspCamera("rtsp:kitchen", "Cuisine", "rtsp://192.0.2.11:554/live", provider=IMOU_ACCOUNT_PROVIDER)
+        worker = RtspStreamWorker(camera, Mock(), Path("/tmp/intraswitch_okam_test.sock"))
+        worker.set_main_stream(True)
+        self.assertTrue(worker.settings_requests.empty())
+        worker.set_main_stream(False)
+        worker.set_main_stream(False)
+        self.assertEqual(worker.settings_requests.get_nowait(), ("quality", "SD"))
+        self.assertTrue(worker.settings_requests.empty())
+        self.assertEqual(worker.quality, "HD")
+
     def test_local_replay_stays_in_its_camera_pane(self) -> None:
         camera = RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0")
         recording = Path(self.settings_directory.name) / "Entrée_entrance_20260927_180000.mkv"
@@ -864,7 +962,6 @@ class TrayTest(unittest.TestCase):
     def test_switching_camera_stops_previous_stream_before_starting_new_one(self) -> None:
         with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:
             self.window.settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.Format.IniFormat)
-            self.window.settings.setValue("camera/quality/garden", "HD")
             garden = SimpleNamespace(name="Jardin", uid="garden")
             entrance = SimpleNamespace(name="Entrée", uid="entrance")
             self.window.devices = [garden, entrance]

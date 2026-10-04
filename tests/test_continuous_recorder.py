@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -6,9 +7,18 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from app import ContinuousRecorder, RtspCamera, camera_recordings, continuous_prefix, main, prune_continuous_recordings, recover_continuous_recordings, segment_time
+from app import ContinuousRecorder, RtspCamera, camera_recordings, continuous_prefix, h264_sequence_parameters, main, prune_continuous_recordings, recover_continuous_recordings, segment_time
 
 from test_video_recorder import FRAME_SECONDS, encoded_frames, probe_duration
+
+
+def probe_size(path: Path) -> tuple[int, int]:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+        capture_output=True, check=True, text=True,
+    )
+    width, height = result.stdout.strip().split(",")
+    return int(width), int(height)
 
 
 class ContinuousRecorderTest(unittest.TestCase):
@@ -41,6 +51,32 @@ class ContinuousRecorderTest(unittest.TestCase):
         files = self.wait_for_files(2)
         self.assertAlmostEqual(probe_duration(files[0]), 2.0, delta=0.15)
         self.assertAlmostEqual(probe_duration(files[1]), 1.0, delta=0.15)
+
+    def test_sequence_parameters_identify_the_video_format(self) -> None:
+        small, large = encoded_frames(), encoded_frames("640x360")
+        self.assertTrue(h264_sequence_parameters(small[0]))
+        self.assertEqual(h264_sequence_parameters(small[10]), h264_sequence_parameters(small[0]))
+        self.assertNotEqual(h264_sequence_parameters(large[0]), h264_sequence_parameters(small[0]))
+        self.assertEqual(h264_sequence_parameters(small[1]), b"")
+        self.assertEqual(h264_sequence_parameters(b"\x00\x00\x00\x01\x67\x64\x00\x1f\x00\x00\x00\x01\x68\xee"), b"\x67\x64\x00\x1f")
+        self.assertEqual(h264_sequence_parameters(b"\x00\x00\x01\x67\x64"), b"\x67\x64")
+        self.assertEqual(h264_sequence_parameters(b"\x00\x00\x01\x09\xf0\x00\x00\x01\x06\x05" + b"\xff" * 700 + b"\x00\x00\x01\x67\x64"), b"\x67\x64")
+        self.assertEqual(h264_sequence_parameters(b"\x00\x00\x01"), b"")
+        self.assertEqual(h264_sequence_parameters(b""), b"")
+
+    def test_segment_ends_when_the_video_format_changes(self) -> None:
+        small, large = encoded_frames(), encoded_frames("640x360")
+        recorder = ContinuousRecorder(self.path, "Jardin")
+        for index, frame in enumerate(small[:20]):
+            recorder.write(frame, index % 10 == 0, index * FRAME_SECONDS)
+        time.sleep(1.1)
+        for index, frame in enumerate(large[:20], start=20):
+            recorder.write(frame, index % 10 == 0, index * FRAME_SECONDS)
+        recorder.close()
+        files = self.wait_for_files(2)
+        self.assertEqual([probe_size(path) for path in files], [(320, 180), (640, 360)])
+        self.assertAlmostEqual(probe_duration(files[0]), 2.0, delta=0.15)
+        self.assertAlmostEqual(probe_duration(files[1]), 2.0, delta=0.15)
 
     def test_recordings_older_than_the_retention_are_deleted(self) -> None:
         now = datetime(2026, 9, 27, 12, 0, 0)

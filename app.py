@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import BinaryIO, Callable
 from datetime import datetime, timedelta, timezone
 
-from PyQt6.QtCore import QEvent, QMargins, QMetaType, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QEvent, QMargins, QMetaType, QObject, QPoint, QPointF, QProcess, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
     QAction,
     QDesktopServices,
@@ -179,6 +179,14 @@ MAX_DRAG_STEPS = 4
 VIDEO_READ_TIMEOUT_SECONDS = 2
 VIDEO_STALL_SECONDS = 12
 CAMERA_KEEP_ALIVE_SECONDS = 45
+LIVE_STREAM_PATH = "livestream.cgi?streamid=10&substream={substream}&"
+MAIN_SUBSTREAM = 2
+SECONDARY_SUBSTREAM = 4
+SECONDARY_STREAM_ASPECT = "16:9"
+STREAM_ASPECT = "-1"
+STREAM_CHANGE_SECONDS = 15
+H264_START_CODE = b"\x00\x00\x01"
+H264_SEQUENCE_PARAMETERS = 7
 RTSP_STALL_SECONDS = 10
 RTSP_MAX_ACCUMULATED_DELAY_SECONDS = 6
 RTSP_DELAY_CONFIRM_SECONDS = 3
@@ -267,7 +275,6 @@ VIDEO_QUALITY_PATH = "camera_control.cgi?param=16&value={value}&"
 VIDEO_QUALITIES = {"Super HD": 100, "HD": 1, "SD": 2, "Low": 4}
 SUPER_HD_QUALITY = "Super HD"
 RESTART_REQUIRED_PIXELS = ("200", "300")
-QUALITY_SETTING = "camera/quality"
 SETTING_LIGHT = "light"
 SETTING_QUALITY = "quality"
 SETTING_RESPONSE_SECONDS = 5
@@ -362,6 +369,18 @@ CONTINUOUS_SETTING = "recording/continuous"
 DETECTION_SETTING = "detections/last_seen"
 LOCAL_DETECTION_SETTING = "detections/local_enabled"
 LOCAL_DETECTION_CAMERAS_SETTING = "detections/camera_enabled"
+SECONDARY_STREAM_CAMERAS_SETTING = "view/secondary_stream"
+STANDBY_HOST_SETTING = "standby/host"
+STANDBY_PROBE_COMMAND = "ping"
+STANDBY_PROBE_ARGUMENTS = ("-n", "-q", "-c", "1", "-w", "3", "--")
+STANDBY_PROBE_MS = 10000
+STANDBY_PROBE_STOP_MS = 1000
+STANDBY_RELEASE_PROBES = 3
+STANDBY_STATUS = "Standby while {host} is on."
+STANDBY_DESCRIPTION = ("Camera connections close while this computer answers on the network and reopen when it stops answering. "
+                       "Leave the address empty to keep the cameras connected.")
+STANDBY_HOST_MESSAGE = "Enter a host name or an IP address."
+HOST_NAME_PATTERN = re.compile(r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*")
 DETECTION_MESSAGE_MS = 15000
 NOTIFICATIONS_SERVICE = "org.freedesktop.Notifications"
 NOTIFICATIONS_PATH = "/org/freedesktop/Notifications"
@@ -906,6 +925,15 @@ def camera_continuous_allowed(camera: AccountDevice | RtspCamera) -> bool:
             or camera.imou_account is not None and camera.imou_account.cloud_recording)
 
 
+def secondary_stream_available(camera: AccountDevice | RtspCamera) -> bool:
+    if not isinstance(camera, RtspCamera) or camera.provider == IMOU_ACCOUNT_PROVIDER:
+        return True
+    try:
+        return load_icam365_config(camera.uid) is not None
+    except OSError:
+        return False
+
+
 def create_menu(parent: QWidget) -> QMenu:
     menu = QMenu(parent)
     menu.setStyleSheet(MENU_STYLE)
@@ -1072,6 +1100,14 @@ def valid_rtsp_url(url: str) -> bool:
                 and not parsed.username and not parsed.password and parsed.port != 0)
     except ValueError:
         return False
+
+
+def valid_host(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return len(host) <= 253 and HOST_NAME_PATTERN.fullmatch(host) is not None
+    return True
 
 
 def load_rtsp_cameras(settings: QSettings) -> list[RtspCamera]:
@@ -1343,15 +1379,29 @@ def recover_continuous_recordings(directory: Path, raw_paths: tuple[Path, ...] |
             LOG.info("Could not recover %s: %s", raw_path.name, ex)
 
 
+def h264_sequence_parameters(frame: bytes) -> bytes:
+    start = frame.find(H264_START_CODE)
+    while 0 <= start < len(frame) - len(H264_START_CODE):
+        end = frame.find(H264_START_CODE, start + len(H264_START_CODE))
+        if frame[start + len(H264_START_CODE)] & 0x1F == H264_SEQUENCE_PARAMETERS:
+            return frame[start + len(H264_START_CODE):end if end >= 0 else len(frame)].rstrip(b"\x00")
+        start = end
+    return b""
+
+
 class ContinuousRecorder:
     def __init__(self, directory: Path, prefix: str) -> None:
         self.directory = directory
         self.prefix = prefix
         self.recorder: VideoRecorder | None = None
         self.segment_started = 0.0
+        self.sequence_parameters = b""
 
     def write(self, frame: bytes, keyframe: bool, now: float) -> None:
-        if self.recorder is not None and keyframe and now - self.segment_started >= CONTINUOUS_SEGMENT_SECONDS:
+        sequence_parameters = h264_sequence_parameters(frame) if keyframe else b""
+        if self.recorder is not None and keyframe and (
+                now - self.segment_started >= CONTINUOUS_SEGMENT_SECONDS
+                or sequence_parameters and sequence_parameters != self.sequence_parameters):
             self.close()
         if self.recorder is None:
             if not keyframe:
@@ -1359,6 +1409,7 @@ class ContinuousRecorder:
             path = self.directory / f"{self.prefix}_{datetime.now():{CONTINUOUS_TIME_FORMAT}}{MATROSKA_SUFFIX}"
             self.recorder = VideoRecorder(path)
             self.segment_started = now
+            self.sequence_parameters = sequence_parameters
             prune_continuous_recordings(self.directory, datetime.now(), CONTINUOUS_RETENTION)
         try:
             self.recorder.write(frame, keyframe, now)
@@ -1956,6 +2007,10 @@ class StreamWorker(QThread):
         self.display_enabled = threading.Event()
         self.display_enabled.set()
         self.display_needs_keyframe = False
+        self.main_stream = True
+
+    def set_main_stream(self, enabled: bool) -> None:
+        self.main_stream = enabled
 
     def queue_setting(self, name: str, value: object) -> bool:
         try:
@@ -2030,16 +2085,9 @@ class StreamWorker(QThread):
                 return
             login = authenticate_camera(session, password)
             self._read_capabilities(session, login.user, login.password)
-            write_command(
-                session,
-                make_cgi_request(
-                    "livestream.cgi?streamid=10&substream=2&", login.user, login.password
-                ),
-            )
             stream_started = True
-            response = read_command_result(session, LIVE_STREAM_RESPONSE_COMMANDS, timeout=10)
-            if response is not None and response[1] != 0:
-                raise P2PError("The camera rejected the live stream request.")
+            main_stream = self.main_stream
+            self._request_stream(session, login.user, login.password, main_stream)
             received_video = False
             last_video = time.monotonic()
             last_keep_alive = last_video
@@ -2053,6 +2101,9 @@ class StreamWorker(QThread):
                 if time.monotonic() - last_keep_alive >= CAMERA_KEEP_ALIVE_SECONDS:
                     self._keep_session_open(session, login.user, login.password)
                     last_keep_alive = time.monotonic()
+                if main_stream != self.main_stream:
+                    main_stream = self.main_stream
+                    self._request_stream(session, login.user, login.password, main_stream)
                 try:
                     frame, frame_type = frame_reader.read(session)
                 except CS2Timeout:
@@ -2125,6 +2176,13 @@ class StreamWorker(QThread):
                 except CS2Error:
                     pass
             session.close()
+
+    def _request_stream(self, session: CS2Session, user: str, password: str, main_stream: bool) -> None:
+        substream = MAIN_SUBSTREAM if main_stream else SECONDARY_SUBSTREAM
+        write_command(session, make_cgi_request(LIVE_STREAM_PATH.format(substream=substream), user, password))
+        response = read_command_result(session, LIVE_STREAM_RESPONSE_COMMANDS, timeout=10)
+        if response is not None and response[1] != 0:
+            raise P2PError("The camera rejected the live stream request.")
 
     def _keep_session_open(self, session: CS2Session, user: str, password: str) -> None:
         write_command(session, make_cgi_request(CAMERA_STATUS_PATH, user, password))
@@ -3625,6 +3683,8 @@ class RtspStreamWorker(QThread):
         self.recording_announced = False
         self.continuous: subprocess.Popen[bytes] | None = None
         self.continuous_retry_at = 0.0
+        self.stream_change_height: object = None
+        self.stream_change_deadline = 0.0
         self.light_lock = threading.Lock()
         self.light_request: str | None = None
         self.ptz_lock = threading.Lock()
@@ -3636,6 +3696,7 @@ class RtspStreamWorker(QThread):
         self.imou_client: ImouClient | None = None
         self.imou_collections: dict[str, str] = {}
         self.quality = quality if quality in ("HD", "SD") else "HD"
+        self.requested_quality = self.quality
         self.settings_requests: queue.Queue[tuple[str, object]] = queue.Queue()
 
     def queue_setting(self, name: str, value: object) -> bool:
@@ -3643,6 +3704,13 @@ class RtspStreamWorker(QThread):
             return False
         self.settings_requests.put((name, value))
         return True
+
+    def set_main_stream(self, enabled: bool) -> None:
+        quality = "HD" if enabled else "SD"
+        if quality != self.requested_quality:
+            self.requested_quality = quality
+            if not self.queue_setting(SETTING_QUALITY, quality):
+                self.quality = quality
 
     def set_continuous(self, enabled: bool) -> None:
         if enabled and camera_continuous_allowed(self.camera):
@@ -3717,12 +3785,19 @@ class RtspStreamWorker(QThread):
             if self.player.poll() is not None:
                 raise ImouError("The camera video player stopped.")
             if self.socket_path.exists():
-                if not mpv_request(self.socket_path, ["loadfile", self.imou_stream_url, "replace"])[0]:
+                if not self._play_imou_stream(self.imou_stream_url, self.quality):
                     raise ImouError("Unable to open the private Imou stream in the video player.")
                 return
             if time.monotonic() >= deadline:
                 raise ImouError("The camera video player did not start.")
             self.stop_requested.wait(0.1)
+
+    def _play_imou_stream(self, url: str, quality: str) -> bool:
+        if not mpv_request(self.socket_path, ["loadfile", url, "replace"])[0]:
+            return False
+        mpv_request(self.socket_path, ["set_property", "video-aspect-override",
+                                       STREAM_ASPECT if quality == "HD" else SECONDARY_STREAM_ASPECT])
+        return True
 
     def _shared_imou_url(self) -> str:
         if self.imou_tunnel is None:
@@ -3762,9 +3837,10 @@ class RtspStreamWorker(QThread):
     def _change_imou_quality(self, quality: str) -> None:
         tunnel = self._open_imou_tunnel(quality)
         url = tunnel.url
-        if not mpv_request(self.socket_path, ["loadfile", url, "replace"])[0]:
+        if not self._play_imou_stream(url, quality):
             tunnel.close()
             raise ImouError("Unable to change the camera video quality.")
+        self._stop_continuous()
         previous = self.imou_tunnel
         self.imou_tunnel = tunnel
         self.imou_stream_url = url
@@ -3835,6 +3911,28 @@ class RtspStreamWorker(QThread):
             if tunnel is not None:
                 tunnel.close()
 
+    def _stop_continuous(self) -> None:
+        if self.continuous is not None:
+            self._finish_recording_process(self.continuous)
+            self.continuous = None
+
+    def _video_height(self) -> object:
+        return mpv_request(self.socket_path, ["get_property", "video-params/h"])[1]
+
+    def _select_native_stream(self) -> None:
+        main_stream = self.quality == "HD"
+        if self.native_bridge is not None and self.native_bridge.main_stream != main_stream:
+            self._stop_continuous()
+            self.native_bridge.set_main_stream(main_stream)
+            self.stream_change_height = self._video_height()
+            self.stream_change_deadline = time.monotonic() + STREAM_CHANGE_SECONDS
+
+    def _stream_changing(self, now: float) -> bool:
+        if now < self.stream_change_deadline and self._video_height() in (None, self.stream_change_height):
+            return True
+        self.stream_change_deadline = 0.0
+        return False
+
     def _update_continuous(self, now: float) -> None:
         if self.continuous is not None and self.continuous.poll() is not None:
             exit_code = self.continuous.returncode
@@ -3843,7 +3941,8 @@ class RtspStreamWorker(QThread):
             self.continuous_retry_at = now + CONTINUOUS_RETRY_SECONDS
             LOG.info("Continuous RTSP recording stopped for %s with exit code %s", self.camera.name, exit_code)
             self.continuous_failed.emit("Continuous RTSP recording stopped.")
-        if self.continuous_enabled.is_set() and self.continuous is None and now >= self.continuous_retry_at:
+        if (self.continuous_enabled.is_set() and self.continuous is None and now >= self.continuous_retry_at
+                and not self._stream_changing(now)):
             try:
                 directory = continuous_directory()
                 pattern = directory / f"{safe_camera_name(self.camera.name)}_{self.camera.uid[5:13]}_%Y%m%d_%H%M%S.mkv"
@@ -3852,9 +3951,8 @@ class RtspStreamWorker(QThread):
                 self.continuous_retry_at = now + CONTINUOUS_RETRY_SECONDS
                 LOG.info("Continuous RTSP recording could not start: %s", ex)
                 self.continuous_failed.emit("Unable to start continuous RTSP recording.")
-        elif not self.continuous_enabled.is_set() and self.continuous is not None:
-            self._finish_recording_process(self.continuous)
-            self.continuous = None
+        elif not self.continuous_enabled.is_set():
+            self._stop_continuous()
 
     def _stop_recording(self) -> None:
         process = self.recording
@@ -3876,6 +3974,7 @@ class RtspStreamWorker(QThread):
                 self._load_imou_stream()
             else:
                 self.native_bridge = get_bridge(self.camera.uid)
+                self._select_native_stream()
             deadline = time.monotonic() + (60 if self.native_bridge is not None else 30)
             while not self.stop_requested.is_set():
                 if self.imou_tunnel is not None and self.imou_tunnel.error:
@@ -3939,13 +4038,15 @@ class RtspStreamWorker(QThread):
                     pass
                 else:
                     try:
-                        self._change_imou_quality(quality)
-                        latency_guard = LiveLatencyGuard()
-                        catch_up = LiveCatchUp()
-                        last_progress_at = time.monotonic()
+                        if quality != self.quality:
+                            self._change_imou_quality(quality)
+                            latency_guard = LiveLatencyGuard()
+                            catch_up = LiveCatchUp()
+                            last_progress_at = time.monotonic()
                         self.setting_completed.emit(setting, quality)
                     except OSError as ex:
                         self.setting_failed.emit(setting, str(ex))
+                self._select_native_stream()
                 current_options = self.movement_options()
                 current_ptz = self.native_bridge.ptz_supported if self.native_bridge is not None else ptz_supported
                 if current_ptz and (not ptz_supported or current_options != movement_options):
@@ -4050,9 +4151,7 @@ class RtspStreamWorker(QThread):
             self.imou_stream_url = ""
             self.imou_client = None
             self._stop_recording()
-            if self.continuous is not None:
-                self._finish_recording_process(self.continuous)
-                self.continuous = None
+            self._stop_continuous()
             if self.imou_tunnel is not None:
                 self.imou_tunnel.close()
                 self.imou_tunnel = None
@@ -4083,6 +4182,8 @@ class CameraPreview(QWidget):
         self.on_local_event = on_local_event
         self.on_local_error = on_local_error
         self.continuous_enabled = continuous_enabled
+        self.main_stream = True
+        self.suspended_status: str | None = None
         self.settings = settings
         self.player: subprocess.Popen[bytes] | None = None
         self.mpv_directory: tempfile.TemporaryDirectory[str] | None = None
@@ -4239,7 +4340,7 @@ class CameraPreview(QWidget):
             button.setEnabled(enabled)
 
     def start(self) -> None:
-        if self.closing or self.worker is not None:
+        if self.closing or self.suspended_status is not None or self.worker is not None:
             return
         self.retry_enabled = True
         if (isinstance(self.camera, RtspCamera) and self.camera.imou_device is not None
@@ -4294,8 +4395,7 @@ class CameraPreview(QWidget):
             if playlist_fd is not None:
                 os.close(playlist_fd)
         if rtsp_camera:
-            quality = self.settings.value(f"{QUALITY_SETTING}/{self.camera.uid}", "HD", str) if self.settings is not None else "HD"
-            self.worker = RtspStreamWorker(rtsp_camera, self.player, socket_path, quality)
+            self.worker = RtspStreamWorker(rtsp_camera, self.player, socket_path, "HD" if self.main_stream else "SD")
         else:
             assert self.player.stdin is not None
             try:
@@ -4307,6 +4407,7 @@ class CameraPreview(QWidget):
                 self.camera, stored_camera_password(self.camera.uid) or "", self.player.stdin, continuous,
             )
             self.worker.set_display(self.isVisible())
+            self.worker.set_main_stream(self.main_stream)
         self.worker.set_continuous(self.continuous_enabled)
         self.worker.local_detection_enabled = self.local_detection_enabled
         self.worker.local_event_callback = self.on_local_event
@@ -4386,6 +4487,8 @@ class CameraPreview(QWidget):
         self._cleanup_player()
         if self.closing:
             self.stopped.emit()
+        elif self.suspended_status is not None:
+            self.show_status(self.suspended_status, True)
         elif self.retry_enabled:
             self._retry()
 
@@ -4631,6 +4734,22 @@ class CameraPreview(QWidget):
         self.local_detection_enabled = enabled
         if self.worker is not None:
             self.worker.local_detection_enabled = enabled
+
+    def set_main_stream(self, enabled: bool) -> None:
+        self.main_stream = enabled
+        if self.worker is not None:
+            self.worker.set_main_stream(enabled)
+
+    def set_suspended(self, status: str | None) -> None:
+        self.suspended_status = status
+        if status is None:
+            self.start()
+            return
+        self.retry_timer.stop()
+        self.video.clear_retained_frame()
+        self.show_status(status, True)
+        if self.worker is not None:
+            self.worker.stop()
 
     def stop(self) -> None:
         self.closing = True
@@ -5454,6 +5573,51 @@ class CameraProfileDialog(QDialog):
         self.accept()
 
 
+class HostPresence:
+    def __init__(self) -> None:
+        self.present = False
+        self.misses = 0
+
+    def observe(self, answered: bool) -> bool:
+        self.misses = 0 if answered else self.misses + 1
+        self.present = answered or self.present and self.misses < STANDBY_RELEASE_PROBES
+        return self.present
+
+
+class StandbyHostDialog(QDialog):
+    def __init__(self, parent: QWidget, host: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Standby")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        description = QLabel(STANDBY_DESCRIPTION)
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        form = QFormLayout()
+        self.address = QLineEdit(host)
+        self.address.setPlaceholderText("192.168.1.20")
+        form.addRow("Computer address", self.address)
+        layout.addLayout(form)
+        self.message = QLabel()
+        self.message.setStyleSheet(FORM_ERROR_STYLE)
+        self.message.setWordWrap(True)
+        layout.addWidget(self.message)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.submit)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def host(self) -> str:
+        return self.address.text().strip()
+
+    def submit(self) -> None:
+        if self.host() and not valid_host(self.host()):
+            self.message.setText(STANDBY_HOST_MESSAGE)
+            self.address.setFocus()
+            return
+        self.accept()
+
+
 class DesktopNotifier(QObject):
     def __init__(self, parent: QObject | None = None, bus: QDBusConnection | None = None) -> None:
         super().__init__(parent)
@@ -5627,6 +5791,15 @@ class MainWindow(QMainWindow):
         self.overlay_timer.setSingleShot(True)
         self.overlay_timer.timeout.connect(self.hide_overlay)
         self.settings = QSettings(STORAGE_NAME, STORAGE_NAME)
+        self.standby = False
+        self.presence = HostPresence()
+        self.standby_probe = QProcess(self)
+        self.standby_probe.setStandardOutputFile(QProcess.nullDevice())
+        self.standby_probe.setStandardErrorFile(QProcess.nullDevice())
+        self.standby_probe.finished.connect(self.on_standby_probe_finished)
+        self.standby_probe.errorOccurred.connect(self.on_standby_probe_error)
+        self.standby_timer = QTimer(self)
+        self.standby_timer.timeout.connect(self.probe_standby_host)
         self.rtsp_cameras = load_rtsp_cameras(self.settings)
         self.imou_accounts = load_imou_accounts(self.settings)
         self.imou_cameras = load_imou_cameras(self.settings, self.imou_accounts)
@@ -5785,6 +5958,7 @@ class MainWindow(QMainWindow):
         if QApplication.platformName() == "xcb":
             self.window_hints = X11WindowHints(self)
         self.set_status("Connecting to camera...")
+        self.apply_standby_host()
         if self.accounts or self.rtsp_cameras or self.imou_accounts:
             QTimer.singleShot(0, self.find_cameras)
         else:
@@ -5828,6 +6002,10 @@ class MainWindow(QMainWindow):
             self.camera_layout_actions[value] = action
         self.camera_profiles_menu = menu.addMenu("Camera profiles")
         self.camera_profiles_menu.aboutToShow.connect(self.update_camera_profiles_menu)
+        self.secondary_stream_menu = menu.addMenu("Secondary stream cameras")
+        self.secondary_stream_menu.aboutToShow.connect(self.update_secondary_stream_menu)
+        standby_action = menu.addAction("Standby while a computer is on...")
+        standby_action.triggered.connect(self.configure_standby)
         add_camera_menu = menu.addMenu("Add camera")
         for index, (label, callback) in enumerate(zip(CAMERA_SOURCE_LABELS, self.camera_source_actions())):
             action = add_camera_menu.addAction(f"{label}...")
@@ -5977,7 +6155,8 @@ class MainWindow(QMainWindow):
         return days
 
     def check_detections(self) -> None:
-        if not self.devices or self.detection_worker is not None or self.close_pending or self.replay is not None:
+        if (not self.devices or self.detection_worker is not None or self.close_pending or self.replay is not None
+                or self.standby):
             return
         selected = getattr(self, "selected_device", None)
         if selected is None or not self.camera_visible(selected.uid):
@@ -6131,6 +6310,93 @@ class MainWindow(QMainWindow):
         return self.settings.value(LOCAL_DETECTION_SETTING, True, bool) and (
             uid is None or self.camera_local_detection_enabled(uid)
         )
+
+    def camera_secondary_stream_enabled(self, uid: str) -> bool:
+        return self.settings.value(f"{SECONDARY_STREAM_CAMERAS_SETTING}/{uid}", False, bool)
+
+    def main_stream_enabled(self, uid: str) -> bool:
+        return self.isFullScreen() or not self.camera_secondary_stream_enabled(uid)
+
+    def update_secondary_stream_menu(self) -> None:
+        self.secondary_stream_menu.clear()
+        cameras = [camera for camera in self.ordered_devices() if secondary_stream_available(camera)]
+        for camera in cameras:
+            action = self.secondary_stream_menu.addAction(camera.name)
+            action.setCheckable(True)
+            action.setChecked(self.camera_secondary_stream_enabled(camera.uid))
+            action.toggled.connect(lambda enabled, uid=camera.uid: self.set_camera_secondary_stream(uid, enabled))
+        if not cameras:
+            self.secondary_stream_menu.addAction("No cameras available").setEnabled(False)
+
+    def apply_stream_quality(self) -> None:
+        selected = getattr(self, "selected_device", None)
+        if self.stream_worker is not None and selected is not None:
+            self.stream_worker.set_main_stream(self.main_stream_enabled(selected.uid))
+        for uid, preview in self.previews.items():
+            preview.set_main_stream(self.main_stream_enabled(uid))
+
+    def set_camera_secondary_stream(self, uid: str, enabled: bool) -> None:
+        self.settings.setValue(f"{SECONDARY_STREAM_CAMERAS_SETTING}/{uid}", enabled)
+        self.settings.sync()
+        self.apply_stream_quality()
+
+    def standby_host(self) -> str:
+        return self.settings.value(STANDBY_HOST_SETTING, "", str)
+
+    def standby_status(self) -> str | None:
+        return STANDBY_STATUS.format(host=self.standby_host()) if self.standby else None
+
+    def configure_standby(self) -> None:
+        dialog = StandbyHostDialog(self, self.standby_host())
+        if self.exec_camera_dialog(dialog) == QDialog.DialogCode.Accepted and dialog.host() != self.standby_host():
+            self.settings.setValue(STANDBY_HOST_SETTING, dialog.host())
+            self.settings.sync()
+            self.apply_standby_host()
+        dialog.deleteLater()
+
+    def apply_standby_host(self) -> None:
+        self.stop_standby_probe()
+        self.presence = HostPresence()
+        if self.standby_host():
+            self.set_standby(True)
+            self.standby_timer.start(STANDBY_PROBE_MS)
+            self.probe_standby_host()
+        else:
+            self.standby_timer.stop()
+            self.set_standby(False)
+
+    def probe_standby_host(self) -> None:
+        if self.standby_probe.state() == QProcess.ProcessState.NotRunning:
+            self.standby_probe.start(STANDBY_PROBE_COMMAND, [*STANDBY_PROBE_ARGUMENTS, self.standby_host()])
+
+    def stop_standby_probe(self) -> None:
+        self.standby_probe.blockSignals(True)
+        self.standby_probe.kill()
+        self.standby_probe.waitForFinished(STANDBY_PROBE_STOP_MS)
+        self.standby_probe.blockSignals(False)
+
+    def on_standby_probe_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+        self.set_standby(self.presence.observe(exit_status == QProcess.ExitStatus.NormalExit and exit_code == 0))
+
+    def on_standby_probe_error(self, error: QProcess.ProcessError) -> None:
+        if error == QProcess.ProcessError.FailedToStart:
+            self.set_standby(self.presence.observe(False))
+
+    def set_standby(self, enabled: bool) -> None:
+        if enabled == self.standby or self.close_pending or self.quit_requested:
+            return
+        self.standby = enabled
+        LOG.info(self.standby_status() or "Standby ended.")
+        for preview in self.previews.values():
+            preview.set_suspended(self.standby_status())
+        if enabled:
+            if self.replay is None:
+                self.stop_stream()
+                self.set_status(self.standby_status())
+        elif self.stream_worker is not None:
+            self.retry_pending = True
+        elif self.replay is None:
+            self.resume_live_if_idle()
 
     def update_local_detection_menu(self) -> None:
         self.local_detection_menu.clear()
@@ -6533,7 +6799,8 @@ class MainWindow(QMainWindow):
                 self.previews[camera.uid] = preview
                 self.video_grid.addWidget(preview, row, column)
                 preview.show()
-                preview.start()
+                preview.set_main_stream(self.main_stream_enabled(camera.uid))
+                preview.set_suspended(self.standby_status())
             else:
                 self.video_grid.addWidget(preview, row, column)
             preview.video.reorder_enabled = self.video.reorder_enabled
@@ -7196,9 +7463,6 @@ class MainWindow(QMainWindow):
                     legacy_detection = self.settings.value(DETECTION_SETTING, "", str)
                     if legacy_detection:
                         self.settings.setValue(f"{DETECTION_SETTING}/{self.selected_device.uid}", legacy_detection)
-                    legacy_quality = self.settings.value(QUALITY_SETTING, "", str)
-                    if legacy_quality:
-                        self.settings.setValue(f"{QUALITY_SETTING}/{self.selected_device.uid}", legacy_quality)
                 self.settings.sync()
             self.sync_previews()
             if self.stream_worker is None:
@@ -7221,6 +7485,9 @@ class MainWindow(QMainWindow):
 
     def watch_live(self) -> None:
         if not self.devices or self.stream_worker is not None:
+            return
+        if self.standby:
+            self.set_status(self.standby_status())
             return
         if isinstance(self.selected_device, RtspCamera) and self.selected_device.provider == IMOU_ACCOUNT_PROVIDER:
             set_replay_menu(self.replay_button, lambda: self.open_camera_sd_replay(self.selected_device),
@@ -7256,7 +7523,7 @@ class MainWindow(QMainWindow):
         if rtsp_camera is not None:
             assert self.mpv_socket is not None
             self.stream_worker = RtspStreamWorker(rtsp_camera, self.player, self.mpv_socket,
-                                                  self.settings.value(f"{QUALITY_SETTING}/{rtsp_camera.uid}", "HD", str))
+                                                  "HD" if self.main_stream_enabled(rtsp_camera.uid) else "SD")
         else:
             try:
                 continuous = ContinuousRecorder(continuous_directory(), safe_camera_name(self.selected_device.name))
@@ -7269,6 +7536,7 @@ class MainWindow(QMainWindow):
                 self.player.stdin,
                 continuous,
             )
+            self.stream_worker.set_main_stream(self.main_stream_enabled(self.selected_device.uid))
         self.stream_worker.set_continuous(self.continuous_recording_enabled())
         self.stream_worker.local_detection_enabled = self.local_detection_enabled(self.selected_device.uid)
         self.stream_worker.local_event_callback = self.local_detection_ready.emit
@@ -7574,6 +7842,7 @@ class MainWindow(QMainWindow):
                                               else "background-color: #171717;")
             self.dragged_alignment = None
             self.align_fullscreen_videos()
+            self.apply_stream_quality()
             self.camera_mask_timer.start(0)
             if self.isMinimized():
                 self.overlay_timer.stop()
@@ -7807,6 +8076,8 @@ class MainWindow(QMainWindow):
             self.schedule_reconnect("Camera disconnected.")
         elif not self.stream_error:
             self.set_status("Camera stopped.")
+        if self.standby:
+            self.set_status(self.standby_status())
         if self.close_pending:
             self.close()
         elif self.pending_camera is not None:
@@ -7824,6 +8095,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.hide_to_tray()
             return
+        self.standby_timer.stop()
+        self.stop_standby_probe()
         self.reconnect_timer.stop()
         self.layout_refresh_timer.stop()
         self.camera_mask_timer.stop()

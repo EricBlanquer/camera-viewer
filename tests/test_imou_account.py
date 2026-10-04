@@ -360,7 +360,10 @@ class ImouAccountUiTest(unittest.TestCase):
             client.return_value.secure_stream_url.return_value = STREAM_URL
             transport.return_value.url = "rtsp://127.0.0.1:40000/recording"
             worker._load_imou_stream()
-            ipc.assert_called_once_with(socket_path, ["loadfile", transport.return_value.url, "replace"])
+            self.assertEqual([call.args for call in ipc.call_args_list], [
+                (socket_path, ["loadfile", transport.return_value.url, "replace"]),
+                (socket_path, ["set_property", "video-aspect-override", "-1"]),
+            ])
             client.return_value.secure_stream_url.return_value = STREAM_URL + "-renewed"
 
             def start_recorder(arguments, **options):
@@ -385,13 +388,25 @@ class ImouAccountUiTest(unittest.TestCase):
         worker.imou_client = Mock()
         previous = Mock()
         worker.imou_tunnel = previous
-        with patch("app.RtspWebSocketTunnel") as transport, patch("app.mpv_request", return_value=(False, None)):
+        recording = Mock()
+        worker.continuous = recording
+        with patch("app.RtspWebSocketTunnel") as transport, patch("app.mpv_request", return_value=(False, None)) as ipc:
             with self.assertRaises(ImouError):
                 worker._change_imou_quality("SD")
+            ipc.assert_called_once_with(worker.socket_path, ["loadfile", transport.return_value.url, "replace"])
             self.assertIs(worker.imou_tunnel, previous)
             self.assertEqual(worker.quality, "HD")
+            self.assertIs(worker.continuous, recording)
             previous.close.assert_not_called()
             transport.return_value.close.assert_called_once()
+        with patch("app.RtspWebSocketTunnel") as transport, patch("app.mpv_request", return_value=(True, None)), \
+                patch.object(worker, "_finish_recording_process") as finish:
+            previous.close.side_effect = lambda: finish.assert_called_once_with(recording)
+            worker._change_imou_quality("SD")
+            self.assertIs(worker.imou_tunnel, transport.return_value)
+            self.assertEqual(worker.quality, "SD")
+            self.assertIsNone(worker.continuous)
+            previous.close.assert_called_once_with()
         self.assertTrue(worker.queue_setting("quality", "SD"))
         self.assertFalse(worker.queue_setting("quality", "LD"))
 

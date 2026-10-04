@@ -377,7 +377,9 @@ class ImouLocalUiTest(unittest.TestCase):
             "app.LocalRtspMediaBridge", side_effect=start_bridge
         ):
             worker._load_imou_stream()
-            self.assertEqual(ipc.call_args.args[1][1], bridges[0].url)
+            self.assertEqual([call.args[1] for call in ipc.call_args_list[-2:]], [
+                ["loadfile", bridges[0].url, "replace"], ["set_property", "video-aspect-override", "-1"],
+            ])
             with patch("app.subprocess.Popen", side_effect=inspect_recorder):
                 recorder = worker._ffmpeg(Path(self.directory.name) / "clip.mkv", False)
             worker._finish_recording_process(recorder)
@@ -387,6 +389,9 @@ class ImouLocalUiTest(unittest.TestCase):
             os.close(descriptor)
             self.assertEqual(len(created), 1)
             worker._change_imou_quality("SD")
+            self.assertEqual([call.args[1] for call in ipc.call_args_list[-2:]], [
+                ["loadfile", bridges[1].url, "replace"], ["set_property", "video-aspect-override", "16:9"],
+            ])
             bridges[0].close.assert_called_once()
             cloud.return_value.secure_stream_url.assert_not_called()
             cloud.return_value.stream_url.assert_not_called()

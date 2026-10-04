@@ -248,6 +248,29 @@ class NativeTransportTest(unittest.TestCase):
         self.assertEqual(session.receive(), ([], []))
         self.assertEqual(transport.sent, [b"\xf1\x42\0\x14" + transport._uid, b"\xf1\x43\0\0"])
 
+    def test_media_starts_on_the_requested_stream_and_the_bridge_changes_it_in_session(self):
+        for main_stream, quality in ((True, 1), (False, 5)):
+            session, transport = self.session()
+            session.start_media(main_stream)
+            self.assertEqual(
+                [struct.unpack_from("<I", packet, 8)[0] for packet in transport.sent if packet[:2] == b"\xf1\xd0"],
+                [0x8024, 0x8012, 0x1FF, 0x320, 0x300],
+            )
+            self.assertEqual(struct.unpack_from("<II", transport.sent[3], 16), (0, quality))
+        bridge = NativeBridge.__new__(NativeBridge)
+        bridge.main_stream = True
+        bridge.control_requests = queue.Queue(maxsize=16)
+        bridge.set_main_stream(True)
+        self.assertTrue(bridge.control_requests.empty())
+        bridge.set_main_stream(False)
+        self.assertEqual(bridge.control_requests.get_nowait(), (0x320, struct.pack("<II", 0, 5)))
+        bridge.set_main_stream(True)
+        self.assertEqual(bridge.control_requests.get_nowait(), (0x320, struct.pack("<II", 0, 1)))
+        for _ in range(16):
+            bridge.control_requests.put_nowait((0, b""))
+        bridge.set_main_stream(False)
+        self.assertTrue(bridge.main_stream)
+
     def test_close_stops_media_before_closing_connection(self):
         session, transport = self.session()
         session.authenticated = True

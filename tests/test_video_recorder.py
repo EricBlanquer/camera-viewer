@@ -12,7 +12,7 @@ FRAME_COUNT = 30
 FRAME_SECONDS = 0.1
 
 
-def encoded_frames() -> list[bytes]:
+def encoded_frames(size: str = "320x180") -> list[bytes]:
     stream = subprocess.run(
         [
             "ffmpeg",
@@ -22,7 +22,7 @@ def encoded_frames() -> list[bytes]:
             "-f",
             "lavfi",
             "-i",
-            f"testsrc=size=320x180:rate=15:duration={FRAME_COUNT / 15}",
+            f"testsrc=size={size}:rate=15:duration={FRAME_COUNT / 15}",
             "-c:v",
             "libx264",
             "-bf",
