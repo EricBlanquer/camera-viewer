@@ -182,11 +182,15 @@ Click the video to show or hide the translucent control bar.
 Live video starts automatically, and the viewer reconnects by itself after a network or transport interruption.
 RTSP and native iCam365 live views stay close to real time: when received video waits in the player, playback runs up to 1.5 times faster until only the buffer covering the camera's network pauses of the last twelve seconds remains.
 A muted camera plays without its audio track, so its picture follows the computer clock instead of the camera's audio clock; turning the sound on plays picture and sound in sync through a 0.2-second audio buffer.
-RTSP and native iCam365 live views also reconnect when playback accumulates at least six seconds of additional delay for three seconds.
+RTSP and native iCam365 live views return to live video when playback accumulates at least six seconds of additional delay for three seconds, or stops advancing for ten seconds.
 The delay is measured against monotonic elapsed time and the fastest observed playback position, independently of the camera's displayed clock and initial connection delay.
+When at least one second of received video is waiting in the player, only the player reopens the live stream: the camera connection, continuous recording, and local detection keep running, and the last image stays visible until the live image arrives.
+This applies to native iCam365 cameras, Imou Life cameras with local video access, and RTSP cameras added by address.
+Without waiting video, for the other cameras, or when the reopened player still does not advance, the viewer reconnects.
 Reconnecting closes the current recording segment and starts a fresh transport, player, and continuous recording segment.
 An O-KAM camera closes a live session that sends it no request for two minutes; the viewer requests the camera status every 45 seconds to keep each O-KAM live session open.
-O-KAM live views reconnect under the same six-second rule, measured against the capture time stamped on each camera frame.
+O-KAM live views reconnect when frames arrive at least six seconds after the capture time stamped on them for three seconds.
+O-KAM video reaches its player through a queue of 32 frames; while the player does not read it, further frames are left out of the display until the next keyframe, and the camera session, recordings, and local detection continue.
 O-KAM video packets are acknowledged in encrypted groups, at most 10 ms after reception and 32 packets at a time, which limits the traffic sent to the camera and the packets it repeats on a weak Wi-Fi link.
 Each video keeps its last decoded camera image during reconnection and replaces it when the new player has a frame.
 The connection message identifies this paused image; changing or stopping a camera clears it.

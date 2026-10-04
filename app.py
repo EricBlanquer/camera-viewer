@@ -179,6 +179,8 @@ MAX_DRAG_STEPS = 4
 VIDEO_READ_TIMEOUT_SECONDS = 2
 VIDEO_STALL_SECONDS = 12
 CAMERA_KEEP_ALIVE_SECONDS = 45
+PLAYER_FEED_FRAMES = 32
+PLAYER_FEED_POLL_SECONDS = 0.1
 LIVE_STREAM_PATH = "livestream.cgi?streamid=10&substream={substream}&"
 MAIN_SUBSTREAM = 2
 SECONDARY_SUBSTREAM = 4
@@ -190,6 +192,9 @@ H264_SEQUENCE_PARAMETERS = 7
 RTSP_STALL_SECONDS = 10
 RTSP_MAX_ACCUMULATED_DELAY_SECONDS = 6
 RTSP_DELAY_CONFIRM_SECONDS = 3
+LIVE_DELAY_MESSAGE = "Live playback delay increased by {delay:.1f}s. Reconnecting to live video."
+LIVE_STALL_MESSAGE = "The RTSP video stream stopped producing frames."
+LIVE_RELOAD_BUFFER_SECONDS = 1
 LIVE_READAHEAD_SECONDS = 10
 LIVE_AUDIO_BUFFER_SECONDS = 0.2
 LIVE_BUFFER_SECONDS = 0.25
@@ -1959,6 +1964,50 @@ class DetectionWorker(QThread):
             self.camera_password = ""
 
 
+class PlayerFeed:
+    def __init__(self, output: BinaryIO) -> None:
+        self.output = output
+        self.frames: queue.Queue[bytes] = queue.Queue(maxsize=PLAYER_FEED_FRAMES)
+        self.stopped = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def write(self, frame: bytes) -> bool:
+        if self.thread is None:
+            os.set_blocking(self.output.fileno(), False)
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+        elif not self.thread.is_alive():
+            raise BrokenPipeError
+        try:
+            self.frames.put_nowait(frame)
+        except queue.Full:
+            return False
+        return True
+
+    def close(self) -> None:
+        if self.thread is not None:
+            self.stopped.set()
+            self.thread.join()
+            if not self.output.closed:
+                os.set_blocking(self.output.fileno(), True)
+
+    def _run(self) -> None:
+        try:
+            while not self.stopped.is_set():
+                try:
+                    remaining = memoryview(self.frames.get(timeout=PLAYER_FEED_POLL_SECONDS))
+                except queue.Empty:
+                    continue
+                while remaining and not self.stopped.is_set():
+                    written = self.output.write(remaining)
+                    if written:
+                        remaining = remaining[written:]
+                    else:
+                        select.select([], [self.output], [], PLAYER_FEED_POLL_SECONDS)
+        except (OSError, ValueError):
+            pass
+
+
 class StreamWorker(QThread):
     status_changed = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -1985,7 +2034,7 @@ class StreamWorker(QThread):
         super().__init__()
         self.device = device
         self.camera_password = camera_password
-        self.player_input = player_input
+        self.player = PlayerFeed(player_input)
         self.stop_requested = threading.Event()
         self.controls: queue.Queue[tuple[str, ...]] = queue.Queue(maxsize=1)
         self.settings: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
@@ -2070,6 +2119,7 @@ class StreamWorker(QThread):
                 print(f"Camera stream error: {type(ex).__name__}: {ex}", file=sys.stderr, flush=True)
                 self.failed.emit("Unable to start the camera stream.")
         finally:
+            self.player.close()
             self.camera_password = ""
 
     def _stream(self) -> None:
@@ -2119,10 +2169,9 @@ class StreamWorker(QThread):
                 if not valid:
                     continue
                 last_video = time.monotonic()
-                try:
-                    latency_guard.observe(frame_reader.timestamp, last_video)
-                except OSError as ex:
-                    raise P2PError(str(ex)) from None
+                delay = latency_guard.observe(frame_reader.timestamp, last_video)
+                if delay is not None:
+                    raise P2PError(LIVE_DELAY_MESSAGE.format(delay=delay))
                 self.local_frame_times.append(last_video)
                 self._record_frame(frame, keyframe, last_video)
                 if self.continuous is not None:
@@ -2146,9 +2195,8 @@ class StreamWorker(QThread):
                     continue
                 if self.display_needs_keyframe and not keyframe:
                     continue
-                self.display_needs_keyframe = False
                 try:
-                    self.player_input.write(frame)
+                    self.display_needs_keyframe = not self.player.write(frame)
                 except BrokenPipeError:
                     raise P2PError("The video player stopped unexpectedly.") from None
         finally:
@@ -3613,10 +3661,10 @@ class LiveLatencyGuard:
         self.minimum_offset: float | None = None
         self.delayed_since: float | None = None
 
-    def observe(self, position: object, now: float) -> None:
+    def observe(self, position: object, now: float) -> float | None:
         if not isinstance(position, (int, float)) or isinstance(position, bool) or not math.isfinite(position):
             self.delayed_since = None
-            return
+            return None
         offset = now - position
         self.minimum_offset = offset if self.minimum_offset is None else min(self.minimum_offset, offset)
         delay = offset - self.minimum_offset
@@ -3625,7 +3673,8 @@ class LiveLatencyGuard:
         elif self.delayed_since is None:
             self.delayed_since = now
         elif now - self.delayed_since >= RTSP_DELAY_CONFIRM_SECONDS:
-            raise OSError(f"Live playback delay increased by {delay:.1f}s. Reconnecting to live video.")
+            return delay
+        return None
 
 
 class LiveCatchUp:
@@ -3911,6 +3960,18 @@ class RtspStreamWorker(QThread):
             if tunnel is not None:
                 tunnel.close()
 
+    def _live_url(self) -> str | None:
+        if self.camera.provider == IMOU_PROVIDER or (
+                self.camera.provider == IMOU_ACCOUNT_PROVIDER and self.camera.local_connection is None):
+            return None
+        return self.imou_stream_url or (self.native_bridge.url if self.native_bridge is not None else self.camera.url)
+
+    def _reload_player(self, buffered: object) -> bool:
+        url = self._live_url()
+        return (url is not None and isinstance(buffered, (int, float)) and not isinstance(buffered, bool)
+                and buffered >= LIVE_RELOAD_BUFFER_SECONDS
+                and mpv_request(self.socket_path, ["loadfile", url, "replace"])[0])
+
     def _stop_continuous(self) -> None:
         if self.continuous is not None:
             self._finish_recording_process(self.continuous)
@@ -4023,6 +4084,7 @@ class RtspStreamWorker(QThread):
             latency_guard = LiveLatencyGuard()
             catch_up = LiveCatchUp()
             playback_speed = 1.0
+            player_reloaded = False
             pending_light = None
             pending_ptz = None
             while not self.stop_requested.is_set():
@@ -4107,13 +4169,20 @@ class RtspStreamWorker(QThread):
                         self.control_failed.emit("Camera movement failed.")
                         pending_ptz = None
                 position_ready, position = mpv_request(self.socket_path, ["get_property", "time-pos"])
-                latency_guard.observe(position if position_ready else None, time.monotonic())
+                buffer_ready, buffered = mpv_request(self.socket_path, ["get_property", "demuxer-cache-duration"])
+                delay = latency_guard.observe(position if position_ready else None, time.monotonic())
                 if position_ready and isinstance(position, (int, float)) and position != last_position:
                     last_position = position
                     last_progress_at = time.monotonic()
-                elif time.monotonic() - last_progress_at > RTSP_STALL_SECONDS:
-                    raise OSError("The RTSP video stream stopped producing frames.")
-                buffer_ready, buffered = mpv_request(self.socket_path, ["get_property", "demuxer-cache-duration"])
+                    player_reloaded = False
+                if delay is not None or time.monotonic() - last_progress_at > RTSP_STALL_SECONDS:
+                    reason = LIVE_STALL_MESSAGE if delay is None else LIVE_DELAY_MESSAGE.format(delay=delay)
+                    if player_reloaded or not self._reload_player(buffered if buffer_ready else None):
+                        raise OSError(reason)
+                    LOG.info("Reloaded the %s player on its live stream: %s", self.camera.name, reason)
+                    player_reloaded = True
+                    latency_guard = LiveLatencyGuard()
+                    last_progress_at = time.monotonic()
                 speed = catch_up.speed(buffered if buffer_ready else None, time.monotonic())
                 if speed != playback_speed and mpv_request(self.socket_path, ["set_property", "speed", speed])[0]:
                     playback_speed = speed

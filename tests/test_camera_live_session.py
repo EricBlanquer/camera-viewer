@@ -71,9 +71,36 @@ class CameraLiveSessionTest(unittest.TestCase):
         self.assertEqual(continuous.write.call_count, 6)
         continuous.close.assert_called_once_with()
 
-    def stream(self, worker: StreamWorker, clock: SimpleNamespace, read: object) -> tuple[list[str], list[int]]:
+    def test_frames_refused_by_a_stalled_player_resume_at_the_next_keyframe(self) -> None:
+        clock = SimpleNamespace(now=100.0)
+        worker = StreamWorker(SimpleNamespace(uid="uid", name="Garden", device_password=""), "", io.BytesIO())
+        frames = [(b"first", False), (b"refused", False), (b"skipped", False), (b"key", True), (b"next", False)]
+        worker.player = Mock()
+        worker.player.write.side_effect = [True, False, True, True]
+
+        def read(_reader: object, _session: object) -> tuple[bytes, int]:
+            clock.now += 1
+            if len(frames) == 1:
+                worker.stop_requested.set()
+            return frames.pop(0)[0], 0
+
+        self.stream(worker, clock, read, lambda frame: (True, frame == b"key"))
+        self.assertEqual([call.args[0] for call in worker.player.write.call_args_list], [b"first", b"refused", b"key", b"next"])
+
+    def test_player_feed_closes_when_the_session_ends(self) -> None:
+        worker = StreamWorker(SimpleNamespace(uid="uid", name="Garden", device_password=""), "", io.BytesIO())
+        worker.player = Mock()
+        with patch.object(worker, "_stream", side_effect=P2PError("camera closed the native P2P session")), \
+                patch("sys.stderr"):
+            worker.run()
+        worker.player.close.assert_called_once_with()
+
+    def stream(self, worker: StreamWorker, clock: SimpleNamespace, read: object,
+               inspect: object = lambda frame: (True, False)) -> tuple[list[str], list[int]]:
         requests: list[str] = []
         responses: list[int] = []
+        if not isinstance(worker.player, Mock):
+            worker.player = Mock()
         with patch("app.prepare_camera_connection", return_value=("client", "service")), \
                 patch("app.select_camera_password", return_value="password"), \
                 patch("app.open_camera_session", return_value=Mock()), \
@@ -82,7 +109,7 @@ class CameraLiveSessionTest(unittest.TestCase):
                 patch("app.write_command", side_effect=lambda session, request: requests.append(request)), \
                 patch("app.read_command_result", return_value=None), \
                 patch("app.read_response_fields", side_effect=lambda *arguments: responses.append(arguments[1])), \
-                patch("app.inspect_h264", return_value=(True, False)), \
+                patch("app.inspect_h264", side_effect=inspect), \
                 patch("app.update_local_detector", return_value=None), \
                 patch("app.CameraFrameReader.read", read), \
                 patch("app.time.monotonic", side_effect=lambda: clock.now), \
