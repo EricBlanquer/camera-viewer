@@ -38,6 +38,7 @@ from PyQt6.QtGui import (
     QDesktopServices,
     QActionGroup,
     QColor,
+    QCursor,
     QHideEvent,
     QIcon,
     QMouseEvent,
@@ -212,6 +213,8 @@ RTSP_AUDIO_FILTER = "--af=lavfi=[volume=25dB,alimiter=limit=0.95]"
 AUDIO_RESPONSE_COMMAND = 0x6031
 RECONNECT_MAX_SECONDS = 30
 OVERLAY_TIMEOUT_MS = 5000
+CURSOR_POLL_MS = 200
+CURSOR_HIDE_DELAY_MS = 2000
 ICAM365_LIGHT_PORT = 8001
 ICAM365_LIGHT_PATH = "/whitelight"
 ICAM365_LIGHT_ON = "on"
@@ -5814,6 +5817,11 @@ class MainWindow(QMainWindow):
         self.camera_mask_timer = QTimer(self)
         self.camera_mask_timer.setSingleShot(True)
         self.camera_mask_timer.timeout.connect(self.update_camera_mask)
+        self.cursor_timer = QTimer(self)
+        self.cursor_timer.setInterval(CURSOR_POLL_MS)
+        self.cursor_timer.timeout.connect(self.check_cursor_activity)
+        self.cursor_position = QPoint()
+        self.cursor_idle_ms = 0
         self.pending_camera: tuple[str, str] | None = None
         self.pending_camera_replay: str | None = None
         self.pending_camera_replay_start: datetime | None = None
@@ -7897,6 +7905,30 @@ class MainWindow(QMainWindow):
             self.normal_geometry = self.geometry()
             self.showFullScreen()
 
+    def update_cursor_autohide(self) -> None:
+        self.cursor_position = QCursor.pos()
+        self.cursor_idle_ms = 0
+        self.show_cursor()
+        if self.isFullScreen():
+            self.cursor_timer.start()
+        else:
+            self.cursor_timer.stop()
+
+    def check_cursor_activity(self) -> None:
+        position = QCursor.pos()
+        if position != self.cursor_position:
+            self.cursor_position = position
+            self.cursor_idle_ms = 0
+            self.show_cursor()
+        elif self.cursor_idle_ms < CURSOR_HIDE_DELAY_MS:
+            self.cursor_idle_ms += CURSOR_POLL_MS
+            if self.cursor_idle_ms >= CURSOR_HIDE_DELAY_MS:
+                self.setCursor(Qt.CursorShape.BlankCursor)
+
+    def show_cursor(self) -> None:
+        if self.cursor().shape() == Qt.CursorShape.BlankCursor:
+            self.unsetCursor()
+
     def fit_video_aspect(self) -> None:
         if self.isFullScreen():
             return
@@ -7956,6 +7988,7 @@ class MainWindow(QMainWindow):
             self.align_fullscreen_videos()
             self.apply_stream_quality()
             self.update_hidden_pause()
+            self.update_cursor_autohide()
             self.camera_mask_timer.start(0)
             if self.isMinimized():
                 self.overlay_timer.stop()

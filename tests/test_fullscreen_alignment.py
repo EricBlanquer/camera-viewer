@@ -11,8 +11,8 @@ from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QApplication
 
 from app import (
-    CameraPreview, MainWindow, RtspCamera, load_fullscreen_alignment, nearest_fullscreen_alignment,
-    save_fullscreen_alignment,
+    CURSOR_HIDE_DELAY_MS, CURSOR_POLL_MS, CameraPreview, MainWindow, RtspCamera, load_fullscreen_alignment,
+    nearest_fullscreen_alignment, save_fullscreen_alignment,
 )
 
 
@@ -183,6 +183,28 @@ class FullscreenAlignmentTest(unittest.TestCase):
         self.drag(self.video(0), QPoint(0, 200))
         self.assertEqual(self.window.video_grid.contentsMargins(), QMargins())
         self.assertEqual(self.window.fullscreen_alignment(), "top")
+
+    def test_cursor_hides_after_two_idle_seconds_in_fullscreen_and_returns_on_movement(self) -> None:
+        self.assertTrue(self.window.cursor_timer.isActive())
+        self.assertEqual(self.window.cursor_timer.interval(), CURSOR_POLL_MS)
+        idle_ticks = CURSOR_HIDE_DELAY_MS // CURSOR_POLL_MS
+        with patch("app.QCursor.pos", return_value=self.window.cursor_position):
+            for _ in range(idle_ticks - 1):
+                self.window.check_cursor_activity()
+            self.assertNotEqual(self.window.cursor().shape(), Qt.CursorShape.BlankCursor)
+            self.window.check_cursor_activity()
+            self.assertEqual(self.window.cursor().shape(), Qt.CursorShape.BlankCursor)
+        with patch("app.QCursor.pos", return_value=self.window.cursor_position + QPoint(1, 0)):
+            self.window.check_cursor_activity()
+            self.assertNotEqual(self.window.cursor().shape(), Qt.CursorShape.BlankCursor)
+            for _ in range(idle_ticks):
+                self.window.check_cursor_activity()
+        self.assertEqual(self.window.cursor().shape(), Qt.CursorShape.BlankCursor)
+        with patch.object(self.window, "fit_video_aspect"):
+            self.window.toggle_fullscreen()
+            self.settle()
+        self.assertFalse(self.window.cursor_timer.isActive())
+        self.assertNotEqual(self.window.cursor().shape(), Qt.CursorShape.BlankCursor)
 
     def test_invalid_saved_records_are_ignored(self) -> None:
         self.settings.setValue("view/fullscreen_alignment", '[{"layout": "diagonal", "cameras": [], "alignment": "top"}, 3]')

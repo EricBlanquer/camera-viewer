@@ -105,6 +105,7 @@ The camera panes share the available space equally in a side-by-side layout.
 Each camera has its own local playback, photo, recording, and zoom controls.
 Double-click a live or playback video to enter or leave full-screen view.
 Full-screen view centers the videos vertically when the screen leaves space above or below them.
+In full-screen view, the mouse pointer disappears after two seconds without movement and reappears as soon as the mouse moves.
 With multiple cameras displayed, drag a video up or down to place the videos at the top, center, or bottom; they move to the nearest position while dragging and stay there when released.
 Dropping the video on another camera exchanges them instead and keeps the previous vertical position.
 The vertical position is remembered for each camera layout and set of displayed cameras, regardless of their order.
