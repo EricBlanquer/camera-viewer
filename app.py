@@ -38,6 +38,7 @@ from PyQt6.QtGui import (
     QDesktopServices,
     QActionGroup,
     QColor,
+    QHideEvent,
     QIcon,
     QMouseEvent,
     QMoveEvent,
@@ -6384,7 +6385,7 @@ class MainWindow(QMainWindow):
         return self.settings.value(f"{SECONDARY_STREAM_CAMERAS_SETTING}/{uid}", False, bool)
 
     def main_stream_enabled(self, uid: str) -> bool:
-        return self.isFullScreen() or not self.camera_secondary_stream_enabled(uid)
+        return (self.isVisible() and not self.isMinimized()) or not self.camera_secondary_stream_enabled(uid)
 
     def update_secondary_stream_menu(self) -> None:
         self.secondary_stream_menu.clear()
@@ -7888,10 +7889,15 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
+        self.apply_stream_quality()
         if not self.aspect_fitted:
             self.aspect_fitted = True
             QTimer.singleShot(0, self.fit_video_aspect)
         QTimer.singleShot(0, self.update_recording_badge)
+
+    def hideEvent(self, event: QHideEvent) -> None:
+        super().hideEvent(event)
+        self.apply_stream_quality()
 
     def moveEvent(self, event: QMoveEvent) -> None:
         super().moveEvent(event)

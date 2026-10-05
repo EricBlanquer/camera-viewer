@@ -87,8 +87,8 @@ Choosing a saved profile restores that selection, order, and layout; the profile
 Saving under an existing name, ignoring case, replaces that profile, and **Remove profile** deletes one.
 Cameras removed since a profile was saved are ignored when it is applied.
 The grid keeps its saved layout when docked.
-Use **Secondary stream cameras** to check the cameras that display their secondary stream outside full-screen view: 640 × 360 for O-KAM and native iCam365 cameras, and the secondary stream of Imou Life account cameras, displayed in 16:9.
-Checked cameras display their main stream while the window is in full-screen view, and unchecked cameras always display it.
+Use **Secondary stream cameras** to check the cameras that use their secondary stream while the window is hidden or minimized: 640 × 360 for O-KAM and native iCam365 cameras, and the secondary stream of Imou Life account cameras, displayed in 16:9.
+Checked cameras switch to their main stream as soon as the window is displayed, and unchecked cameras always use it.
 O-KAM and native iCam365 sessions change stream without reconnecting; Imou Life cameras reopen their video on the other stream.
 Continuous recording stores the displayed stream, and a recording segment ends when the stream changes, so each segment has a single video format.
 Use **Standby while a computer is on...** to enter the host name or IP address of another computer.
