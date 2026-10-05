@@ -59,6 +59,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGraphicsDropShadowEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -216,8 +217,13 @@ RECONNECT_MAX_SECONDS = 30
 OVERLAY_TIMEOUT_MS = 5000
 CURSOR_POLL_MS = 200
 CURSOR_HIDE_DELAY_MS = 2000
-CORNER_BUTTON_SIZE = 32
+CORNER_BUTTON_SIZE = 24
+CORNER_ICON_SIZE = 20
 CORNER_BUTTON_MARGIN = 8
+CORNER_BUTTON_OPACITY = 0.6
+CORNER_BUTTON_STYLE = "QPushButton { background: transparent; border: none; padding: 0; }"
+CORNER_SHADOW_COLOR = QColor(0, 0, 0, 200)
+CORNER_SHADOW_BLUR = 6
 SOLO_CAMERA_LABEL = "Show this camera alone in full screen"
 ALL_CAMERAS_LABEL = "Show all cameras"
 ICAM365_LIGHT_PORT = 8001
@@ -1551,11 +1557,16 @@ class ControlsOverlay(QWidget):
 class CornerButtonOverlay(ControlsOverlay):
     def __init__(self, video: VideoWidget) -> None:
         super().__init__(video)
-        self.setObjectName("cameraControls")
-        self.setStyleSheet(CAMERA_CONTROLS_STYLE)
+        self.setStyleSheet(CORNER_BUTTON_STYLE)
+        self.setWindowOpacity(CORNER_BUTTON_OPACITY)
         self.available = False
         self.hovered = False
         self.button = QPushButton()
+        shadow = QGraphicsDropShadowEffect(self.button)
+        shadow.setColor(CORNER_SHADOW_COLOR)
+        shadow.setBlurRadius(CORNER_SHADOW_BLUR)
+        shadow.setOffset(0, 0)
+        self.button.setGraphicsEffect(shadow)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.button)
@@ -1570,6 +1581,7 @@ class CornerButtonOverlay(ControlsOverlay):
         self.available = available
         set_button_icon(self.button, "exit_fullscreen" if solo else "fullscreen",
                         ALL_CAMERAS_LABEL if solo else SOLO_CAMERA_LABEL, CORNER_BUTTON_SIZE)
+        self.button.setIconSize(QSize(CORNER_ICON_SIZE, CORNER_ICON_SIZE))
         if not available:
             self.timer.stop()
             self.hide()
@@ -1587,11 +1599,16 @@ class CornerButtonOverlay(ControlsOverlay):
         super().enterEvent(event)
         self.hovered = True
         self.timer.stop()
+        self.setWindowOpacity(1.0)
 
     def leaveEvent(self, event: QEvent) -> None:
         super().leaveEvent(event)
         self.hovered = False
         self.timer.start(CURSOR_HIDE_DELAY_MS)
+        self.setWindowOpacity(CORNER_BUTTON_OPACITY)
+
+    def paintEvent(self, event: object) -> None:
+        pass
 
 
 class MovementControls(QWidget):
