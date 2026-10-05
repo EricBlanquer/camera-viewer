@@ -39,6 +39,7 @@ from PyQt6.QtGui import (
     QActionGroup,
     QColor,
     QCursor,
+    QEnterEvent,
     QHideEvent,
     QIcon,
     QMouseEvent,
@@ -215,6 +216,10 @@ RECONNECT_MAX_SECONDS = 30
 OVERLAY_TIMEOUT_MS = 5000
 CURSOR_POLL_MS = 200
 CURSOR_HIDE_DELAY_MS = 2000
+CORNER_BUTTON_SIZE = 32
+CORNER_BUTTON_MARGIN = 8
+SOLO_CAMERA_LABEL = "Show this camera alone in full screen"
+ALL_CAMERAS_LABEL = "Show all cameras"
 ICAM365_LIGHT_PORT = 8001
 ICAM365_LIGHT_PATH = "/whitelight"
 ICAM365_LIGHT_ON = "on"
@@ -1454,6 +1459,7 @@ class ControlsOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.requested_visible = False
         self.owner_window: QWidget | None = None
+        parent.installEventFilter(self)
         QApplication.instance().focusWindowChanged.connect(self.schedule_visibility_refresh)
 
     def schedule_visibility_refresh(self) -> None:
@@ -1473,11 +1479,11 @@ class ControlsOverlay(QWidget):
         active = QApplication.activeWindow()
         active_tool = (active is not None and active.parentWidget() is not None
                        and active.windowType() == Qt.WindowType.Tool and active.parentWidget().window() is owner)
-        super().setVisible(self.requested_visible and owner.isVisible()
+        super().setVisible(self.requested_visible and self.parentWidget().isVisible() and owner.isVisible()
                            and (owner.isActiveWindow() or active_tool) and not owner.isMinimized())
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self.owner_window:
+        if watched is self.owner_window or watched is self.parentWidget():
             if event.type() == QEvent.Type.Hide:
                 super().setVisible(False)
             elif event.type() in (QEvent.Type.WindowActivate, QEvent.Type.WindowDeactivate,
@@ -1540,6 +1546,52 @@ class ControlsOverlay(QWidget):
         radius = min(self.height() / 2, OVERLAY_MAX_RADIUS)
         painter.drawRoundedRect(self.rect(), radius, radius)
         painter.end()
+
+
+class CornerButtonOverlay(ControlsOverlay):
+    def __init__(self, video: VideoWidget) -> None:
+        super().__init__(video)
+        self.setObjectName("cameraControls")
+        self.setStyleSheet(CAMERA_CONTROLS_STYLE)
+        self.available = False
+        self.hovered = False
+        self.button = QPushButton()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.button)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.hide)
+        self.set_view(False, False)
+        video.set_corner_overlay(self)
+        self.hide()
+
+    def set_view(self, available: bool, solo: bool) -> None:
+        self.available = available
+        set_button_icon(self.button, "exit_fullscreen" if solo else "fullscreen",
+                        ALL_CAMERAS_LABEL if solo else SOLO_CAMERA_LABEL, CORNER_BUTTON_SIZE)
+        if not available:
+            self.timer.stop()
+            self.hide()
+
+    def reveal(self) -> None:
+        if not self.available:
+            return
+        self.parentWidget().place_overlay()
+        self.show()
+        self.raise_()
+        if not self.hovered:
+            self.timer.start(CURSOR_HIDE_DELAY_MS)
+
+    def enterEvent(self, event: QEnterEvent) -> None:
+        super().enterEvent(event)
+        self.hovered = True
+        self.timer.stop()
+
+    def leaveEvent(self, event: QEvent) -> None:
+        super().leaveEvent(event)
+        self.hovered = False
+        self.timer.start(CURSOR_HIDE_DELAY_MS)
 
 
 class MovementControls(QWidget):
@@ -2876,9 +2928,11 @@ class VideoWidget(QWidget):
     double_clicked = pyqtSignal(int, int)
     camera_dragged = pyqtSignal(str, QPoint)
     camera_drop_requested = pyqtSignal(str, QPoint)
+    pointer_moved = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
+        self.setMouseTracking(True)
         self.drag_start: tuple[int, int] | None = None
         self.drag_last: tuple[int, int] | None = None
         self.drag_origin = QPoint()
@@ -2893,6 +2947,7 @@ class VideoWidget(QWidget):
         self.controls_overlay: ControlsOverlay | None = None
         self.recording_badge: QWidget | None = None
         self.status_overlay: QWidget | None = None
+        self.corner_overlay: QWidget | None = None
         self.retained_frame = QPixmap()
         self.frame_placeholder = QLabel(self)
         self.frame_placeholder.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
@@ -2920,6 +2975,9 @@ class VideoWidget(QWidget):
     def set_status_overlay(self, overlay: QWidget) -> None:
         self.status_overlay = overlay
 
+    def set_corner_overlay(self, overlay: QWidget) -> None:
+        self.corner_overlay = overlay
+
     def set_controls_overlay(self, overlay: ControlsOverlay) -> None:
         self.controls_overlay = overlay
         if self.x_display is None:
@@ -2946,7 +3004,7 @@ class VideoWidget(QWidget):
             self.frame_placeholder.raise_()
         if self.input_window is not None:
             self.input_window.configure(stack_mode=X11.Above)
-        for overlay in (self.controls_overlay, self.recording_badge, self.status_overlay):
+        for overlay in (self.controls_overlay, self.recording_badge, self.status_overlay, self.corner_overlay):
             if overlay is not None and overlay.isVisible():
                 overlay.raise_()
         if self.x_display is not None:
@@ -2968,6 +3026,15 @@ class VideoWidget(QWidget):
                 QRect(
                     self.mapToGlobal(QPoint((self.width() - badge_size.width()) // 2, OVERLAY_MARGIN)),
                     badge_size,
+                )
+            )
+        if self.corner_overlay is not None:
+            corner_size = self.corner_overlay.sizeHint()
+            self.corner_overlay.setGeometry(
+                QRect(
+                    self.mapToGlobal(QPoint(self.width() - corner_size.width() - CORNER_BUTTON_MARGIN,
+                                            CORNER_BUTTON_MARGIN)),
+                    corner_size,
                 )
             )
         if self.controls_overlay is None:
@@ -3113,6 +3180,7 @@ class VideoWidget(QWidget):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        self.pointer_moved.emit()
         self._move_drag(round(event.position().x()), round(event.position().y()), event.globalPosition().toPoint())
 
     def wheelEvent(self, event: QWheelEvent) -> None:
@@ -3132,6 +3200,7 @@ class VideoWidget(QWidget):
         if self.x_display is None:
             return
         motion: tuple[int, int, QPoint] | None = None
+        moved = False
         while self.x_display.pending_events():
             event = self.x_display.next_event()
             if self.input_window is None:
@@ -3142,6 +3211,7 @@ class VideoWidget(QWidget):
                 continue
             if event.type == X11.MotionNotify:
                 motion = (event.event_x, event.event_y, QPoint(event.root_x, event.root_y))
+                moved = True
                 continue
             if event.type not in (X11.ButtonPress, X11.ButtonRelease):
                 continue
@@ -3158,6 +3228,8 @@ class VideoWidget(QWidget):
                     self._finish_drag(event.event_x, event.event_y, QPoint(event.root_x, event.root_y))
         if motion is not None:
             self._move_drag(*motion)
+        if moved:
+            self.pointer_moved.emit()
 
     def closeEvent(self, event: object) -> None:
         self.input_timer.stop()
@@ -4241,6 +4313,7 @@ class CameraPreview(QWidget):
     replay_requested = pyqtSignal(object)
     camera_replay_requested = pyqtSignal(object)
     fullscreen_requested = pyqtSignal()
+    solo_requested = pyqtSignal()
 
     def __init__(
         self, camera: AccountDevice | RtspCamera, continuous_enabled: bool = False,
@@ -4298,6 +4371,9 @@ class CameraPreview(QWidget):
         self.video_stack.addWidget(self.frame)
         layout.addWidget(self.video_stack, 1)
         self.status_overlay = VideoStatusOverlay(self.video)
+        self.corner_overlay = CornerButtonOverlay(self.video)
+        self.corner_overlay.button.clicked.connect(self.solo_requested.emit)
+        self.video.pointer_moved.connect(self.corner_overlay.reveal)
         self.overlay = ControlsOverlay(self.video)
         self.overlay.setObjectName("cameraControls")
         self.overlay.setStyleSheet(CAMERA_CONTROLS_STYLE)
@@ -5914,6 +5990,11 @@ class MainWindow(QMainWindow):
         self.video.double_clicked.connect(lambda x, y: self.toggle_fullscreen())
         self.video.camera_dragged.connect(self.drag_camera)
         self.video.camera_drop_requested.connect(self.drop_camera)
+        self.corner_overlay = CornerButtonOverlay(self.video)
+        self.corner_overlay.button.clicked.connect(lambda: self.toggle_solo_camera(self.video.camera_uid))
+        self.video.pointer_moved.connect(self.corner_overlay.reveal)
+        self.solo_uid: str | None = None
+        self.solo_fullscreen = False
         self.video_grid = QGridLayout()
         self.video_grid.setContentsMargins(0, 0, 0, 0)
         self.video_grid.setSpacing(0)
@@ -6665,6 +6746,36 @@ class MainWindow(QMainWindow):
     def visible_devices(self) -> list[AccountDevice | RtspCamera]:
         return [camera for camera in self.ordered_devices() if self.camera_visible(camera.uid)]
 
+    def displayed_devices(self) -> list[AccountDevice | RtspCamera]:
+        visible = self.visible_devices()
+        return [camera for camera in visible if camera.uid == self.solo_uid] or visible
+
+    def toggle_solo_camera(self, uid: str) -> None:
+        if self.solo_uid == uid:
+            self.leave_solo_camera()
+            return
+        visible = self.visible_devices()
+        if len(visible) < 2 or uid not in {camera.uid for camera in visible}:
+            return
+        if self.solo_uid is None:
+            self.solo_fullscreen = not self.isFullScreen()
+            if self.solo_fullscreen:
+                self.toggle_fullscreen()
+        self.solo_uid = uid
+        self.sync_previews()
+
+    def leave_solo_camera(self) -> None:
+        if self.solo_fullscreen and self.isFullScreen():
+            self.toggle_fullscreen()
+        self.end_solo_camera()
+
+    def end_solo_camera(self) -> None:
+        if self.solo_uid is None:
+            return
+        self.solo_uid = None
+        self.solo_fullscreen = False
+        self.sync_previews()
+
     def save_camera_visibility(self, visibility: dict[str, bool]) -> None:
         for camera in self.devices:
             setting = f"{CAMERA_VISIBLE_SETTING}/{camera.uid}"
@@ -6730,7 +6841,7 @@ class MainWindow(QMainWindow):
     def camera_grid_dimensions(self) -> tuple[int, int]:
         count = len(self.visible_devices())
         layout = self.effective_camera_layout()
-        if not count:
+        if not count or len(self.displayed_devices()) < count:
             return 1, 1
         if layout == "grid":
             return CAMERA_GRID_COLUMNS, max(CAMERA_GRID_MIN_ROWS, math.ceil(count / CAMERA_GRID_COLUMNS))
@@ -6867,8 +6978,13 @@ class MainWindow(QMainWindow):
             return
         selected = getattr(self, "selected_device", None)
         visible = self.visible_devices()
+        if len(visible) < 2 or self.solo_uid not in {camera.uid for camera in visible}:
+            self.solo_uid = None
+            self.solo_fullscreen = False
+        displayed = {camera.uid for camera in self.displayed_devices()}
         self.video.camera_uid = selected.uid if selected is not None else ""
-        self.video.reorder_enabled = len(visible) > 1
+        self.video.reorder_enabled = len(displayed) > 1
+        self.corner_overlay.set_view(len(visible) > 1, selected is not None and selected.uid == self.solo_uid)
         for replay in self.local_replays.values():
             replay.video.reorder_enabled = self.video.reorder_enabled
         cameras = [camera for camera in visible if selected is None or camera.uid != selected.uid]
@@ -6880,7 +6996,7 @@ class MainWindow(QMainWindow):
                 del self.previews[uid]
                 self._retire_preview(preview)
         self.video_grid.removeWidget(self.primary_pane)
-        self.primary_pane.setVisible(selected is not None and self.camera_visible(selected.uid))
+        self.primary_pane.setVisible(selected is not None and selected.uid in displayed)
         self.video_grid.removeWidget(self.empty_camera_label)
         self.empty_camera_label.setVisible(not visible)
         if not visible:
@@ -6890,10 +7006,13 @@ class MainWindow(QMainWindow):
             self.video_grid.setColumnStretch(column, 1 if column < columns else 0)
         for row in range(max(rows, self.video_grid.rowCount())):
             self.video_grid.setRowStretch(row, 1 if row < rows else 0)
-        for index, camera in enumerate(visible):
-            row, column = divmod(index, columns)
+        cells = iter(divmod(index, columns) for index in range(len(displayed)))
+        for camera in visible:
+            shown = camera.uid in displayed
+            row, column = next(cells) if shown else (0, 0)
             if selected is not None and camera.uid == selected.uid:
-                self.video_grid.addWidget(self.primary_pane, row, column)
+                if shown:
+                    self.video_grid.addWidget(self.primary_pane, row, column)
                 continue
             preview = self.previews.get(camera.uid)
             if preview is None:
@@ -6909,14 +7028,21 @@ class MainWindow(QMainWindow):
                 preview.replay_requested.connect(self.open_local_replay)
                 preview.camera_replay_requested.connect(self.open_camera_sd_replay)
                 preview.fullscreen_requested.connect(self.toggle_fullscreen)
+                preview.solo_requested.connect(lambda uid=camera.uid: self.toggle_solo_camera(uid))
                 self.previews[camera.uid] = preview
-                self.video_grid.addWidget(preview, row, column)
-                preview.show()
+                if shown:
+                    self.video_grid.addWidget(preview, row, column)
+                preview.setVisible(shown)
                 preview.set_main_stream(self.main_stream_enabled(camera.uid))
                 preview.set_suspended(self.suspension_status())
-            else:
+            elif shown:
                 self.video_grid.addWidget(preview, row, column)
+                preview.show()
+            else:
+                self.video_grid.removeWidget(preview)
+                preview.hide()
             preview.video.reorder_enabled = self.video.reorder_enabled
+            preview.corner_overlay.set_view(len(visible) > 1, camera.uid == self.solo_uid)
         self.preview_layout = layout
         self.camera_mask_timer.start(0)
         if len(cameras) == 1 and layout == "horizontal" and self.width() < 1120:
@@ -7989,6 +8115,8 @@ class MainWindow(QMainWindow):
             self.apply_stream_quality()
             self.update_hidden_pause()
             self.update_cursor_autohide()
+            if not self.isFullScreen():
+                self.end_solo_camera()
             self.camera_mask_timer.start(0)
             if self.isMinimized():
                 self.overlay_timer.stop()

@@ -106,6 +106,8 @@ Each camera has its own local playback, photo, recording, and zoom controls.
 Double-click a live or playback video to enter or leave full-screen view.
 Full-screen view centers the videos vertically when the screen leaves space above or below them.
 In full-screen view, the mouse pointer disappears after two seconds without movement and reappears as soon as the mouse moves.
+With several cameras displayed, moving the pointer over a video shows a small button in its top-right corner that displays that camera alone in full-screen view; the same button returns to all the cameras, and a double-click leaves full-screen view.
+The button disappears two seconds after the pointer stops moving, and the other cameras stay connected while one camera is displayed alone.
 With multiple cameras displayed, drag a video up or down to place the videos at the top, center, or bottom; they move to the nearest position while dragging and stay there when released.
 Dropping the video on another camera exchanges them instead and keeps the previous vertical position.
 The vertical position is remembered for each camera layout and set of displayed cameras, regardless of their order.
