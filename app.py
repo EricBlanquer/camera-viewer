@@ -383,6 +383,8 @@ STANDBY_PROBE_MS = 10000
 STANDBY_PROBE_STOP_MS = 1000
 STANDBY_RELEASE_PROBES = 3
 STANDBY_STATUS = "Standby while {host} is on."
+HIDDEN_PAUSE_STATUS = "Paused while the window is hidden."
+HIDDEN_PAUSE_DELAY_MS = 30000
 STANDBY_DESCRIPTION = ("Camera connections close while this computer answers on the network and reopen when it stops answering. "
                        "Leave the address empty to keep the cameras connected.")
 STANDBY_HOST_MESSAGE = "Enter a host name or an IP address."
@@ -5862,6 +5864,10 @@ class MainWindow(QMainWindow):
         self.overlay_timer.timeout.connect(self.hide_overlay)
         self.settings = QSettings(STORAGE_NAME, STORAGE_NAME)
         self.standby = False
+        self.hidden_pause = False
+        self.hidden_pause_timer = QTimer(self)
+        self.hidden_pause_timer.setSingleShot(True)
+        self.hidden_pause_timer.timeout.connect(self.pause_hidden_window)
         self.presence = HostPresence()
         self.standby_probe = QProcess(self)
         self.standby_probe.setStandardOutputFile(QProcess.nullDevice())
@@ -6029,6 +6035,7 @@ class MainWindow(QMainWindow):
             self.window_hints = X11WindowHints(self)
         self.set_status("Connecting to camera...")
         self.apply_standby_host()
+        self.update_hidden_pause()
         if self.accounts or self.rtsp_cameras or self.imou_accounts:
             QTimer.singleShot(0, self.find_cameras)
         else:
@@ -6226,7 +6233,7 @@ class MainWindow(QMainWindow):
 
     def check_detections(self) -> None:
         if (not self.devices or self.detection_worker is not None or self.close_pending or self.replay is not None
-                or self.standby):
+                or self.suspension_status() is not None):
             return
         selected = getattr(self, "selected_device", None)
         if selected is None or not self.camera_visible(selected.uid):
@@ -6384,8 +6391,11 @@ class MainWindow(QMainWindow):
     def camera_secondary_stream_enabled(self, uid: str) -> bool:
         return self.settings.value(f"{SECONDARY_STREAM_CAMERAS_SETTING}/{uid}", False, bool)
 
+    def window_displayed(self) -> bool:
+        return self.isVisible() and not self.isMinimized()
+
     def main_stream_enabled(self, uid: str) -> bool:
-        return (self.isVisible() and not self.isMinimized()) or not self.camera_secondary_stream_enabled(uid)
+        return self.window_displayed() or not self.camera_secondary_stream_enabled(uid)
 
     def update_secondary_stream_menu(self) -> None:
         self.secondary_stream_menu.clear()
@@ -6413,8 +6423,10 @@ class MainWindow(QMainWindow):
     def standby_host(self) -> str:
         return self.settings.value(STANDBY_HOST_SETTING, "", str)
 
-    def standby_status(self) -> str | None:
-        return STANDBY_STATUS.format(host=self.standby_host()) if self.standby else None
+    def suspension_status(self) -> str | None:
+        if self.standby:
+            return STANDBY_STATUS.format(host=self.standby_host())
+        return HIDDEN_PAUSE_STATUS if self.hidden_pause else None
 
     def configure_standby(self) -> None:
         dialog = StandbyHostDialog(self, self.standby_host())
@@ -6456,13 +6468,35 @@ class MainWindow(QMainWindow):
         if enabled == self.standby or self.close_pending or self.quit_requested:
             return
         self.standby = enabled
-        LOG.info(self.standby_status() or "Standby ended.")
+        LOG.info(STANDBY_STATUS.format(host=self.standby_host()) if enabled else "Standby ended.")
+        self.apply_suspension()
+
+    def update_hidden_pause(self) -> None:
+        if self.window_displayed() or self.continuous_recording_enabled():
+            self.hidden_pause_timer.stop()
+            self.set_hidden_pause(False)
+        elif not self.hidden_pause and not self.hidden_pause_timer.isActive():
+            self.hidden_pause_timer.start(HIDDEN_PAUSE_DELAY_MS)
+
+    def pause_hidden_window(self) -> None:
+        if not self.window_displayed() and not self.continuous_recording_enabled():
+            self.set_hidden_pause(True)
+
+    def set_hidden_pause(self, enabled: bool) -> None:
+        if enabled == self.hidden_pause or self.close_pending or self.quit_requested:
+            return
+        self.hidden_pause = enabled
+        LOG.info(HIDDEN_PAUSE_STATUS if enabled else "Hidden window pause ended.")
+        self.apply_suspension()
+
+    def apply_suspension(self) -> None:
+        status = self.suspension_status()
         for preview in self.previews.values():
-            preview.set_suspended(self.standby_status())
-        if enabled:
+            preview.set_suspended(status)
+        if status is not None:
             if self.replay is None:
                 self.stop_stream()
-                self.set_status(self.standby_status())
+                self.set_status(status)
         elif self.stream_worker is not None:
             self.retry_pending = True
         elif self.replay is None:
@@ -6501,6 +6535,7 @@ class MainWindow(QMainWindow):
     def set_continuous_recording(self, enabled: bool) -> None:
         self.settings.setValue(CONTINUOUS_SETTING, enabled)
         self.settings.sync()
+        self.update_hidden_pause()
         if self.stream_worker is not None:
             self.stream_worker.set_continuous(enabled)
         for preview in self.previews.values():
@@ -6870,7 +6905,7 @@ class MainWindow(QMainWindow):
                 self.video_grid.addWidget(preview, row, column)
                 preview.show()
                 preview.set_main_stream(self.main_stream_enabled(camera.uid))
-                preview.set_suspended(self.standby_status())
+                preview.set_suspended(self.suspension_status())
             else:
                 self.video_grid.addWidget(preview, row, column)
             preview.video.reorder_enabled = self.video.reorder_enabled
@@ -7556,8 +7591,8 @@ class MainWindow(QMainWindow):
     def watch_live(self) -> None:
         if not self.devices or self.stream_worker is not None:
             return
-        if self.standby:
-            self.set_status(self.standby_status())
+        if self.suspension_status() is not None:
+            self.set_status(self.suspension_status())
             return
         if isinstance(self.selected_device, RtspCamera) and self.selected_device.provider == IMOU_ACCOUNT_PROVIDER:
             set_replay_menu(self.replay_button, lambda: self.open_camera_sd_replay(self.selected_device),
@@ -7890,6 +7925,7 @@ class MainWindow(QMainWindow):
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
         self.apply_stream_quality()
+        self.update_hidden_pause()
         if not self.aspect_fitted:
             self.aspect_fitted = True
             QTimer.singleShot(0, self.fit_video_aspect)
@@ -7898,6 +7934,7 @@ class MainWindow(QMainWindow):
     def hideEvent(self, event: QHideEvent) -> None:
         super().hideEvent(event)
         self.apply_stream_quality()
+        self.update_hidden_pause()
 
     def moveEvent(self, event: QMoveEvent) -> None:
         super().moveEvent(event)
@@ -7918,6 +7955,7 @@ class MainWindow(QMainWindow):
             self.dragged_alignment = None
             self.align_fullscreen_videos()
             self.apply_stream_quality()
+            self.update_hidden_pause()
             self.camera_mask_timer.start(0)
             if self.isMinimized():
                 self.overlay_timer.stop()
@@ -8151,8 +8189,8 @@ class MainWindow(QMainWindow):
             self.schedule_reconnect("Camera disconnected.")
         elif not self.stream_error:
             self.set_status("Camera stopped.")
-        if self.standby:
-            self.set_status(self.standby_status())
+        if self.suspension_status() is not None:
+            self.set_status(self.suspension_status())
         if self.close_pending:
             self.close()
         elif self.pending_camera is not None:

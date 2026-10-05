@@ -11,8 +11,8 @@ from PyQt6.QtCore import QProcess, QSettings
 from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox
 
 from app import (
-    CameraPreview, HostPresence, MainWindow, RtspCamera, STANDBY_HOST_MESSAGE, STANDBY_HOST_SETTING,
-    StandbyHostDialog, valid_host,
+    CONTINUOUS_SETTING, HIDDEN_PAUSE_DELAY_MS, HIDDEN_PAUSE_STATUS, CameraPreview, HostPresence, MainWindow,
+    RtspCamera, STANDBY_HOST_MESSAGE, STANDBY_HOST_SETTING, StandbyHostDialog, valid_host,
 )
 
 HOST = "192.0.2.5"
@@ -189,6 +189,77 @@ class StandbyTest(unittest.TestCase):
             stop_stream.assert_not_called()
             reconnect.assert_not_called()
         self.window.replay = None
+
+    def test_hidden_window_without_recording_closes_connections_until_it_is_displayed(self) -> None:
+        self.settings.setValue(CONTINUOUS_SETTING, False)
+        self.window.stream_worker = worker = Mock()
+        self.preview.worker = preview_worker = Mock()
+        self.preview_start.reset_mock()
+        self.window.update_hidden_pause()
+        self.assertTrue(self.window.hidden_pause_timer.isActive())
+        self.assertEqual(self.window.hidden_pause_timer.interval(), HIDDEN_PAUSE_DELAY_MS)
+        self.assertFalse(self.window.hidden_pause)
+        worker.stop.assert_not_called()
+        self.window.hidden_pause_timer.timeout.emit()
+        self.assertTrue(self.window.hidden_pause)
+        worker.stop.assert_called_once_with()
+        preview_worker.stop.assert_called_once_with()
+        self.assertEqual(self.preview.status_overlay.label.text(), HIDDEN_PAUSE_STATUS)
+        self.window.on_stream_finished()
+        self.assertEqual(self.window.status_text, HIDDEN_PAUSE_STATUS)
+        self.assertFalse(self.window.reconnect_timer.isActive())
+        with patch.object(self.window, "start_player") as start_player, patch("app.DetectionWorker") as detections:
+            self.window.reconnect()
+            self.window.check_detections()
+            start_player.assert_not_called()
+            detections.assert_not_called()
+        with patch.object(self.window, "reconnect") as reconnect:
+            self.window.show()
+            self.application.processEvents()
+            self.assertFalse(self.window.hidden_pause)
+            reconnect.assert_called_with()
+            self.preview_start.assert_called_with()
+        self.assertIsNone(self.preview.suspended_status)
+        with patch.object(self.window, "reconnect"):
+            self.window.showMinimized()
+            self.application.processEvents()
+        self.assertTrue(self.window.hidden_pause_timer.isActive())
+
+    def test_window_displayed_again_before_the_delay_keeps_its_connections(self) -> None:
+        self.settings.setValue(CONTINUOUS_SETTING, False)
+        self.window.stream_worker = worker = Mock()
+        self.window.show()
+        self.application.processEvents()
+        self.window.hide()
+        self.assertTrue(self.window.hidden_pause_timer.isActive())
+        self.window.show()
+        self.application.processEvents()
+        self.assertFalse(self.window.hidden_pause_timer.isActive())
+        self.window.pause_hidden_window()
+        self.assertFalse(self.window.hidden_pause)
+        worker.stop.assert_not_called()
+
+    def test_continuous_recording_keeps_hidden_connections_open(self) -> None:
+        self.window.update_hidden_pause()
+        self.assertFalse(self.window.hidden_pause_timer.isActive())
+        self.window.set_continuous_recording(False)
+        self.window.hidden_pause_timer.timeout.emit()
+        self.assertTrue(self.window.hidden_pause)
+        with patch.object(self.window, "reconnect") as reconnect:
+            self.window.set_continuous_recording(True)
+            reconnect.assert_called_once_with()
+        self.assertFalse(self.window.hidden_pause)
+        self.assertIsNone(self.preview.suspended_status)
+
+    def test_standby_status_takes_precedence_over_the_hidden_window_pause(self) -> None:
+        self.settings.setValue(CONTINUOUS_SETTING, False)
+        self.window.set_hidden_pause(True)
+        self.enter_standby()
+        self.assertEqual(self.preview.status_overlay.label.text(), STATUS)
+        with patch.object(self.window, "reconnect") as reconnect:
+            self.window.set_standby(False)
+            reconnect.assert_not_called()
+        self.assertEqual(self.preview.suspended_status, HIDDEN_PAUSE_STATUS)
 
     def test_startup_waits_for_the_first_probe(self) -> None:
         self.settings.setValue(STANDBY_HOST_SETTING, HOST)

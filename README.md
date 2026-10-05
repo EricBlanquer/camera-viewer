@@ -91,6 +91,7 @@ Use **Secondary stream cameras** to check the cameras that use their secondary s
 Checked cameras switch to their main stream as soon as the window is displayed, and unchecked cameras always use it.
 O-KAM and native iCam365 sessions change stream without reconnecting; Imou Life cameras reopen their video on the other stream.
 Continuous recording stores the displayed stream, and a recording segment ends when the stream changes, so each segment has a single video format.
+Without continuous recording, Camera Viewer closes its live connections and microSD detection checks 30 seconds after the window is hidden or minimized, and reopens them as soon as the window is displayed.
 Use **Standby while a computer is on...** to enter the host name or IP address of another computer.
 While that computer answers the system `ping` command, Camera Viewer closes its live connections, recordings, local detection, and microSD detection checks, and each video displays the standby state; the window and its layout stay in place.
 The address is checked every ten seconds; connections reopen after three consecutive checks without an answer, and at startup they wait for the first check.
