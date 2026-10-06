@@ -121,6 +121,9 @@ class CameraPane {
         message,
     );
   }
+  wantsHd() {
+    return fullScreen === this.index || Boolean(this.camera && this.camera.always_hd);
+  }
   rectangle() {
     if (fullScreen === this.index) {
       return { x: 0, y: 0, width: SCREEN_WIDTH, height: SCREEN_HEIGHT };
@@ -179,7 +182,7 @@ class CameraPane {
     try {
       config = Object.assign({}, config, {
         local_host: webapis.network.getIp(),
-        hd: fullScreen === this.index,
+        hd: this.wantsHd(),
       });
       this.session = createSession(config, {
         status: (message) => this.status(message),
@@ -273,7 +276,7 @@ class CameraPane {
   applyQuality() {
     if (!this.session) return;
     if (this.session.setQuality) {
-      this.session.setQuality(fullScreen === this.index);
+      this.session.setQuality(this.wantsHd());
     } else this.connect(this.camera);
   }
   check() {

@@ -435,6 +435,26 @@ test("an Imou camera reconnects on its main stream in full screen and on its sec
   assert.equal(full.peer, null);
   assert.equal(pane.session.config.hd, false);
 });
+test("a camera marked always_hd stays on its main stream in the grid", async () => {
+  const app = viewer();
+  app.context.window.cameraViewer.configure([
+    { ...app.camera, always_hd: true },
+    { ...app.camera, name: "Garden", p2p_id: "TEST-2-ABCDE" },
+  ]);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  assert.equal(app.pane(0).session.config.hd, true);
+  assert.equal(app.pane(1).session.config.hd, false);
+  app.press(13);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(app.pane(0).session.config.hd, true);
+  app.press(10009);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(app.pane(0).session.config.hd, true);
+  assert.ok(!app.pane(0).session.qualities.includes(false));
+});
 test("a camera connected while it is in full screen starts on its main stream", async () => {
   const app = viewer();
   app.context.window.cameraViewer.configure([app.camera]);

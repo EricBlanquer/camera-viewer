@@ -21,6 +21,7 @@ An O-KAM camera closes a live session that sends it no request for two minutes; 
 O-KAM video packets are acknowledged in encrypted groups, at most 10 ms after reception and 32 packets at a time, which limits the traffic sent to the camera and the packets it repeats on a weak Wi-Fi link.
 In the grid, each camera sends its secondary stream: 640 × 360 for iCam365 and O-KAM, 640 × 480 for local Imou Life.
 The camera shown in full screen sends its main stream; the other cameras keep their secondary stream.
+A camera configured with `always_hd: true` sends its main stream in the grid as well as in full screen, for a sharper image at the cost of more decoding on the TV.
 iCam365 and O-KAM sessions change stream without reconnecting, and Imou Life sessions reconnect on the other stream while their last image stays visible.
 Decoders wait for an image keyframe at startup and after dropping compressed packets.
 The Imou decoder can queue up to 32 frames for TCP bursts, with a 16 MiB compressed-data limit; UDP decoders retain their four-frame limit.
@@ -76,6 +77,7 @@ Use the TV's actual LAN address in the following commands.
 The last command prints a debug port.
 Install Python's `websocket-client` package for the provisioning helper.
 Store an array of one to four camera configurations in a private JSON file outside the checkout and set its permissions to `600`.
+Any entry may add `always_hd: true` to keep that camera on its main stream in the grid instead of its secondary stream.
 An iCam365 entry contains `type: "icam365"`, `name`, `p2p_id`, `p2p_platform`, and `password` from an authenticated device detail response.
 Its optional `cloud_session` uses the same private metadata described in the root README; the TV refreshes the device credential over HTTPS before connecting.
 An O-KAM entry contains `type: "okam"`, `name`, the resolved fifteen-character `uid`, `service_parameter`, and its device `password`.
