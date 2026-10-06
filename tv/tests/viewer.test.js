@@ -5,11 +5,12 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const protocol = require("../web/protocol.js");
 const imou = require("../web/imou.js");
-function viewer() {
+function viewer(options = {}) {
   const listeners = {};
   const intervals = [];
   const sessions = [];
   const messages = [];
+  const screenSaverStates = [];
   let exits = 0;
   let now = 0;
   function element() {
@@ -110,7 +111,16 @@ function viewer() {
     localStorage: { getItem: () => null, setItem: () => {} },
     CameraProtocol: Object.assign({}, protocol, { NativeSession }),
     ImouVideo: Object.assign({}, imou, { Session: ImouSession }),
-    webapis: { network: { getIp: () => "192.0.2.10" } },
+    webapis: {
+      network: { getIp: () => "192.0.2.10" },
+      appcommon: "appcommon" in options ? options.appcommon : {
+        AppCommonScreenSaverState: { SCREEN_SAVER_OFF: 0, SCREEN_SAVER_ON: 1 },
+        setScreenSaver: (state, onsuccess) => {
+          screenSaverStates.push(state);
+          onsuccess(state);
+        },
+      },
+    },
     tizen: {
       application: {
         getCurrentApplication: () => ({
@@ -168,6 +178,11 @@ function viewer() {
     intervals,
     messages,
     exits: () => exits,
+    screenSaver: () => screenSaverStates,
+    setHidden: (hidden) => {
+      document.hidden = hidden;
+      listeners.visibilitychange();
+    },
     press: (keyCode) => listeners.keydown({ keyCode }),
     pane: (index) => vm.runInContext("panes[" + index + "]", context),
     setTime: (value) => {
@@ -376,6 +391,28 @@ test("OK shows the selected camera in full screen and Back returns to the grid",
   assert.deepEqual(session.qualities, [true, false]);
   assert.deepEqual(decodeSize(), [1, 960, 540]);
   app.press(10009);
+  assert.equal(app.exits(), 1);
+});
+test("the TV screen saver stays off while the viewer is displayed", () => {
+  const app = viewer();
+  assert.deepEqual(app.screenSaver(), [0]);
+  app.setHidden(true);
+  assert.deepEqual(app.screenSaver(), [0, 1]);
+  app.setHidden(false);
+  assert.deepEqual(app.screenSaver(), [0, 1, 0]);
+  app.press(10009);
+  assert.deepEqual(app.screenSaver(), [0, 1, 0, 1]);
+  assert.equal(app.exits(), 1);
+});
+test("an unavailable screen saver setting is logged without blocking the viewer", () => {
+  const app = viewer({ appcommon: undefined });
+  const failures = () =>
+    app.context.window.cameraViewer.events.filter((event) =>
+      event.message === "Screen saver setting failed"
+    ).length;
+  assert.equal(failures(), 1);
+  app.press(10009);
+  assert.equal(failures(), 2);
   assert.equal(app.exits(), 1);
 });
 test("OK on an unused cell keeps the grid", async () => {

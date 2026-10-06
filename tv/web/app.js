@@ -22,6 +22,20 @@ function log(message) {
   );
   console.log(message);
 }
+function preventScreenSaver(prevented) {
+  const failed = () => log("Screen saver setting failed");
+  try {
+    const appcommon = webapis.appcommon;
+    const states = appcommon.AppCommonScreenSaverState;
+    appcommon.setScreenSaver(
+      prevented ? states.SCREEN_SAVER_OFF : states.SCREEN_SAVER_ON,
+      () => {},
+      failed,
+    );
+  } catch (error) {
+    failed();
+  }
+}
 function refreshOverlay() {
   debugPanel.hidden = panes.some((pane) => pane.hasImage);
 }
@@ -361,6 +375,7 @@ document.addEventListener("keydown", (event) => {
     showGrid().applyQuality();
   } else if (event.keyCode === KEY_BACK) {
     stop();
+    preventScreenSaver(false);
     tizen.application.getCurrentApplication().exit();
   } else if (fullScreen !== null) return;
   else if (event.keyCode === KEY_ENTER) showFullScreen(selected);
@@ -368,6 +383,7 @@ document.addEventListener("keydown", (event) => {
   else if ([38, 40].includes(event.keyCode)) select(selected ^ 2);
 });
 document.addEventListener("visibilitychange", () => {
+  preventScreenSaver(!document.hidden);
   if (document.hidden) stop();
   else connect();
 });
@@ -380,3 +396,4 @@ try {
   log("Camera setup required");
 }
 select(0);
+preventScreenSaver(!document.hidden);

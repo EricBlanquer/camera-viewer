@@ -114,6 +114,7 @@ The arrow keys select a cell, and OK shows the selected camera in full screen on
 Back returns from full screen to the grid; from the grid, it exits the application.
 Other cameras stay connected in full screen, so the grid reappears without reconnecting.
 Hiding the application stops its sessions; returning to it connects again.
+The TV screen saver stays off while the application is displayed and is allowed again when it is hidden or exits.
 Camera stop commands are acknowledged for up to five seconds before closing the native socket.
 
 ## Third-party notices
