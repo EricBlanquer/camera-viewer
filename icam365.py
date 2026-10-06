@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import getpass
+import hashlib
 import json
 import logging
 import os
@@ -21,10 +24,15 @@ from cs2pppp import PpppSession, configure_tables, decode_init_string
 from cs2pppp._protocol import header
 from okam_native.cs2 import _DECODE_LOOKUP, _SHUFFLE
 
-from icam365_cloud import CloudSession
+from icam365_cloud import (
+    ACCOUNT_SIGN_IN_ERROR, AccountCredentialsRejected, CloudSession, CloudSessionRejected,
+)
 
 
 CONFIG_PATH = Path.home() / ".config/camera-viewer/icam365.json"
+ACCOUNT_SECRET_CATEGORY = "icam365-account"
+ACCOUNT_SECRET_LABEL = "Camera Viewer iCam365 account"
+DEFAULT_AREA_CODE = "33"
 MAX_FRAME_SIZE = 1024 * 1024
 MAX_PENDING_PACKETS = 4096
 MAX_CHANNEL_BUFFER = 8 * 1024 * 1024
@@ -48,6 +56,36 @@ PRESETS_REQUEST_COMMAND = 0x0452
 PRESETS_RESPONSE_COMMAND = 0x0453
 NATIVE_PTZ_DIRECTIONS = {"Up": 1, "Down": 2, "Left": 3, "Right": 6}
 LOG = logging.getLogger("okam-linux.icam365")
+_CONFIG_LOCK = threading.Lock()
+_REJECTED_SIGN_INS: set[bytes] = set()
+
+
+def stored_account_password(username: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["secret-tool", "lookup", "application", "okam-linux", ACCOUNT_SECRET_CATEGORY, username],
+            capture_output=True, check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    try:
+        return result.stdout.decode("utf-8").removesuffix("\n")
+    except UnicodeError:
+        return None
+
+
+def save_account_password(username: str, password: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["secret-tool", "store", f"--label={ACCOUNT_SECRET_LABEL}", "application", "okam-linux",
+             ACCOUNT_SECRET_CATEGORY, username],
+            input=password.encode("utf-8"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        return result.returncode == 0
+    except OSError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -111,21 +149,90 @@ class NativeConfig:
     def refreshed(self) -> NativeConfig:
         if self.cloud_session is None:
             return self
-        record = self.cloud_session.device_record()
+        session = self.cloud_session
+        try:
+            record = session.device_record()
+        except CloudSessionRejected:
+            session = signed_in_session(session)
+            record = session.device_record()
+        refreshed = self.with_device_record(record, session)
+        if session is not self.cloud_session or refreshed.password != self.password:
+            try:
+                store_config(refreshed)
+            except (OSError, ValueError, TypeError, AttributeError):
+                LOG.warning("Unable to save the refreshed iCam365 connection.")
+        return refreshed
+
+    def with_device_record(self, record: dict, session: CloudSession) -> NativeConfig:
         config = NativeConfig.from_record(record)
         if config.did != self.did:
             raise OSError("The iCam365 account returned a different camera.")
-        return NativeConfig(config.did, config.platform, config.password, self.cloud_session)
+        return NativeConfig(config.did, config.platform, config.password, session)
 
 
-def load_config(uid: str) -> NativeConfig | None:
+def signed_in_session(session: CloudSession) -> CloudSession:
+    password = stored_account_password(session.username) if session.username else None
+    if not password:
+        raise OSError(ACCOUNT_SIGN_IN_ERROR)
+    attempt = hashlib.sha256(f"{session.username}\0{password}".encode()).digest()
+    if attempt in _REJECTED_SIGN_INS:
+        raise OSError(ACCOUNT_SIGN_IN_ERROR)
+    try:
+        renewed = session.signed_in(password)
+    except AccountCredentialsRejected:
+        _REJECTED_SIGN_INS.add(attempt)
+        raise
+    LOG.info("Renewed the iCam365 account session.")
+    return renewed
+
+
+def read_records() -> dict:
     if not CONFIG_PATH.exists():
-        return None
+        return {}
     try:
         if CONFIG_PATH.stat().st_mode & 0o077:
             raise OSError("The iCam365 connection file must be private (mode 600).")
         records = json.loads(CONFIG_PATH.read_text())
-        record = records.get(uid)
+    except (ValueError, TypeError):
+        raise OSError("Invalid iCam365 native connection configuration.") from None
+    if not isinstance(records, dict):
+        raise OSError("Invalid iCam365 native connection configuration.")
+    return records
+
+
+def write_records(records: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=CONFIG_PATH.parent, prefix=".icam365-", delete=False) as output:
+            temporary_path = Path(output.name)
+            os.fchmod(output.fileno(), 0o600)
+            json.dump(records, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, CONFIG_PATH)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def store_config(config: NativeConfig) -> None:
+    with _CONFIG_LOCK:
+        records = read_records()
+        matches = [record for record in records.values()
+                   if isinstance(record, dict) and record.get("p2p_id", "").split(",", 1)[0] == config.did]
+        if not matches:
+            raise OSError("The iCam365 connection is no longer configured.")
+        for record in matches:
+            record["password"] = config.password
+            if config.cloud_session is not None:
+                record["cloud_session"] = config.cloud_session.record()
+        write_records(records)
+
+
+def load_config(uid: str) -> NativeConfig | None:
+    record = read_records().get(uid)
+    try:
         return NativeConfig.from_record(record) if isinstance(record, dict) else None
     except (ValueError, TypeError, AttributeError):
         raise OSError("Invalid iCam365 native connection configuration.") from None
@@ -649,13 +756,18 @@ def close_bridge(uid: str) -> None:
         bridge.close()
 
 
-def import_device_response(response_path: Path, camera_name: str, session_path: Path | None = None) -> None:
+def saved_camera_uid(camera_name: str) -> str:
     from PyQt6.QtCore import QSettings
     settings = QSettings("O-KAM Linux", "O-KAM Linux")
     cameras = json.loads(settings.value("cameras/rtsp", "[]", str))
     matches = [camera for camera in cameras if camera.get("name") == camera_name]
     if len(matches) != 1:
         raise OSError("The saved camera name must identify exactly one camera.")
+    return matches[0]["uid"]
+
+
+def import_device_response(response_path: Path, camera_name: str, session_path: Path | None = None) -> None:
+    uid = saved_camera_uid(camera_name)
     if response_path.stat().st_size > MAX_FRAME_SIZE:
         raise OSError("The iCam365 device response is too large.")
     response = json.loads(response_path.read_text())
@@ -674,37 +786,49 @@ def import_device_response(response_path: Path, camera_name: str, session_path: 
     config = NativeConfig.from_record(record)
     if not decode_init_string(config.platform, lut=_DECODE_LOOKUP).lib_ok:
         raise OSError("Invalid iCam365 directory configuration.")
-    records = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
-    if not isinstance(records, dict):
-        raise OSError("Invalid iCam365 native connection configuration.")
-    previous = records.get(matches[0]["uid"], {})
-    if session_path is None and isinstance(previous, dict) and previous.get("cloud_session") is not None:
-        cloud_session = CloudSession.from_record(previous["cloud_session"])
-        if cloud_session.uuid == items[0].get("uuid"):
-            record["cloud_session"] = previous["cloud_session"]
-    records[matches[0]["uid"]] = record
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", dir=CONFIG_PATH.parent, prefix=".icam365-", delete=False) as output:
-            temporary_path = Path(output.name)
-            json.dump(records, output)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary_path, CONFIG_PATH)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+    with _CONFIG_LOCK:
+        records = read_records()
+        previous = records.get(uid, {})
+        if session_path is None and isinstance(previous, dict) and previous.get("cloud_session") is not None:
+            cloud_session = CloudSession.from_record(previous["cloud_session"])
+            if cloud_session.uuid == items[0].get("uuid"):
+                record["cloud_session"] = previous["cloud_session"]
+        records[uid] = record
+        write_records(records)
+
+
+def sign_in(camera_name: str, username: str, password: str, area_code: str = DEFAULT_AREA_CODE) -> None:
+    config = load_config(saved_camera_uid(camera_name))
+    if config is None or config.cloud_session is None:
+        raise OSError("Import the camera with an iCam365 account session first.")
+    session = CloudSession.from_record(
+        config.cloud_session.record() | {"username": username, "area_code": area_code}
+    ).signed_in(password)
+    renewed = config.with_device_record(session.device_record(), session)
+    if not save_account_password(username, password):
+        raise OSError("Unable to save the iCam365 account password in the desktop keyring.")
+    store_config(renewed)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Import private iCam365 native connection parameters.")
-    parser.add_argument("--device-response", type=Path, required=True)
     parser.add_argument("--camera-name", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--device-response", type=Path)
+    source.add_argument("--sign-in", metavar="ACCOUNT")
     parser.add_argument("--cloud-session", type=Path)
+    parser.add_argument("--area-code", default=DEFAULT_AREA_CODE)
     arguments = parser.parse_args()
-    try:
-        import_device_response(arguments.device_response, arguments.camera_name, arguments.cloud_session)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        parser.exit(1, "Unable to import the iCam365 connection parameters.\n")
-    print("Private iCam365 connection parameters saved.")
+    if arguments.sign_in is not None:
+        try:
+            sign_in(arguments.camera_name, arguments.sign_in, getpass.getpass("iCam365 password: "),
+                    arguments.area_code)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            parser.exit(1, "Unable to sign in to the iCam365 account.\n")
+        print("iCam365 account session saved.")
+    else:
+        try:
+            import_device_response(arguments.device_response, arguments.camera_name, arguments.cloud_session)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            parser.exit(1, "Unable to import the iCam365 connection parameters.\n")
+        print("Private iCam365 connection parameters saved.")

@@ -156,7 +156,10 @@ To fetch its current value before each native connection, also pass `--cloud-ses
 The private session JSON contains `origin` (`https://api-we01.tange365.com`), `token`, `appid`, `uuid`, and the Android request metadata in `query`.
 The session must identify the imported device and is saved in the same owner-only configuration file.
 If the account service is unavailable, the viewer tries the saved camera credential; a rejected credential then displays the account-session error.
-When the account token expires, import a renewed authenticated session; automatic iCam365 account sign-in is not implemented.
+For an account that signs in with a username and password, run `icam365.py --sign-in <account> --camera-name Entrance` once; it prompts for the password, stores it in the desktop keyring, and records the account in the connection file.
+The viewer then renews the account session on its own whenever the stored one expires, so the credential stays valid without a phone.
+Pass `--area-code` when the account's phone number uses a code other than `33`.
+An account that signs in only through a third-party identity provider cannot use `--sign-in`; import a renewed authenticated session instead when its token expires.
 After restarting the viewer, that camera uses its native transport for live view and local recordings; the phone is not needed.
 One native session supplies all local consumers, with ordered packets, acknowledgements, bounded retries, and explicit video/audio stop commands before disconnecting.
 Each missing packet has an eight-second recovery window; recovering a gap starts a fresh window for the next missing packet while duplicate packets keep the current deadline.
