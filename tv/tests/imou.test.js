@@ -741,3 +741,80 @@ test("local sessions open the secondary stream for the grid and the main stream 
     );
   }
 });
+test("a local Imou camera with its account moves through the account API", async (t) => {
+  const original = global.XMLHttpRequest;
+  const calls = [];
+  global.XMLHttpRequest = class {
+    open(method, url) {
+      this.url = url;
+    }
+    setRequestHeader() {}
+    send(body) {
+      calls.push({ url: this.url, body: JSON.parse(body) });
+      const data = this.url.endsWith("accessToken")
+        ? { accessToken: "moveToken", expireTime: 3600 }
+        : {};
+      this.status = 200;
+      this.responseText = JSON.stringify({
+        result: this.url.endsWith("accessToken")
+          ? { code: "0", data }
+          : { code: "0" },
+      });
+      queueMicrotask(() => this.onload());
+    }
+  };
+  t.after(() => {
+    global.XMLHttpRequest = original;
+  });
+  const native = {
+    postMessage: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+  const statuses = [];
+  const callbacks = {
+    status: (message) => statuses.push(message),
+    video: () => {},
+    error: () => {},
+  };
+  const movable = {
+    ...localCamera,
+    account: { ...account, app_id: "moveApp" },
+    device_id: "testDevice",
+    channel_id: "0",
+  };
+  const session = new imou.Session(movable, native, callbacks);
+  assert.equal(session.move("left"), false);
+  session.state = "playing";
+  assert.equal(session.move("diagonal"), false);
+  assert.equal(session.move("left"), true);
+  assert.equal(session.move("left"), true);
+  await session.moveRequest;
+  assert.deepEqual(statuses, []);
+  const moves = calls.filter((call) => call.url.endsWith("/controlMovePTZ"));
+  assert.equal(moves.length, 1);
+  assert.equal(
+    moves[0].url,
+    "https://openapi-fk.easy4ip.com/openapi/controlMovePTZ",
+  );
+  assert.deepEqual(moves[0].body.params, {
+    deviceId: "testDevice",
+    channelId: "0",
+    operation: "2",
+    duration: 500,
+    token: "moveToken",
+  });
+  const local = new imou.Session(localCamera, native, callbacks);
+  local.state = "playing";
+  assert.equal(local.move("left"), false);
+  assert.throws(
+    () =>
+      imou.validate({
+        ...localCamera,
+        account: { ...account, region: "Mars" },
+        device_id: "testDevice",
+        channel_id: "0",
+      }),
+    /Invalid Imou camera configuration/,
+  );
+});

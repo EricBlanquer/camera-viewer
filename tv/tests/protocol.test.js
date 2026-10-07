@@ -359,3 +359,91 @@ test("O-KAM live sessions request the camera status every 45 seconds", () => {
   other.tick();
   assert.deepEqual(commands, []);
 });
+function authenticatedIcam(features) {
+  const { connection } = session();
+  const commands = [];
+  connection.command = (command, body) =>
+    commands.push([command, Array.from(body || [])]);
+  connection.commandBuffer.append(
+    p.concat(p.word32(0x8003), p.word32(4), p.word32(0)),
+  );
+  if (features) {
+    const payload = p.bytes(JSON.stringify({ feature: features }) + "\0");
+    connection.commandBuffer.append(
+      p.concat(p.word32(0x8025), p.word32(payload.length), payload),
+    );
+  }
+  connection.commands();
+  commands.length = 0;
+  return { connection, commands };
+}
+const pulse = () => new Promise((resolve) => setTimeout(resolve, 150));
+test("iCam365 PTZ cameras move with a short pulse and then stop", async () => {
+  const unknown = authenticatedIcam();
+  assert.equal(unknown.connection.move("left"), false);
+  assert.deepEqual(unknown.commands, []);
+  const { connection, commands } = authenticatedIcam({
+    SupportPTZ: "Yes,PresetPos",
+  });
+  assert.equal(connection.move("toString"), false);
+  assert.equal(connection.move("left"), true);
+  assert.equal(connection.move("left"), true);
+  assert.deepEqual(commands, [[0x1001, [3, 0, 0, 0, 0, 0, 0, 0]]]);
+  await pulse();
+  assert.deepEqual(commands.at(-1), [0x1001, [0, 0, 0, 0, 0, 0, 0, 0]]);
+  assert.equal(connection.move("up"), true);
+  assert.equal(connection.move("right"), true);
+  assert.deepEqual(commands.slice(2), [
+    [0x1001, [1, 0, 0, 0, 0, 0, 0, 0]],
+    [0x1001, [0, 0, 0, 0, 0, 0, 0, 0]],
+    [0x1001, [6, 0, 0, 0, 0, 0, 0, 0]],
+  ]);
+  await pulse();
+  assert.equal(commands.length, 6);
+});
+test("iCam365 tilt-only cameras ignore pan movements", () => {
+  const { connection, commands } = authenticatedIcam({
+    SupportPTZ: "Yes,VertOnly",
+  });
+  assert.equal(connection.move("left"), false);
+  assert.equal(connection.move("down"), true);
+  assert.deepEqual(commands, [[0x1001, [2, 0, 0, 0, 0, 0, 0, 0]]]);
+  connection.finishMove();
+  const fixed = authenticatedIcam({ SupportPTZ: "No" });
+  assert.equal(fixed.connection.move("up"), false);
+});
+test("O-KAM cameras move with motor start and stop requests", async () => {
+  const { connection } = session("okam");
+  const requests = [];
+  connection.cgi = (path) => requests.push(path);
+  assert.equal(connection.move("right"), false);
+  const response = p.bytes("result=0;");
+  const header = new Uint8Array(8);
+  p.view(header).setUint16(0, 0x0a01, true);
+  p.view(header).setUint16(2, 0x6001, true);
+  p.view(header).setUint16(4, response.length, true);
+  connection.commandBuffer.append(p.concat(header, response));
+  connection.commands();
+  requests.length = 0;
+  assert.equal(connection.move("right"), true);
+  assert.equal(connection.move("up"), true);
+  await pulse();
+  assert.deepEqual(requests, [
+    "decoder_control.cgi?command=6&onestep=0&",
+    "decoder_control.cgi?command=7&onestep=0&",
+    "decoder_control.cgi?command=0&onestep=0&",
+    "decoder_control.cgi?command=1&onestep=0&",
+  ]);
+});
+test("closing a moving camera stops it before closing the stream", () => {
+  const { connection, commands } = authenticatedIcam({ SupportPTZ: "Yes" });
+  connection.peer = { host: "192.0.2.2", port: 40000 };
+  assert.equal(connection.move("down"), true);
+  connection.close();
+  assert.deepEqual(commands.map(([command, body]) => [command, body[0]]), [
+    [0x1001, 2],
+    [0x1001, 0],
+    [0x2ff, 2],
+  ]);
+  assert.equal(connection.moveTimer, null);
+});

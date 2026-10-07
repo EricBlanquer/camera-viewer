@@ -13,6 +13,22 @@
   const ACKNOWLEDGEMENT_DELAY_MS = 10;
   const MAX_ACKNOWLEDGED_PACKETS = 32;
   const AUTHENTICATION_REJECTED = "Camera rejected authentication";
+  const ICAM_MOVE_COMMAND = 0x1001;
+  const ICAM_FEATURES_RESPONSE = 0x8025;
+  const ICAM_PTZ_MODES = ["Yes", "Relative", "Hybrid", "Absolute"];
+  const ICAM_MOVES = new Map([
+    ["up", 1],
+    ["down", 2],
+    ["left", 3],
+    ["right", 6],
+  ]);
+  const OKAM_MOVES = new Map([
+    ["up", [0, 1]],
+    ["down", [2, 3]],
+    ["left", [4, 5]],
+    ["right", [6, 7]],
+  ]);
+  const MOVE_PULSE_MS = 120;
   const SHUFFLE_HEX =
     "7c9ce84a13dedcb22f2123e4307b3d8cbc0b270c3cf79ae7087196009785efc11fc4dba1c2ebd901faba3b05b81587832872d18b5ad6da9358feaacc6e1bf0a388ab43c00db545384f502266207f075b14981d9ba72ab9a8cbf1fc4947063eb10e043a945eee541134dd4df9ecc7c9e3781a6f706ba4bda95dd5f8e5bb26af4237d8e1020aae5f1cc573094e6924906d12b319ad748a2940f52dbea559e0f479d24bce8982488425c6912ba2fb8fe9a6b09e3f65f603312eac0f952c5ced39b7336c567eb4a0fd7a815351868d9f77ff6a80dfe2bf10d775645776f355cdd0c818e6364162cf99f2324c67606192cad3ea637d16b68ed46835c3529d46441e17";
   const LOOKUP_HEX =
@@ -256,6 +272,19 @@
       return output;
     }
   }
+  function motorPath(command) {
+    return "decoder_control.cgi?command=" + command + "&onestep=0&";
+  }
+  function movementSupport(payload) {
+    try {
+      const features = JSON.parse(text(payload).replace(/\0+$/, "")).feature;
+      const modes = String(features && features.SupportPTZ || "").split(",");
+      if (!ICAM_PTZ_MODES.includes(modes[0])) return null;
+      return { pan: !modes.includes("VertOnly"), tilt: true };
+    } catch (error) {
+      return null;
+    }
+  }
   let nextSessionId = 1;
   class NativeSession {
     constructor(config, native, callbacks) {
@@ -264,6 +293,9 @@
       this.callbacks = callbacks;
       this.okam = config.type === "okam";
       this.hd = Boolean(config.hd);
+      this.movement = this.okam ? { pan: true, tilt: true } : null;
+      this.moving = null;
+      this.moveTimer = null;
       if (!["okam", "icam365"].includes(config.type)) {
         throw new Error("Unsupported camera type");
       }
@@ -667,6 +699,36 @@
         );
       }
     }
+    move(direction) {
+      const moves = this.okam ? OKAM_MOVES : ICAM_MOVES;
+      const pan = direction === "left" || direction === "right";
+      if (
+        !this.authenticated || this.state !== "streaming" || !this.movement ||
+        !moves.has(direction) || !(pan ? this.movement.pan : this.movement.tilt)
+      ) return false;
+      if (this.moving !== direction) {
+        this.finishMove();
+        if (this.okam) this.cgi(motorPath(OKAM_MOVES.get(direction)[0]));
+        else {
+          const body = new Uint8Array(8);
+          body[0] = ICAM_MOVES.get(direction);
+          this.command(ICAM_MOVE_COMMAND, body);
+        }
+        this.moving = direction;
+      }
+      clearTimeout(this.moveTimer);
+      this.moveTimer = setTimeout(() => this.finishMove(), MOVE_PULSE_MS);
+      return true;
+    }
+    finishMove() {
+      clearTimeout(this.moveTimer);
+      this.moveTimer = null;
+      if (!this.moving) return;
+      const direction = this.moving;
+      this.moving = null;
+      if (this.okam) this.cgi(motorPath(OKAM_MOVES.get(direction)[1]));
+      else this.command(ICAM_MOVE_COMMAND, new Uint8Array(8));
+    }
     setQuality(hd) {
       if (this.hd === hd) return;
       this.hd = hd;
@@ -709,6 +771,8 @@
           }
           this.selectStream();
           this.callbacks.status("Authenticated, waiting for live video");
+        } else if (!this.okam && command === ICAM_FEATURES_RESPONSE) {
+          this.movement = movementSupport(payload);
         } else if (
           this.okam && [0x6037, 0x60d1].includes(command) && result &&
           Number(result[1]) !== 0
@@ -783,12 +847,14 @@
     close() {
       if (["closed", "closing"].includes(this.state)) return;
       clearInterval(this.timer);
+      clearTimeout(this.moveTimer);
       this.state = "closing";
       this.pending.clear();
       this.closeStarted = performance.now();
       this.closeListener = (event) => this.event(event.data);
       this.native.addEventListener("message", this.closeListener);
       if (this.peer && this.authenticated) {
+        this.finishMove();
         if (this.okam) this.cgi("livestream.cgi?streamid=16&substream=0&");
         else this.command(0x2ff, concat(word32(2), word32(0)));
       }

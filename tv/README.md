@@ -90,6 +90,7 @@ For local Imou Life access, an entry contains `type: "imou"`, `name`, and `local
 TLS cameras additionally require `local.certificate_sha256`, the lowercase 64-character SHA-256 fingerprint verified during desktop camera setup.
 The TV authenticates its RTSP requests using Digest authentication and receives `/cam/realmonitor?channel=<channel>&subtype=1` in the grid and the HD main stream at `subtype=0` in full screen.
 Local access requires the TV to reach the camera's private address and has no cloud fallback.
+A local entry may also contain the `account`, `device_id`, and `channel_id` of a cloud entry; the TV then uses the Imou Open Platform only to move the camera.
 The Linux viewer's saved camera settings and desktop keyring can supply the local connection and credential during setup.
 
 For cloud Imou Life access, an entry contains `type: "imou"`, `name`, `device_id`, `channel_id` (a string, usually `"0"`), and `account` with `app_id`, `app_secret`, and `region` (`"Europe"`, `"Singapore"`, or `"North America"`).
@@ -116,6 +117,8 @@ Without `account_password`, provision a current iCam365 account session when the
 ## Remote control
 
 The arrow keys select a cell, and OK shows the selected camera in full screen on its main stream.
+In full screen, the arrow keys move a motorized camera: an iCam365 camera that reports pan-tilt support, an O-KAM camera, or a local Imou Life camera whose entry includes its account.
+An iCam365 or O-KAM camera moves while the key is held and stops 120 ms after the last key press; an Imou Life camera moves for 500 ms per request.
 Back returns from full screen to the grid; from the grid, it exits the application.
 Other cameras stay connected in full screen, so the grid reappears without reconnecting.
 Hiding the application stops its sessions; returning to it connects again.

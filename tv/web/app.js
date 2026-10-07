@@ -8,6 +8,12 @@ const SCREEN_WIDTH = 1920;
 const SCREEN_HEIGHT = 1080;
 const KEY_ENTER = 13;
 const KEY_BACK = 10009;
+const MOVE_KEYS = new Map([
+  [37, "left"],
+  [38, "up"],
+  [39, "right"],
+  [40, "down"],
+]);
 const FULL_SCREEN_CLASS = "full-screen";
 const ACCOUNT_ORIGIN = "https://api-we01.tange365.com";
 const ACCOUNT_SUCCESS = 200;
@@ -390,6 +396,12 @@ class CameraPane {
     this.element.classList.toggle("reconnecting", this.hasImage);
     refreshOverlay();
   }
+  move(direction) {
+    if (!direction || !this.session || !this.session.move) return;
+    if (!this.session.move(direction)) {
+      log(this.camera.name + ": camera movement unavailable");
+    }
+  }
   applyQuality() {
     if (!this.session) return;
     if (this.session.setQuality) {
@@ -480,8 +492,9 @@ document.addEventListener("keydown", (event) => {
     stop();
     preventScreenSaver(false);
     tizen.application.getCurrentApplication().exit();
-  } else if (fullScreen !== null) return;
-  else if (event.keyCode === KEY_ENTER) showFullScreen(selected);
+  } else if (fullScreen !== null) {
+    panes[fullScreen].move(MOVE_KEYS.get(event.keyCode));
+  } else if (event.keyCode === KEY_ENTER) showFullScreen(selected);
   else if ([37, 39].includes(event.keyCode)) select(selected ^ 1);
   else if ([38, 40].includes(event.keyCode)) select(selected ^ 2);
 });

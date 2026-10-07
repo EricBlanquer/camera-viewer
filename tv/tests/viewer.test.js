@@ -84,6 +84,12 @@ function viewer(options = {}) {
     constructor(config, native, callbacks) {
       super(config, native, callbacks);
       this.qualities = [];
+      this.moves = [];
+      this.movable = true;
+    }
+    move(direction) {
+      this.moves.push(direction);
+      return this.movable;
     }
     setQuality(hd) {
       this.qualities.push(hd);
@@ -680,5 +686,40 @@ test("viewer visibility changes are logged", () => {
       (event) => event.message,
     ).filter((message) => message.startsWith("Viewer ")),
     ["Viewer hidden", "Viewer displayed"],
+  );
+});
+test("arrow keys move the full-screen camera and select cells in the grid", async () => {
+  const app = viewer();
+  app.context.window.cameraViewer.configure([app.camera, {
+    ...app.camera,
+    name: "Garden",
+    p2p_id: "TEST-2-ABCDE",
+  }]);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  app.press(13);
+  app.press(37);
+  app.press(40);
+  app.press(65);
+  assert.deepEqual(Array.from(app.pane(0).session.moves), ["left", "down"]);
+  assert.equal(app.pane(0).element.classList.contains("selected"), true);
+  app.press(10009);
+  app.press(39);
+  assert.deepEqual(Array.from(app.pane(0).session.moves), ["left", "down"]);
+  assert.deepEqual(Array.from(app.pane(1).session.moves), []);
+  assert.equal(app.pane(1).element.classList.contains("selected"), true);
+});
+test("an unavailable camera movement is logged", async () => {
+  const app = viewer();
+  app.context.window.cameraViewer.configure([app.camera]);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  app.press(13);
+  app.pane(0).session.movable = false;
+  app.press(38);
+  assert.ok(
+    app.context.window.cameraViewer.events.some((event) =>
+      event.message === "Entrance: camera movement unavailable"
+    ),
   );
 });

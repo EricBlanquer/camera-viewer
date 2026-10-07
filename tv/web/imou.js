@@ -15,6 +15,13 @@
     Singapore: "openapi-sg.easy4ip.com",
     "North America": "openapi-or.easy4ip.com",
   };
+  const MOVES = new Map([
+    ["up", "0"],
+    ["down", "1"],
+    ["left", "2"],
+    ["right", "3"],
+  ]);
+  const MOVE_DURATION_MS = 500;
   const accounts = new Map();
   let nextId = 1;
   function uuid() {
@@ -83,8 +90,12 @@
           (typeof local.certificate_sha256 !== "string" ||
             !/^[a-f0-9]{64}$/.test(local.certificate_sha256)))
       ) throw new Error("Invalid local Imou camera configuration");
+      if (camera.account !== undefined) validateAccount(camera);
       return;
     }
+    validateAccount(camera);
+  }
+  function validateAccount(camera) {
     const account = camera.account;
     if (
       camera.type !== "imou" || !account ||
@@ -233,10 +244,11 @@
             ")",
         );
       }
-      if (!result.data || typeof result.data !== "object") {
+      const data = result.data === undefined ? {} : result.data;
+      if (!data || typeof data !== "object") {
         throw new Error("Invalid Imou account response");
       }
-      return result.data;
+      return data;
     }
     async authenticate() {
       if (this.token && Date.now() < this.expires) return;
@@ -289,6 +301,17 @@
       if (camera.product_id) params.productId = camera.product_id;
       return (await this.call("getStreamUrl", params)).url;
     }
+  }
+  function accountFor(config) {
+    let account = accounts.get(config.app_id);
+    if (
+      !account || account.config.region !== config.region ||
+      account.config.app_secret !== config.app_secret
+    ) {
+      account = new Account(config);
+      accounts.set(config.app_id, account);
+    }
+    return account;
   }
   function streamUrl(value, local = false) {
     if (
@@ -611,6 +634,8 @@
       this.hashes = new Map();
       this.hashSequence = 0;
       this.nonceCount = 0;
+      this.moveRequest = null;
+      this.lastMove = -Infinity;
       this.reader = new RtspReader(
         (status, headers, body) => this.response(status, headers, body),
         (channel, packet) => {
@@ -636,16 +661,10 @@
         const hd = Boolean(this.config.hd);
         if (this.config.local) this.url = localUrl(this.config, hd);
         else {
-          const config = this.config.account;
-          let account = accounts.get(config.app_id);
-          if (
-            !account || account.config.region !== config.region ||
-            account.config.app_secret !== config.app_secret
-          ) {
-            account = new Account(config);
-            accounts.set(config.app_id, account);
-          }
-          const value = await account.stream(this.config, hd);
+          const value = await accountFor(this.config.account).stream(
+            this.config,
+            hd,
+          );
           if (this.state !== "account") return;
           this.url = streamUrl(value);
         }
@@ -860,6 +879,31 @@
         if (this.state === "closing") this.finishClose();
         else this.fail(error);
       }
+    }
+    move(direction) {
+      const operation = MOVES.get(direction);
+      if (
+        operation === undefined || !this.config.account ||
+        this.config.device_id === undefined || this.state !== "playing"
+      ) return false;
+      const now = performance.now();
+      if (this.moveRequest || now - this.lastMove < MOVE_DURATION_MS) {
+        return true;
+      }
+      this.lastMove = now;
+      const params = {
+        deviceId: this.config.device_id,
+        channelId: this.config.channel_id,
+        operation,
+        duration: MOVE_DURATION_MS,
+      };
+      this.moveRequest = accountFor(this.config.account)
+        .call("controlMovePTZ", params)
+        .catch((error) => this.callbacks.status(error.message))
+        .finally(() => {
+          this.moveRequest = null;
+        });
+      return true;
     }
     tick() {
       const now = performance.now();
