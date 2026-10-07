@@ -79,7 +79,12 @@ Install Python's `websocket-client` package for the provisioning helper.
 Store an array of one to four camera configurations in a private JSON file outside the checkout and set its permissions to `600`.
 Any entry may add `always_hd: true` to keep that camera on its main stream in the grid instead of its secondary stream.
 An iCam365 entry contains `type: "icam365"`, `name`, `p2p_id`, `p2p_platform`, and `password` from an authenticated device detail response.
-Its optional `cloud_session` uses the same private metadata described in the root README; the TV refreshes the device credential over HTTPS before connecting.
+Its optional `cloud_session` uses the same private metadata described in the root README, including the account `username` and `area_code`.
+An optional `account_password` lets the TV sign in to that account again when its token expires.
+The TV connects with the saved device credential and refreshes it over HTTPS only after the camera rejects it.
+A refreshed credential and account token replace the saved ones in the TV's local storage.
+The account keeps a single active session, so each sign-in, from the TV or a computer, ends the previous session; the TV therefore signs in only when the camera rejects its credential and the account refuses its token.
+The TV waits five minutes between two sign-in attempts and never resubmits a password that the account refused.
 An O-KAM entry contains `type: "okam"`, `name`, the resolved fifteen-character `uid`, `service_parameter`, and its device `password`.
 For local Imou Life access, an entry contains `type: "imou"`, `name`, and `local` with `host` (an RFC 1918 IPv4 address), `port` (usually `554`), `channel` (usually `1`), `username`, and `password` (the device password, which can differ from the account password).
 TLS cameras additionally require `local.certificate_sha256`, the lowercase 64-character SHA-256 fingerprint verified during desktop camera setup.
@@ -106,7 +111,7 @@ python3 tv/device.py http://TV_ADDRESS:DEBUG_PORT
 Provisioning writes the camera settings to the TV application's local storage.
 Subsequent launches connect autonomously; a PC is needed only for building, installation, and setup.
 The status helper reports connection and frame counters without credentials.
-Renew the provisioned iCam365 account session when its account token expires.
+Without `account_password`, provision a current iCam365 account session when the TV can no longer refresh the device credential.
 
 ## Remote control
 

@@ -11,6 +11,8 @@ function viewer(options = {}) {
   const sessions = [];
   const messages = [];
   const screenSaverStates = [];
+  const accountRequests = [];
+  const storage = new Map();
   let exits = 0;
   let now = 0;
   function element() {
@@ -103,12 +105,40 @@ function viewer(options = {}) {
       this.config = config;
     }
   }
+  class XMLHttpRequest {
+    constructor() {
+      this.headers = {};
+    }
+    open(method, url) {
+      this.url = url;
+    }
+    setRequestHeader(name, value) {
+      this.headers[name] = value;
+    }
+    send(body) {
+      const request = {
+        url: this.url,
+        headers: this.headers,
+        body: JSON.parse(body),
+      };
+      accountRequests.push(request);
+      this.status = 200;
+      this.responseText = JSON.stringify(
+        options.account ? options.account(request) : { code: 500 },
+      );
+      Promise.resolve().then(() => this.onload());
+    }
+  }
   const context = vm.createContext({
     document,
     window: {},
     console: { log: () => {} },
     performance: { now: () => now },
-    localStorage: { getItem: () => null, setItem: () => {} },
+    localStorage: {
+      getItem: (key) => storage.has(key) ? storage.get(key) : null,
+      setItem: (key, value) => storage.set(key, value),
+    },
+    XMLHttpRequest,
     CameraProtocol: Object.assign({}, protocol, { NativeSession }),
     ImouVideo: Object.assign({}, imou, { Session: ImouSession }),
     webapis: {
@@ -178,6 +208,8 @@ function viewer(options = {}) {
     intervals,
     messages,
     exits: () => exits,
+    accountRequests,
+    stored: () => JSON.parse(storage.get("camera-viewer-config-v1")),
     screenSaver: () => screenSaverStates,
     setHidden: (hidden) => {
       document.hidden = hidden;
@@ -500,4 +532,153 @@ test("a camera connected while it is in full screen starts on its main stream", 
   await Promise.resolve();
   assert.equal(app.pane(0).session.config.hd, true);
   assert.deepEqual(app.pane(0).session.qualities, []);
+});
+function accountCamera(app) {
+  return {
+    ...app.camera,
+    cloud_session: {
+      origin: "https://api-we01.tange365.com",
+      token: "old-token",
+      appid: "123",
+      uuid: "device-uuid",
+      query: { platform: "android" },
+      username: "600000000",
+      area_code: "33",
+    },
+    account_password: "account-secret",
+  };
+}
+function deviceDetail(password) {
+  return {
+    code: 200,
+    data: {
+      items: [{ uuid: "device-uuid", p2p_id: "TEST-1-ABCDE", password }],
+    },
+  };
+}
+function accountPath(request) {
+  return new URL(request.url).pathname;
+}
+async function rejectAndReconnect(app) {
+  const pane = app.pane(0);
+  pane.session.callbacks.error(protocol.AUTHENTICATION_REJECTED);
+  await pane.connect(pane.camera);
+  return pane;
+}
+async function startAccountViewer(account) {
+  const app = viewer({ account });
+  app.context.window.cameraViewer.configure([accountCamera(app)]);
+  app.emit({ type: "transport-ready" });
+  await new Promise((resolve) => setImmediate(resolve));
+  return app;
+}
+test("an iCam365 camera connects with its saved credential without contacting its account", async () => {
+  const app = await startAccountViewer(() => deviceDetail("fresh"));
+  assert.equal(app.pane(0).session.config.password, "test");
+  assert.equal(app.accountRequests.length, 0);
+});
+test("a credential rejected by the camera is refreshed from the account and saved", async () => {
+  const app = await startAccountViewer((request) =>
+    request.headers.Authorization === "old-token"
+      ? deviceDetail("fresh")
+      : { code: 51023 }
+  );
+  const pane = await rejectAndReconnect(app);
+  assert.deepEqual(app.accountRequests.map(accountPath), [
+    "/app/device/list/detail",
+  ]);
+  assert.equal(app.accountRequests[0].body.platform, "android");
+  assert.equal(app.accountRequests[0].body.uuid, "device-uuid");
+  assert.equal(pane.session.config.password, "fresh");
+  assert.equal(app.stored()[0].password, "fresh");
+  assert.equal(app.stored()[0].cloud_session.token, "old-token");
+});
+test("an expired account session signs in again before refreshing the camera credential", async () => {
+  const app = await startAccountViewer((request) => {
+    if (accountPath(request) === "/app/user/login") {
+      return { code: 200, data: { token: "new-token" } };
+    }
+    return request.headers.Authorization === "new-token"
+      ? deviceDetail("fresh")
+      : { code: 51023 };
+  });
+  const pane = await rejectAndReconnect(app);
+  assert.deepEqual(app.accountRequests.map(accountPath), [
+    "/app/device/list/detail",
+    "/app/user/login",
+    "/app/device/list/detail",
+  ]);
+  const login = app.accountRequests[1];
+  assert.equal(login.headers.Authorization, undefined);
+  assert.equal(login.body.username, "600000000");
+  assert.equal(login.body.pwd, "account-secret");
+  assert.equal(login.body.area_code, "33");
+  assert.equal(login.body.appid, "123");
+  assert.equal(login.body.platform, "android");
+  assert.equal(pane.session.config.password, "fresh");
+  assert.equal(app.stored()[0].password, "fresh");
+  assert.equal(app.stored()[0].cloud_session.token, "new-token");
+  assert.ok(
+    app.context.window.cameraViewer.events.some((event) =>
+      event.message === "Entrance: account session renewed"
+    ),
+  );
+});
+test("a refused account password is not submitted again", async () => {
+  const app = await startAccountViewer((request) =>
+    accountPath(request) === "/app/user/login"
+      ? { code: 51021 }
+      : { code: 51023 }
+  );
+  await rejectAndReconnect(app);
+  app.setTime(300001);
+  const pane = await rejectAndReconnect(app);
+  assert.deepEqual(app.accountRequests.map(accountPath), [
+    "/app/device/list/detail",
+    "/app/user/login",
+    "/app/device/list/detail",
+  ]);
+  assert.equal(pane.session.config.password, "test");
+  assert.ok(
+    app.context.window.cameraViewer.events.some((event) =>
+      event.message === "Entrance: Account password rejected"
+    ),
+  );
+});
+test("a failed account sign-in waits five minutes before the next attempt", async () => {
+  const app = await startAccountViewer(() => ({ code: 500 }));
+  await rejectAndReconnect(app);
+  await rejectAndReconnect(app);
+  assert.deepEqual(app.accountRequests.map(accountPath), [
+    "/app/device/list/detail",
+    "/app/user/login",
+    "/app/device/list/detail",
+  ]);
+  app.setTime(300001);
+  await rejectAndReconnect(app);
+  assert.deepEqual(app.accountRequests.map(accountPath).slice(3), [
+    "/app/device/list/detail",
+    "/app/user/login",
+  ]);
+});
+test("an account password requires the account username and area code", () => {
+  const app = viewer();
+  const camera = accountCamera(app);
+  delete camera.cloud_session.area_code;
+  assert.throws(
+    () => app.context.window.cameraViewer.configure([camera]),
+    /Invalid camera configuration/,
+  );
+});
+test("viewer visibility changes are logged", () => {
+  const app = viewer();
+  app.setHidden(true);
+  app.setHidden(false);
+  assert.deepEqual(
+    Array.from(
+      app.context.window.cameraViewer.events,
+      (event) => event.message,
+    ).filter((message) => message.startsWith("Viewer ")),
+    ["Viewer hidden", "Viewer displayed"],
+  );
 });

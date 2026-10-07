@@ -9,7 +9,15 @@ const SCREEN_HEIGHT = 1080;
 const KEY_ENTER = 13;
 const KEY_BACK = 10009;
 const FULL_SCREEN_CLASS = "full-screen";
+const ACCOUNT_ORIGIN = "https://api-we01.tange365.com";
+const ACCOUNT_SUCCESS = 200;
+const ACCOUNT_PASSWORD_REJECTED = 51021;
+const ACCOUNT_SIGN_IN_INTERVAL = 300000;
+const ACCOUNT_REFRESH_FAILED = "Account credential refresh failed";
+const MAX_ACCOUNT_RESPONSE_LENGTH = 1048576;
+const MAX_ACCOUNT_PASSWORD_LENGTH = 128;
 const events = [];
+const accountSignIns = new Map();
 let nativeReady = false;
 let cameras = [];
 let selected = 0;
@@ -50,6 +58,9 @@ function validateConfiguration(configuration) {
       typeof camera.name !== "string" || !camera.name ||
       camera.name.length > 128
     ) throw new Error("Invalid camera configuration");
+    if ("account_password" in camera && !validAccount(camera)) {
+      throw new Error("Invalid camera configuration");
+    }
     createSession(camera, {});
   });
 }
@@ -67,48 +78,131 @@ function configure(configuration) {
   connect();
   return cameras.length;
 }
-async function refreshCredential(camera) {
-  const cloud = camera.type === "icam365" && camera.cloud_session;
-  if (!cloud) return camera;
-  if (cloud.origin !== "https://api-we01.tange365.com") {
-    throw new Error("Invalid account service");
-  }
-  const body = Object.assign({}, cloud.query, {
-    token: cloud.token,
-    appid: cloud.appid,
-    uuid: cloud.uuid,
-    page: "1",
-    limit: "1",
-  });
-  const response = await new Promise((resolve, reject) => {
+function validAccount(camera) {
+  const cloud = camera.cloud_session;
+  const password = camera.account_password;
+  return Boolean(
+    cloud && typeof cloud.username === "string" &&
+      /^\S{1,254}$/.test(cloud.username) &&
+      typeof cloud.area_code === "string" &&
+      /^\d{1,6}$/.test(cloud.area_code) &&
+      typeof password === "string" && password.length > 0 &&
+      password.length <= MAX_ACCOUNT_PASSWORD_LENGTH,
+  );
+}
+function accountRequest(cloud, path, body, token) {
+  return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
-    request.open("POST", cloud.origin + "/app/device/list/detail", true);
+    request.open("POST", ACCOUNT_ORIGIN + path, true);
     request.timeout = 15000;
-    request.setRequestHeader("Authorization", cloud.token);
+    if (token) request.setRequestHeader("Authorization", token);
     request.setRequestHeader("Content-Type", "application/json");
     request.setRequestHeader("X-Tg-App-Id", cloud.appid);
     request.setRequestHeader("X-Tg-App-Pkgname", "com.tange365.icam365");
     request.setRequestHeader("X-Tg-App-Platform", "android");
     request.onload = () => {
       try {
-        if (request.status !== 200 || request.responseText.length > 1048576) {
-          throw new Error();
-        }
-        resolve(JSON.parse(request.responseText));
+        if (
+          request.status !== 200 ||
+          request.responseText.length > MAX_ACCOUNT_RESPONSE_LENGTH
+        ) throw new Error();
+        const response = JSON.parse(request.responseText);
+        if (!response || typeof response !== "object") throw new Error();
+        resolve(response);
       } catch (error) {
-        reject(new Error("Account credential refresh failed"));
+        reject(new Error(ACCOUNT_REFRESH_FAILED));
       }
     };
     request.onerror = request.ontimeout = () =>
-      reject(new Error("Account credential refresh failed"));
-    request.send(JSON.stringify(body));
+      reject(new Error(ACCOUNT_REFRESH_FAILED));
+    request.send(JSON.stringify(Object.assign({}, cloud.query, body)));
   });
+}
+async function deviceCredential(camera, token) {
+  const cloud = camera.cloud_session;
+  const response = await accountRequest(cloud, "/app/device/list/detail", {
+    token,
+    appid: cloud.appid,
+    uuid: cloud.uuid,
+    page: "1",
+    limit: "1",
+  }, token);
+  if (response.code !== ACCOUNT_SUCCESS) return null;
   const items = response.data && response.data.items;
   if (
-    response.code !== 200 || !Array.isArray(items) || items.length !== 1 ||
-    items[0].uuid !== cloud.uuid || items[0].p2p_id !== camera.p2p_id
+    !Array.isArray(items) || items.length !== 1 ||
+    items[0].uuid !== cloud.uuid || items[0].p2p_id !== camera.p2p_id ||
+    typeof items[0].password !== "string" || !items[0].password
   ) throw new Error("Account returned an unexpected camera");
-  return Object.assign({}, camera, { password: items[0].password });
+  return items[0].password;
+}
+async function signIn(camera) {
+  if (!validAccount(camera)) throw new Error("Account session expired");
+  const cloud = camera.cloud_session;
+  const password = camera.account_password;
+  const previous = accountSignIns.get(cloud.username);
+  if (previous && previous.password === password) {
+    if (previous.rejected) throw new Error("Account password rejected");
+    if (performance.now() - previous.time < ACCOUNT_SIGN_IN_INTERVAL) {
+      throw new Error("Account sign-in postponed");
+    }
+  }
+  const attempt = { password, time: performance.now(), rejected: false };
+  accountSignIns.set(cloud.username, attempt);
+  const response = await accountRequest(cloud, "/app/user/login", {
+    username: cloud.username,
+    pwd: password,
+    area_code: cloud.area_code,
+    appid: cloud.appid,
+  });
+  if (response.code === ACCOUNT_PASSWORD_REJECTED) {
+    attempt.rejected = true;
+    throw new Error("Account password rejected");
+  }
+  const token = response.data && response.data.token;
+  if (
+    response.code !== ACCOUNT_SUCCESS || typeof token !== "string" ||
+    !/^[\x21-\x7e]{1,8192}$/.test(token)
+  ) throw new Error(ACCOUNT_REFRESH_FAILED);
+  log(camera.name + ": account session renewed");
+  return token;
+}
+function saveCredential(camera, token, password) {
+  if (camera.password === password && camera.cloud_session.token === token) {
+    return;
+  }
+  camera.password = password;
+  camera.cloud_session.token = token;
+  try {
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+    stored.forEach((entry) => {
+      if (
+        entry.type === "icam365" && entry.p2p_id === camera.p2p_id &&
+        entry.cloud_session
+      ) {
+        entry.password = password;
+        entry.cloud_session.token = token;
+      }
+    });
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(stored));
+  } catch (error) {
+    log(camera.name + ": camera credential could not be saved");
+  }
+}
+async function refreshCredential(camera) {
+  const cloud = camera.type === "icam365" && camera.cloud_session;
+  if (!cloud) return;
+  if (cloud.origin !== ACCOUNT_ORIGIN) {
+    throw new Error("Invalid account service");
+  }
+  let token = cloud.token;
+  let password = await deviceCredential(camera, token);
+  if (password === null) {
+    token = await signIn(camera);
+    password = await deviceCredential(camera, token);
+    if (password === null) throw new Error(ACCOUNT_REFRESH_FAILED);
+  }
+  saveCredential(camera, token, password);
 }
 class CameraPane {
   constructor(index) {
@@ -119,6 +213,7 @@ class CameraPane {
     this.hasImage = false;
     this.reconnectTimer = null;
     this.lastProgress = null;
+    this.credentialRejected = false;
     this.element = document.createElement("section");
     this.element.className = "camera";
     this.element.innerHTML = '<canvas></canvas><p class="status"></p>';
@@ -171,7 +266,9 @@ class CameraPane {
       : camera.p2p_id === this.camera.p2p_id;
   }
   async connect(camera) {
-    this.stop({ preserveImage: this.sameCamera(camera) });
+    const sameCamera = this.sameCamera(camera);
+    this.stop({ preserveImage: sameCamera });
+    if (!sameCamera) this.credentialRejected = false;
     this.camera = camera;
     const current = this.generation;
     if (!camera || !nativeReady || document.hidden) {
@@ -186,22 +283,28 @@ class CameraPane {
     }
     this.status(this.hasImage ? "Reconnecting" : "Connecting");
     this.metrics = { frames: 0, bytes: 0, playtime: 0, state: "connecting" };
-    let config = camera;
-    try {
-      config = await refreshCredential(camera);
-    } catch (error) {
-      log(camera.name + ": using saved camera credential");
+    if (this.credentialRejected) {
+      try {
+        await refreshCredential(camera);
+      } catch (error) {
+        log(camera.name + ": " + error.message);
+      }
     }
     if (current !== this.generation) return;
+    this.credentialRejected = false;
     try {
-      config = Object.assign({}, config, {
+      const config = Object.assign({}, camera, {
         local_host: webapis.network.getIp(),
         hd: this.wantsHd(),
       });
       this.session = createSession(config, {
         status: (message) => this.status(message),
         video: (payload, codec) => this.video(payload, codec),
-        error: (message, relay) => this.failed(message, relay),
+        error: (message, relay) => {
+          this.credentialRejected =
+            message === CameraProtocol.AUTHENTICATION_REJECTED;
+          this.failed(message, relay);
+        },
       });
       this.session.open();
     } catch (error) {
@@ -383,6 +486,7 @@ document.addEventListener("keydown", (event) => {
   else if ([38, 40].includes(event.keyCode)) select(selected ^ 2);
 });
 document.addEventListener("visibilitychange", () => {
+  log(document.hidden ? "Viewer hidden" : "Viewer displayed");
   preventScreenSaver(!document.hidden);
   if (document.hidden) stop();
   else connect();
