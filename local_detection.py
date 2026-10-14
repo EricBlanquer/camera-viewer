@@ -406,11 +406,19 @@ def save_event(path: Path, event: DetectionEvent, status: str) -> None:
     _write_event_document(path, document)
 
 
+def _is_day_folder(folder: Path) -> bool:
+    try:
+        datetime.strptime(folder.name, EVENT_DAY_FORMAT)
+    except ValueError:
+        return False
+    return True
+
+
 def organize_events() -> None:
     root = event_directory()
     documents = [
         *root.glob("*/*.json"), *root.glob(f"{METADATA_FOLDER}/*/*.json"),
-        *root.glob(f"*/{METADATA_FOLDER}/*/*.json"),
+        *(path for path in root.glob(f"*/{METADATA_FOLDER}/*/*.json") if _is_day_folder(path.parents[2])),
     ]
     for metadata in documents:
         try:

@@ -474,6 +474,31 @@ class RecordingExcerptTest(unittest.TestCase):
                 self.assertEqual([event.clip for event in load_events("camera", datetime(2026, 10, 1, 12))],
                                  [sorted_clips[0], animal_clip])
 
+    def test_personal_folder_with_archived_metadata_is_left_alone(self):
+        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
+            root = Path(directory) / "Detections"
+            archive = root / "old"
+            metadata_folder = archive / ".metadata" / hashlib.sha256(b"camera").hexdigest()[:16]
+            metadata_folder.mkdir(parents=True)
+            (archive / "cat").mkdir()
+            clip = archive / "cat" / "cat_Garden_20261001_171616_927b83bd.mkv"
+            clip.write_bytes(b"archived video")
+            clip_start = datetime(2026, 10, 1, 17, 16, 16)
+            metadata = metadata_folder / "event.json"
+            with patch("local_detection.event_directory", return_value=root):
+                save_event(metadata, DetectionEvent(
+                    "camera", "Garden", clip_start + timedelta(seconds=5), clip_start + timedelta(seconds=12),
+                    ("cat",), .78, clip, clip_start,
+                ), "ready")
+                document = json.loads(metadata.read_text(encoding="utf-8"))
+                document["clip"] = clip.relative_to(archive).as_posix()
+                metadata.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertNoLogs("okam-linux.local_detection"):
+                    organize_events()
+            self.assertEqual(json.loads(metadata.read_text(encoding="utf-8")), document)
+            self.assertEqual(clip.read_bytes(), b"archived video")
+            self.assertEqual(sorted(path.name for path in root.iterdir()), ["old"])
+
     def test_pending_detection_without_kept_recording_is_discarded(self):
         with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
             root = Path(directory) / "Detections"
