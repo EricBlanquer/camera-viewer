@@ -43,6 +43,7 @@ class ImouTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.window.quit_requested = True
         self.window.close()
+        self.settings.sync()
         self.directory.cleanup()
         QApplication.setQuitOnLastWindowClosed(True)
 

@@ -280,6 +280,7 @@ class ImouAccountUiTest(unittest.TestCase):
             self.window.imou_worker.finished.emit()
         self.window.quit_requested = True
         self.window.close()
+        self.settings.sync()
         self.directory.cleanup()
         QApplication.setQuitOnLastWindowClosed(True)
 

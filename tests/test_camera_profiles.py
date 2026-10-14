@@ -45,6 +45,7 @@ class CameraProfilesTest(unittest.TestCase):
         self.window.quit_requested = True
         self.window.close()
         self.preview_start.stop()
+        self.settings.sync()
         self.directory.cleanup()
         QApplication.setQuitOnLastWindowClosed(True)
 

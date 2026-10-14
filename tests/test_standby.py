@@ -46,6 +46,7 @@ class StandbyTest(unittest.TestCase):
         self.window.quit_requested = True
         self.window.close()
         patch.stopall()
+        self.settings.sync()
         self.directory.cleanup()
         QApplication.setQuitOnLastWindowClosed(True)
 
