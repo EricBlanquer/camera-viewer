@@ -121,7 +121,7 @@ Playback and tray menus use light text on dark backgrounds, including selected a
 Selecting O-KAM microSD playback makes that camera the selected pane while the other live feed remains visible.
 Imou and native iCam365 microSD playback stays in its camera pane while the other live feeds continue.
 The other camera views reconnect independently.
-Click either video to show or hide its own control bar; the bars are hidden initially and close after five seconds.
+Click either video to show or hide its own control bar; the bars are hidden initially and close within five seconds once the pointer is no longer on them, so they stay open while the timeline is scrolled or dragged.
 Keep only one camera checked to display one video.
 Use **Refresh camera list** there after adding a camera to an existing account.
 Later launches show the video with controls available on click.

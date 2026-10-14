@@ -1505,6 +1505,16 @@ class ControlsOverlay(QWidget):
                 self.schedule_visibility_refresh()
         return super().eventFilter(watched, event)
 
+    def in_use(self) -> bool:
+        return self.isVisible() and (QApplication.mouseButtons() != Qt.MouseButton.NoButton
+                                     or self.frameGeometry().contains(QCursor.pos()))
+
+    def hide_unless_in_use(self, timer: QTimer) -> None:
+        if self.in_use():
+            timer.start(OVERLAY_TIMEOUT_MS)
+        else:
+            self.hide()
+
     def fit_controls(self, width: int) -> None:
         layout = self.layout()
         if layout is None:
@@ -4378,7 +4388,7 @@ class CameraPreview(QWidget):
         self.retry_timer.timeout.connect(self.start)
         self.overlay_timer = QTimer(self)
         self.overlay_timer.setSingleShot(True)
-        self.overlay_timer.timeout.connect(self.hide_overlay)
+        self.overlay_timer.timeout.connect(lambda: self.overlay.hide_unless_in_use(self.overlay_timer))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -5271,7 +5281,7 @@ class LocalReplayPane(QWidget):
         self.overlay.hide()
         self.overlay_timer = QTimer(self)
         self.overlay_timer.setSingleShot(True)
-        self.overlay_timer.timeout.connect(self.overlay.hide)
+        self.overlay_timer.timeout.connect(lambda: self.overlay.hide_unless_in_use(self.overlay_timer))
         for button in self.controls.findChildren(QPushButton):
             button.clicked.connect(self.show_overlay)
         self.status_overlay = VideoStatusOverlay(self.video)
@@ -6118,7 +6128,7 @@ class MainWindow(QMainWindow):
         self.reconnect_timer.timeout.connect(self.reconnect)
         self.overlay_timer = QTimer(self)
         self.overlay_timer.setSingleShot(True)
-        self.overlay_timer.timeout.connect(self.hide_overlay)
+        self.overlay_timer.timeout.connect(lambda: self.overlay.hide_unless_in_use(self.overlay_timer))
         self.settings = QSettings(STORAGE_NAME, STORAGE_NAME)
         self.standby = False
         self.hidden_pause = False

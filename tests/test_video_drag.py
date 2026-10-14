@@ -198,6 +198,32 @@ class VideoDragTest(unittest.TestCase):
         self.assertIs(self.window.previews[camera.uid].video_stack.currentWidget(), pane)
         self.window.close_local_replay(camera.uid)
 
+    def test_controls_stay_while_the_pointer_uses_them(self) -> None:
+        camera = self.cameras[2]
+        with patch("app.QTimer.singleShot"):
+            self.window.open_local_replay(camera)
+        owners = (self.window, self.window.previews[self.cameras[1].uid], self.window.local_replays[camera.uid])
+        try:
+            for owner in owners:
+                self.window.activateWindow()
+                self.application.processEvents()
+                owner.show_overlay()
+                self.application.processEvents()
+                inside = owner.overlay.frameGeometry().center()
+                outside = owner.overlay.frameGeometry().topLeft() - QPoint(10, 10)
+                for pointer, buttons in ((inside, Qt.MouseButton.NoButton), (outside, Qt.MouseButton.LeftButton)):
+                    with (patch("app.QCursor", **{"pos.return_value": pointer}),
+                          patch.object(QApplication, "mouseButtons", return_value=buttons)):
+                        owner.overlay_timer.timeout.emit()
+                    self.assertTrue(owner.overlay.isVisible())
+                    self.assertTrue(owner.overlay_timer.isActive())
+                with (patch("app.QCursor", **{"pos.return_value": outside}),
+                      patch.object(QApplication, "mouseButtons", return_value=Qt.MouseButton.NoButton)):
+                    owner.overlay_timer.timeout.emit()
+                self.assertFalse(owner.overlay.isVisible())
+        finally:
+            self.window.close_local_replay(camera.uid)
+
 
 if __name__ == "__main__":
     unittest.main()
