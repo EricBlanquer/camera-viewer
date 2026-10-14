@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
+import bisect
 import getpass
 import hashlib
 import json
@@ -15,10 +15,13 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections import deque
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import NamedTuple
 
 from cs2pppp import PpppSession, configure_tables, decode_init_string
 from cs2pppp._protocol import header
@@ -47,6 +50,15 @@ LIVE_MEDIA_OUTPUT_OPTIONS = (
 )
 AAC_SAMPLE_RATE = 8000
 AAC_FRAME_SAMPLES = 1024
+ALAW_INPUT = ("-f", "alaw", "-ar", str(AAC_SAMPLE_RATE), "-ac", "1")
+LIVE_VIDEO_INPUT = ("-probesize", "100000", "-analyzeduration", "1000000", "-use_wallclock_as_timestamps", "1",
+                    "-r", "8", "-f", "hevc")
+LIVE_AUDIO_INPUT = ("-use_wallclock_as_timestamps", "1", *ALAW_INPUT)
+PLAYBACK_VIDEO_INPUT = ("-probesize", "2000000", "-analyzeduration", "1000000", "-f", "mpegts")
+PLAYBACK_AUDIO_INPUT = ("-probesize", "32", *ALAW_INPUT)
+ALAW_SILENCE = b"\xd5"
+LIVE_CHANNELS = (0, 1, 2)
+LIVE_STOP_COMMANDS = ((0x2FF, struct.pack("<II", 2, 0)), (0x301, struct.pack("<II", 1, 0)))
 QUALITY_COMMAND = 0x320
 MAIN_STREAM_QUALITY = 1
 SECONDARY_STREAM_QUALITY = 5
@@ -55,6 +67,64 @@ PTZ_POSITION_COMMAND = 0x0408
 PRESETS_REQUEST_COMMAND = 0x0452
 PRESETS_RESPONSE_COMMAND = 0x0453
 NATIVE_PTZ_DIRECTIONS = {"Up": 1, "Down": 2, "Left": 3, "Right": 6}
+GENERIC_RESPONSE_COMMAND = 1
+AUTHENTICATION_RESPONSE_COMMAND = 0x8003
+FEATURES_REQUEST_COMMAND = 0x8024
+FEATURES_RESPONSE_COMMAND = 0x8025
+LIST_RECORDINGS_COMMAND = 0x8000
+LIST_RECORDINGS_RESPONSE = 0x8001
+PLAY_CONTROL_COMMAND = 0x031A
+PLAY_CONTROL_RESPONSE = 0x031B
+PLAY_STOP = 0x01
+PLAY_FORWARD = 0x04
+PLAY_START = 0x10
+PLAYBACK_AV_INDEXES = (3, 5)
+PLAYBACK_CHANNELS = (0, *PLAYBACK_AV_INDEXES, *(index + 1 for index in PLAYBACK_AV_INDEXES))
+PLAYBACK_RATE_FEATURE = "pbrate"
+PLAYBACK_SPEED_PARAMETERS = {1: 0, 2: 1}
+VIDEO_CODEC = 80
+AUDIO_CODEC = 138
+KEY_FRAME_FLAG = 1
+SYNC_MESSAGE_TYPE = 0
+TIME_DAY = struct.Struct("<HBBBBBB")
+RECORDING_LIST_HEADER = struct.Struct("<IIBBBB")
+RECORDING_ENTRY = struct.Struct("<IB")
+RECORDING_ENTRY_SIZES = {0: 16, 1: 20}
+MAX_RECORDING_SECONDS = 24 * 60 * 60
+CAMERA_RECORDING_PREFIX = "icam365-"
+REPLAY_CONNECT_TIMEOUT = 45
+REPLAY_AUTHENTICATION_TIMEOUT = 15
+REPLAY_FEATURES_TIMEOUT = 3
+REPLAY_CLOSE_TIMEOUT = 15
+REPLAY_REQUEST_TIMEOUT = 120
+RECORDING_LIST_TIMEOUT = 20
+PLAYBACK_START_TIMEOUT = 15
+PLAYBACK_IDLE_TIMEOUT = 10
+PLAYBACK_DISCONTINUITY_SECONDS = 2
+PLAYBACK_FRAME_SECONDS = 0.08
+PLAYBACK_WAIT_SECONDS = 0.25
+PLAYBACK_POSITION_SAMPLES = 4096
+PLAYBACK_QUEUE_FRAMES = 4096
+SAVE_SPEED = 2
+AUDIO_LAG_SECONDS = 0.5
+AUDIO_PLACEMENT_SAMPLES = AAC_SAMPLE_RATE // 5
+AUDIO_PADDING_SAMPLES = 320
+TS_SYNC_BYTE = 0x47
+TS_PAYLOAD_SIZE = 184
+TS_PAT_PID = 0
+TS_PMT_PID = 0x1000
+TS_VIDEO_PID = 0x100
+TS_PROGRAM_NUMBER = 1
+TS_HEVC_STREAM_TYPE = 0x24
+TS_VIDEO_STREAM_ID = 0xE0
+TS_CLOCK_RATE = 90000
+TS_START_SECONDS = 1
+MAX_PLAYBACK_BUFFER = 64 * 1024 * 1024
+MUXER_STOP_TIMEOUT = 3
+RECORDINGS_UNAVAILABLE_MESSAGE = "Unable to connect to the iCam365 camera recordings."
+RECORDING_LIST_ERROR = "The iCam365 camera could not list its recordings."
+NO_RECORDING_MESSAGE = "The camera sent no recording for this time."
+MUXER_STOPPED_MESSAGE = "The iCam365 media muxer stopped."
 LOG = logging.getLogger("okam-linux.icam365")
 _CONFIG_LOCK = threading.Lock()
 _REJECTED_SIGN_INS: set[bytes] = set()
@@ -270,23 +340,32 @@ class OrderedChannel:
             raise OSError("The iCam365 media channel lost packets.")
 
 
+class MediaFrame(NamedTuple):
+    codec: int
+    flags: int
+    timestamp: int
+    payload: bytes
+
+
 class MediaFrames:
     def __init__(self, codecs: tuple[int, ...]) -> None:
         self.codecs = codecs
         self.buffer = bytearray()
 
     def feed(self, data: bytes) -> list[tuple[int, int, bytes]]:
+        return [(frame.codec, frame.flags, frame.payload) for frame in self.feed_timed(data) if frame.codec]
+
+    def feed_timed(self, data: bytes) -> list[MediaFrame]:
         self.buffer.extend(data)
         frames = []
         while len(self.buffer) >= 16:
             codec, flags = self.buffer[0], self.buffer[2]
-            size = struct.unpack_from("<I", self.buffer, 8)[0]
-            if codec not in (0, *self.codecs) or size > MAX_FRAME_SIZE or (codec == 0 and size != 0):
+            size, timestamp = struct.unpack_from("<II", self.buffer, 8)
+            if codec not in (0, *self.codecs) or size > MAX_FRAME_SIZE:
                 raise OSError("Invalid iCam365 media frame.")
             if len(self.buffer) < 16 + size:
                 break
-            if codec:
-                frames.append((codec, flags, bytes(self.buffer[16:16 + size])))
+            frames.append(MediaFrame(codec, flags, timestamp, bytes(self.buffer[16:16 + size])))
             del self.buffer[:16 + size]
         return frames
 
@@ -305,14 +384,15 @@ class NativePpppSession(PpppSession):
 
 
 class NativeSession:
-    def __init__(self, config: NativeConfig) -> None:
+    def __init__(self, config: NativeConfig, channels: tuple[int, ...] = LIVE_CHANNELS) -> None:
         decoded = decode_init_string(config.platform, lut=_DECODE_LOOKUP)
         if not decoded.lib_ok:
             raise OSError("Invalid iCam365 directory configuration.")
         configure_tables(prop_table=_SHUFFLE)
         self.config = config
         self.session = NativePpppSession(real_did=config.did, servers=decoded.servers)
-        self.channels = {index: OrderedChannel() for index in range(3)}
+        self.channels = {index: OrderedChannel() for index in channels}
+        self.stop_commands = LIVE_STOP_COMMANDS
         self.sequence = 0
         self.pending: dict[int, tuple[bytes, float, int]] = {}
         self.control_buffer = bytearray()
@@ -417,7 +497,7 @@ class NativeSession:
 
     def start_media(self, main_stream: bool = True) -> None:
         self.authenticated = True
-        self.send(0x8024)
+        self.send(FEATURES_REQUEST_COMMAND)
         self.send(0x8012, b"\0" * 8)
         self.send(0x1FF, struct.pack("<II", 2, 0))
         self.send(QUALITY_COMMAND, stream_quality(main_stream))
@@ -426,8 +506,8 @@ class NativeSession:
     def close(self) -> None:
         try:
             if self.authenticated and self.session.peer:
-                self.send(0x2FF, struct.pack("<II", 2, 0))
-                self.send(0x301, struct.pack("<II", 1, 0))
+                for command, payload in self.stop_commands:
+                    self.send(command, payload)
                 deadline = time.monotonic() + STOP_ACK_TIMEOUT_SECONDS
                 while self.pending and time.monotonic() < deadline:
                     self.receive(control_only=True)
@@ -492,6 +572,66 @@ def start_media_server(owner):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread, f"http://127.0.0.1:{server.server_port}{owner.stream_path}"
+
+
+def write_media(fd: int, source: queue.Queue, stopped: threading.Event, failed: Callable[[], None]) -> None:
+    try:
+        with os.fdopen(fd, "wb", buffering=0) as output:
+            while not stopped.is_set():
+                try:
+                    data = source.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if data is None:
+                    break
+                remaining = memoryview(data)
+                while remaining:
+                    written = output.write(remaining)
+                    if written is None or written == 0:
+                        raise OSError("The iCam365 media muxer stopped accepting data.")
+                    remaining = remaining[written:]
+    except OSError:
+        failed()
+
+
+def start_media_muxer(
+    video_source: queue.Queue, audio_source: queue.Queue, stopped: threading.Event, failed: Callable[[], None],
+    video_input: tuple[str, ...], audio_input: tuple[str, ...], audio_filter: tuple[str, ...],
+    output_options: tuple[str, ...], stdout: int,
+) -> tuple[subprocess.Popen, list[threading.Thread]]:
+    video_read, video_write = os.pipe()
+    audio_read, audio_write = os.pipe()
+    try:
+        process = subprocess.Popen([
+            "ffmpeg", "-nostdin", "-nostats", "-loglevel", "error",
+            "-thread_queue_size", "512", *video_input, "-i", f"/proc/self/fd/{video_read}",
+            "-thread_queue_size", "512", *audio_input, "-i", f"/proc/self/fd/{audio_read}",
+            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *audio_filter, "-c:a", "aac", "-b:a", "32k",
+            "-output_ts_offset", str(AAC_FRAME_SAMPLES / AAC_SAMPLE_RATE),
+            *output_options,
+        ], stdin=subprocess.DEVNULL, stdout=stdout, stderr=subprocess.DEVNULL,
+            pass_fds=(video_read, audio_read), bufsize=0)
+    except OSError:
+        os.close(video_write)
+        os.close(audio_write)
+        raise
+    finally:
+        os.close(video_read)
+        os.close(audio_read)
+    threads = [
+        threading.Thread(target=write_media, args=(video_write, video_source, stopped, failed), daemon=True),
+        threading.Thread(target=write_media, args=(audio_write, audio_source, stopped, failed), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    return process, threads
+
+
+def camera_features(payload: bytes) -> dict:
+    features = json.loads(payload.rstrip(b"\0")).get("feature", {})
+    if not isinstance(features, dict):
+        raise ValueError("Invalid iCam365 camera features.")
+    return features
 
 
 def broadcast_media(process, stopped, subscribers, subscriber_lock) -> None:
@@ -559,64 +699,23 @@ class NativeBridge:
         preset = self.presets.get(direction)
         return preset is not None and self.control(PTZ_POSITION_COMMAND, preset.payload())
 
-    def _write_media(self, fd: int, source: queue.Queue) -> None:
-        try:
-            with os.fdopen(fd, "wb", buffering=0) as output:
-                while not self.stopped.is_set():
-                    try:
-                        data = source.get(timeout=0.5)
-                    except queue.Empty:
-                        continue
-                    if data is None:
-                        break
-                    remaining = memoryview(data)
-                    while remaining:
-                        written = output.write(remaining)
-                        if written is None or written == 0:
-                            raise OSError("The iCam365 media muxer stopped accepting data.")
-                        remaining = remaining[written:]
-        except OSError:
-            if not self.stopped.is_set():
-                self.error = "The iCam365 media muxer stopped."
-                self.stopped.set()
+    def _muxer_failed(self) -> None:
+        if not self.stopped.is_set():
+            self.error = MUXER_STOPPED_MESSAGE
+            self.stopped.set()
 
     def _broadcast(self) -> None:
         broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock)
-        if not self.stopped.is_set():
-            self.error = "The iCam365 media muxer stopped."
-            self.stopped.set()
+        self._muxer_failed()
 
     def _start_muxer(self) -> list[threading.Thread]:
-        video_read, video_write = os.pipe()
-        audio_read, audio_write = os.pipe()
-        try:
-            self.process = subprocess.Popen([
-                "ffmpeg", "-nostdin", "-nostats", "-loglevel", "error",
-                "-thread_queue_size", "512", "-probesize", "100000", "-analyzeduration", "1000000",
-                "-use_wallclock_as_timestamps", "1", "-r", "8", "-f", "hevc", "-i", f"/proc/self/fd/{video_read}",
-                "-thread_queue_size", "512", "-use_wallclock_as_timestamps", "1",
-                "-f", "alaw", "-ar", "8000", "-ac", "1", "-i", f"/proc/self/fd/{audio_read}",
-                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
-                "-af", LIVE_AUDIO_CLOCK_FILTER, "-c:a", "aac", "-b:a", "32k",
-                "-output_ts_offset", str(AAC_FRAME_SAMPLES / AAC_SAMPLE_RATE),
-                *LIVE_MEDIA_OUTPUT_OPTIONS,
-            ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                pass_fds=(video_read, audio_read), bufsize=0)
-        except OSError:
-            os.close(video_write)
-            os.close(audio_write)
-            raise
-        finally:
-            os.close(video_read)
-            os.close(audio_read)
-        threads = [
-            threading.Thread(target=self._write_media, args=(video_write, self.video_queue), daemon=True),
-            threading.Thread(target=self._write_media, args=(audio_write, self.audio_queue), daemon=True),
-            threading.Thread(target=self._broadcast, daemon=True),
-        ]
-        for thread in threads:
-            thread.start()
-        return threads
+        self.process, threads = start_media_muxer(
+            self.video_queue, self.audio_queue, self.stopped, self._muxer_failed, LIVE_VIDEO_INPUT, LIVE_AUDIO_INPUT,
+            ("-af", LIVE_AUDIO_CLOCK_FILTER), LIVE_MEDIA_OUTPUT_OPTIONS, subprocess.PIPE,
+        )
+        broadcaster = threading.Thread(target=self._broadcast, daemon=True)
+        broadcaster.start()
+        return [*threads, broadcaster]
 
     def _run(self) -> None:
         session = None
@@ -639,16 +738,16 @@ class NativeBridge:
             while not self.stopped.is_set():
                 media, commands = session.receive()
                 for command, payload in commands:
-                    if command == 0x8003:
+                    if command == AUTHENTICATION_RESPONSE_COMMAND:
                         if len(payload) < 4 or struct.unpack_from("<i", payload)[0] != 0:
                             raise OSError(refresh_error or "The iCam365 camera rejected authentication.")
                         if not session.authenticated:
                             session.start_media(self.main_stream)
                             threads = self._start_muxer()
                             last_video = time.monotonic()
-                    elif command == 0x8025:
+                    elif command == FEATURES_RESPONSE_COMMAND:
                         try:
-                            features = json.loads(payload.rstrip(b"\0")).get("feature", {})
+                            features = camera_features(payload)
                             self.light_supported = features.get("DoubleLight", "").startswith("Yes")
                             ptz = features.get("SupportPTZ", "").split(",")
                             self.ptz_supported = ptz[0] in ("Yes", "Relative", "Hybrid", "Absolute")
@@ -754,6 +853,551 @@ def close_bridge(uid: str) -> None:
         bridge = _BRIDGES.pop(uid, None)
     if bridge is not None:
         bridge.close()
+
+
+@dataclass(frozen=True)
+class NativeRecording:
+    start: datetime
+    duration: int
+    event: int
+    size: int = 0
+
+    @property
+    def end(self) -> datetime:
+        return self.start + timedelta(seconds=self.duration)
+
+    @property
+    def detection(self) -> bool:
+        return self.event != 0
+
+    @property
+    def key(self) -> str:
+        return f"{CAMERA_RECORDING_PREFIX}{self.start:%Y%m%d%H%M%S}-{self.event}"
+
+
+def time_day(moment: datetime) -> bytes:
+    return TIME_DAY.pack(moment.year, moment.month, moment.day, moment.isoweekday() % 7,
+                         moment.hour, moment.minute, moment.second)
+
+
+def recording_list_request(start: datetime, end: datetime) -> bytes:
+    return time_day(start) + time_day(end) + struct.pack("<IB3x", 0, 0)
+
+
+def decode_recording_list(payload: bytes) -> tuple[list[NativeRecording], int, int, bool]:
+    if len(payload) < RECORDING_LIST_HEADER.size:
+        raise ValueError(RECORDING_LIST_ERROR)
+    _, total, _, last, count, entry_type = RECORDING_LIST_HEADER.unpack_from(payload)
+    size = RECORDING_ENTRY_SIZES.get(entry_type)
+    if size is None or len(payload) < RECORDING_LIST_HEADER.size + count * size:
+        raise ValueError(RECORDING_LIST_ERROR)
+    recordings = []
+    for offset in range(RECORDING_LIST_HEADER.size, RECORDING_LIST_HEADER.size + count * size, size):
+        year, month, day, _, hour, minute, second = TIME_DAY.unpack_from(payload, offset)
+        duration, event = RECORDING_ENTRY.unpack_from(payload, offset + TIME_DAY.size)
+        start = datetime(year, month, day, hour, minute, second)
+        if 0 < duration <= MAX_RECORDING_SECONDS:
+            recordings.append(NativeRecording(start, duration, event))
+    return recordings, count, total, bool(last)
+
+
+def play_control(av_index: int, command: int, parameter: int = 0, moment: datetime | None = None) -> bytes:
+    return (struct.pack("<III", av_index, command, parameter)
+            + (time_day(moment) if moment is not None else bytes(TIME_DAY.size)) + struct.pack("<I", 0))
+
+
+def mpeg_crc32(data: bytes) -> int:
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte << 24
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x04C11DB7 if crc & 0x80000000 else crc << 1) & 0xFFFFFFFF
+    return crc
+
+
+def program_section(table_id: int, table_id_extension: int, body: bytes) -> bytes:
+    section = struct.pack(">BHHBBB", table_id, 0xB000 | (len(body) + 9), table_id_extension, 0xC1, 0, 0) + body
+    return section + struct.pack(">I", mpeg_crc32(section))
+
+
+def presentation_time(value: int) -> bytes:
+    return bytes([
+        0x21 | ((value >> 29) & 0x0E), (value >> 22) & 0xFF, 0x01 | ((value >> 14) & 0xFE),
+        (value >> 7) & 0xFF, 0x01 | ((value << 1) & 0xFE),
+    ])
+
+
+class TransportStreamWriter:
+    def __init__(self) -> None:
+        self.continuity: dict[int, int] = {}
+        self.tables = (
+            program_section(0x00, 1, struct.pack(">HH", TS_PROGRAM_NUMBER, 0xE000 | TS_PMT_PID)),
+            program_section(0x02, TS_PROGRAM_NUMBER, struct.pack(
+                ">HHBHH", 0xE000 | TS_VIDEO_PID, 0xF000, TS_HEVC_STREAM_TYPE, 0xE000 | TS_VIDEO_PID, 0xF000,
+            )),
+        )
+        self.tables_written = False
+
+    def video(self, stream_time: float, payload: bytes, keyframe: bool) -> bytes:
+        output = bytearray()
+        if keyframe or not self.tables_written:
+            for pid, section in zip((TS_PAT_PID, TS_PMT_PID), self.tables):
+                output += self._packets(pid, b"\0" + section + b"\xff" * (TS_PAYLOAD_SIZE - 1 - len(section)), True)
+            self.tables_written = True
+        pts = round((stream_time + TS_START_SECONDS) * TS_CLOCK_RATE)
+        header = b"\0\0\1" + bytes([TS_VIDEO_STREAM_ID]) + b"\0\0\x80\x80\x05" + presentation_time(pts)
+        clock = struct.pack(">IH", ((pts - TS_CLOCK_RATE // 10) >> 1) & 0xFFFFFFFF, (((pts - TS_CLOCK_RATE // 10) & 1) << 15) | 0x7E00)
+        output += self._packets(TS_VIDEO_PID, header + payload, True, (0x50 if keyframe else 0x10).to_bytes(1, "big") + clock)
+        return bytes(output)
+
+    def _packets(self, pid: int, data: bytes, start: bool, adaptation: bytes = b"") -> bytes:
+        output = bytearray()
+        offset = 0
+        while offset < len(data):
+            fields = adaptation if start and offset == 0 else b""
+            room = TS_PAYLOAD_SIZE - (1 + len(fields) if fields else 0)
+            chunk = data[offset:offset + room]
+            stuffing = room - len(chunk)
+            if stuffing and fields:
+                fields += b"\xff" * stuffing
+            elif stuffing:
+                fields = b"\0" + b"\xff" * (stuffing - 2) if stuffing > 1 else b""
+            adaptation_field = bytes([len(fields)]) + fields if fields or stuffing else b""
+            counter = self.continuity.get(pid, 0)
+            self.continuity[pid] = (counter + 1) % 16
+            output += bytes([
+                TS_SYNC_BYTE, (0x40 if start and offset == 0 else 0) | (pid >> 8), pid & 0xFF,
+                (0x30 if adaptation_field else 0x10) | counter,
+            ]) + adaptation_field + chunk
+            offset += len(chunk)
+        return bytes(output)
+
+
+class PlaybackStream:
+    def __init__(self, replay: NativeReplay, output: Path | None = None, until: datetime | None = None) -> None:
+        self.replay = replay
+        self.until = until.timestamp() if until is not None else None
+        self.speed_supported = replay.speed_supported
+        self.error: str | None = None
+        self.returncode: int | None = None
+        self.stopped = threading.Event()
+        self.done = threading.Event()
+        self.lock = threading.Lock()
+        self.writer = TransportStreamWriter()
+        self.first_timestamp: int | None = None
+        self.time_offset = 0.0
+        self.last_time = 0.0
+        self.audio_position = 0
+        self.input_ended = False
+        self.held: list[tuple[queue.Queue, bytes]] = []
+        self.held_bytes = 0
+        self.samples: deque[tuple[float, float]] = deque(maxlen=PLAYBACK_POSITION_SAMPLES)
+        self.subscribers: set[queue.Queue] = set()
+        self.subscriber_lock = threading.Lock()
+        self.video_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=PLAYBACK_QUEUE_FRAMES)
+        self.audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=PLAYBACK_QUEUE_FRAMES)
+        self.process: subprocess.Popen | None = None
+        self.server: ThreadingHTTPServer | None = None
+        self.server_thread: threading.Thread | None = None
+        self.url = ""
+        self.threads: list[threading.Thread] = []
+        try:
+            if output is None:
+                self.server, self.server_thread, self.url = start_media_server(self)
+            self.process, self.threads = start_media_muxer(
+                self.video_queue, self.audio_queue, self.stopped, self._muxer_failed,
+                PLAYBACK_VIDEO_INPUT, PLAYBACK_AUDIO_INPUT, (),
+                LIVE_MEDIA_OUTPUT_OPTIONS if output is None else ("-f", "matroska", "-y", str(output)),
+                subprocess.PIPE if output is None else subprocess.DEVNULL,
+            )
+            watcher = threading.Thread(target=self._watch_muxer, daemon=True)
+            watcher.start()
+            self.threads.append(watcher)
+        except OSError:
+            self.close()
+            raise
+
+    def add(self, video: bool, timestamp: int, content: float, payload: bytes, keyframe: bool = False) -> None:
+        with self.lock:
+            if self.input_ended or self.stopped.is_set():
+                return
+            if video:
+                stream_time = self._stream_time(timestamp)
+                self.samples.append((stream_time, content))
+                self._output(self.video_queue, self.writer.video(stream_time, payload, keyframe))
+                self._pad_audio(round((stream_time - AUDIO_LAG_SECONDS) * AAC_SAMPLE_RATE))
+            elif self.first_timestamp is not None:
+                start = round((timestamp - self.first_timestamp) / 1000 * AAC_SAMPLE_RATE + self.time_offset * AAC_SAMPLE_RATE)
+                if start > self.audio_position + AUDIO_PLACEMENT_SAMPLES:
+                    self._pad_audio(start)
+                if start + len(payload) >= self.audio_position - AUDIO_PLACEMENT_SAMPLES:
+                    self._output(self.audio_queue, payload)
+                    self.audio_position += len(payload)
+
+    def finish(self) -> None:
+        with self.lock:
+            if self.input_ended or self.stopped.is_set():
+                return
+            self.input_ended = True
+            self._flush()
+            for source in (self.video_queue, self.audio_queue):
+                self._put(source, None)
+
+    def fail(self, message: str) -> None:
+        if self.error is None and not self.stopped.is_set():
+            self.error = message
+        self.stopped.set()
+
+    def set_speed(self, speed: int) -> None:
+        if self.speed_supported and speed in PLAYBACK_SPEED_PARAMETERS:
+            self.replay.request("speed", self, speed)
+
+    def set_paused(self, paused: bool) -> None:
+        if paused:
+            self.replay.request("pause", self)
+
+    def moment(self, position: float) -> datetime | None:
+        with self.lock:
+            samples = list(self.samples)
+        if not samples:
+            return None
+        index = max(0, bisect.bisect_right(samples, (position, float("inf"))) - 1)
+        stream_time, content = samples[index]
+        return datetime.fromtimestamp(content + min(max(0.0, position - stream_time), PLAYBACK_DISCONTINUITY_SECONDS))
+
+    def close(self) -> None:
+        self.replay.request("close", self)
+        self.stopped.set()
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=MUXER_STOP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=MUXER_STOP_TIMEOUT)
+        for thread in self.threads:
+            thread.join(timeout=2)
+        if self.process is not None and self.process.stdout is not None:
+            self.process.stdout.close()
+        if self.server is not None:
+            self.server.shutdown()
+            self.server.server_close()
+            self.server_thread.join(timeout=2)
+
+    def _stream_time(self, timestamp: int) -> float:
+        if self.first_timestamp is None:
+            self.first_timestamp = timestamp
+        stream_time = (timestamp - self.first_timestamp) / 1000 + self.time_offset
+        if self.samples and not 0 <= stream_time - self.last_time <= PLAYBACK_DISCONTINUITY_SECONDS:
+            self.time_offset += self.last_time + PLAYBACK_FRAME_SECONDS - stream_time
+            stream_time = self.last_time + PLAYBACK_FRAME_SECONDS
+        self.last_time = stream_time
+        return stream_time
+
+    def _pad_audio(self, position: int) -> None:
+        while self.audio_position < position:
+            size = min(position - self.audio_position, AUDIO_PADDING_SAMPLES)
+            self._output(self.audio_queue, ALAW_SILENCE * size)
+            self.audio_position += size
+
+    def _output(self, source: queue.Queue, data: bytes) -> None:
+        if self.server is not None and not self.subscribers:
+            self.held.append((source, data))
+            self.held_bytes += len(data)
+            if self.held_bytes > MAX_PLAYBACK_BUFFER:
+                self.fail("The recording player did not connect.")
+            return
+        self._flush()
+        self._put(source, data)
+
+    def _flush(self) -> None:
+        for source, data in self.held:
+            self._put(source, data)
+        self.held.clear()
+        self.held_bytes = 0
+
+    def _put(self, source: queue.Queue, data: bytes | None) -> None:
+        try:
+            source.put_nowait(data)
+        except queue.Full:
+            self.fail("The iCam365 recording muxer stopped reading.")
+
+    def _muxer_failed(self) -> None:
+        if not self.stopped.is_set():
+            self.fail(MUXER_STOPPED_MESSAGE)
+
+    def _watch_muxer(self) -> None:
+        if self.server is not None:
+            broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock)
+        self.returncode = self.process.wait()
+        if not self.input_ended:
+            self._muxer_failed()
+        self.stopped.set()
+        self.done.set()
+
+
+class ActivePlayback:
+    def __init__(self, stream: PlaybackStream, av_index: int) -> None:
+        self.stream = stream
+        self.av_index = av_index
+        self.video = MediaFrames((VIDEO_CODEC,))
+        self.audio = MediaFrames((AUDIO_CODEC,))
+        self.started = time.monotonic()
+        self.sync: int | None = None
+        self.base: tuple[int, int] | None = None
+        self.keyframe = False
+        self.last_video: float | None = None
+
+    def content_time(self, timestamp: int) -> float:
+        return self.base[0] + (timestamp - self.base[1]) / 1000
+
+
+class RecordingListing:
+    def __init__(self, reply: queue.Queue) -> None:
+        self.reply = reply
+        self.recordings: list[NativeRecording] = []
+        self.received = 0
+        self.deadline = time.monotonic() + RECORDING_LIST_TIMEOUT
+
+
+class NativeReplay:
+    def __init__(self, uid: str) -> None:
+        self.uid = uid
+        self.ready = threading.Event()
+        self.stopped = threading.Event()
+        self.error: str | None = None
+        self.speed_supported = False
+        self.requests: queue.Queue[tuple] = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def request(self, *request) -> None:
+        self.requests.put(request)
+
+    def recordings(self, start: datetime, end: datetime) -> list[NativeRecording]:
+        self._wait_ready()
+        reply: queue.Queue[list[NativeRecording] | str] = queue.Queue(maxsize=1)
+        self.request("list", start, end, reply)
+        deadline = time.monotonic() + REPLAY_REQUEST_TIMEOUT
+        while True:
+            try:
+                result = reply.get(timeout=PLAYBACK_WAIT_SECONDS)
+                break
+            except queue.Empty:
+                if self.stopped.is_set() or time.monotonic() > deadline:
+                    raise OSError(self.error or RECORDING_LIST_ERROR) from None
+        if isinstance(result, str):
+            raise OSError(result)
+        return result
+
+    def play(self, moment: datetime, output: Path | None = None, until: datetime | None = None,
+             speed: int = 1) -> PlaybackStream:
+        self._wait_ready()
+        stream = PlaybackStream(self, output, until)
+        self.request("play", moment, stream, speed if self.speed_supported and speed in PLAYBACK_SPEED_PARAMETERS else 1)
+        return stream
+
+    def close(self) -> None:
+        self.stopped.set()
+        self.thread.join(timeout=REPLAY_CLOSE_TIMEOUT)
+
+    def _wait_ready(self) -> None:
+        deadline = time.monotonic() + REPLAY_CONNECT_TIMEOUT
+        while not self.ready.is_set() and not self.stopped.is_set() and time.monotonic() < deadline:
+            self.ready.wait(PLAYBACK_WAIT_SECONDS)
+        if self.stopped.is_set() or not self.ready.is_set():
+            raise OSError(self.error or RECORDINGS_UNAVAILABLE_MESSAGE)
+
+    def _connect(self) -> NativeSession:
+        config = load_config(self.uid)
+        if config is None:
+            raise OSError("The iCam365 connection is not configured.")
+        refreshed = False
+        while True:
+            session = NativeSession(config, PLAYBACK_CHANNELS)
+            session.stop_commands = ()
+            session.open()
+            try:
+                accepted = self._authenticate(session)
+            except BaseException:
+                session.close()
+                raise
+            if accepted:
+                return session
+            session.close()
+            if refreshed or config.cloud_session is None:
+                raise OSError("The iCam365 camera rejected authentication.")
+            config = config.refreshed()
+            refreshed = True
+
+    def _authenticate(self, session: NativeSession) -> bool:
+        deadline = time.monotonic() + REPLAY_AUTHENTICATION_TIMEOUT
+        features_deadline = None
+        while not self.stopped.is_set():
+            now = time.monotonic()
+            if features_deadline is not None and now > features_deadline:
+                return True
+            if now > deadline:
+                raise OSError("The iCam365 camera did not authenticate.")
+            _, commands = session.receive()
+            for command, payload in commands:
+                if command == AUTHENTICATION_RESPONSE_COMMAND:
+                    if len(payload) < 4 or struct.unpack_from("<i", payload)[0] != 0:
+                        return False
+                    session.authenticated = True
+                    session.send(FEATURES_REQUEST_COMMAND)
+                    features_deadline = now + REPLAY_FEATURES_TIMEOUT
+                elif command == FEATURES_RESPONSE_COMMAND:
+                    try:
+                        instructions = str(camera_features(payload).get("ExtInstructions", "")).split(";")
+                    except (ValueError, AttributeError):
+                        instructions = []
+                    self.speed_supported = PLAYBACK_RATE_FEATURE in instructions
+                    return session.authenticated
+        raise OSError(RECORDINGS_UNAVAILABLE_MESSAGE)
+
+    def _run(self) -> None:
+        session = None
+        playback: ActivePlayback | None = None
+        listing: RecordingListing | None = None
+        lists: deque[tuple[datetime, datetime, queue.Queue]] = deque()
+        next_av = 0
+        try:
+            session = self._connect()
+            self.ready.set()
+            while not self.stopped.is_set():
+                media, commands = session.receive()
+                now = time.monotonic()
+                for command, payload in commands:
+                    if command == LIST_RECORDINGS_RESPONSE and listing is not None:
+                        try:
+                            recordings, count, total, last = decode_recording_list(payload)
+                        except ValueError as ex:
+                            listing.reply.put(str(ex))
+                            listing = None
+                            continue
+                        listing.recordings.extend(recordings)
+                        listing.received += count
+                        if last or listing.received >= total:
+                            listing.reply.put(sorted(listing.recordings, key=lambda recording: recording.start))
+                            listing = None
+                    elif command == GENERIC_RESPONSE_COMMAND and len(payload) >= 8 and listing is not None:
+                        request, result = struct.unpack_from("<Ii", payload)
+                        if request == LIST_RECORDINGS_COMMAND and result != 0:
+                            listing.reply.put(RECORDING_LIST_ERROR)
+                            listing = None
+                    elif command == PLAY_CONTROL_RESPONSE and len(payload) >= 8 and playback is not None:
+                        control, result = struct.unpack_from("<Ii", payload)
+                        if control == PLAY_START and result < 0:
+                            playback.stream.fail(NO_RECORDING_MESSAGE)
+                            playback = self._stop(session, playback)
+                while True:
+                    try:
+                        request = self.requests.get_nowait()
+                    except queue.Empty:
+                        break
+                    if request[0] == "list":
+                        lists.append(request[1:])
+                    elif request[0] == "play":
+                        _, moment, stream, speed = request
+                        if playback is not None:
+                            playback = self._stop(session, playback)
+                        if stream.stopped.is_set():
+                            continue
+                        av_index = PLAYBACK_AV_INDEXES[next_av]
+                        next_av = (next_av + 1) % len(PLAYBACK_AV_INDEXES)
+                        session.send(PLAY_CONTROL_COMMAND, play_control(av_index, PLAY_START, 0, moment))
+                        if speed != 1:
+                            session.send(PLAY_CONTROL_COMMAND, play_control(
+                                av_index, PLAY_FORWARD, PLAYBACK_SPEED_PARAMETERS[speed],
+                            ))
+                        session.stop_commands = ((PLAY_CONTROL_COMMAND, play_control(av_index, PLAY_STOP)),)
+                        playback = ActivePlayback(stream, av_index)
+                    elif playback is not None and request[1] is playback.stream:
+                        if request[0] == "speed":
+                            session.send(PLAY_CONTROL_COMMAND, play_control(
+                                playback.av_index, PLAY_FORWARD, PLAYBACK_SPEED_PARAMETERS[request[2]],
+                            ))
+                        else:
+                            playback = self._stop(session, playback)
+                if playback is not None:
+                    try:
+                        playback = self._deliver(session, playback, media, now)
+                    except OSError as ex:
+                        playback.stream.fail(str(ex))
+                        playback = self._stop(session, playback)
+                if playback is not None:
+                    if playback.last_video is None and now - playback.started > PLAYBACK_START_TIMEOUT:
+                        playback.stream.fail(NO_RECORDING_MESSAGE)
+                        playback = self._stop(session, playback)
+                    elif playback.last_video is not None and now - playback.last_video > PLAYBACK_IDLE_TIMEOUT:
+                        playback.stream.finish()
+                        playback = self._stop(session, playback)
+                if listing is not None and now > listing.deadline:
+                    raise OSError(RECORDING_LIST_ERROR)
+                if listing is None and lists:
+                    start, end, reply = lists.popleft()
+                    listing = RecordingListing(reply)
+                    session.send(LIST_RECORDINGS_COMMAND, recording_list_request(start, end))
+        except (OSError, ValueError) as ex:
+            if not self.stopped.is_set():
+                self.error = str(ex) if isinstance(ex, OSError) else RECORDINGS_UNAVAILABLE_MESSAGE
+                LOG.warning("iCam365 recording connection failed: %s", self.error)
+        finally:
+            self.stopped.set()
+            message = self.error or RECORDINGS_UNAVAILABLE_MESSAGE
+            if playback is not None:
+                playback.stream.fail(message)
+            if listing is not None:
+                listing.reply.put(message)
+            for _, _, reply in lists:
+                reply.put(message)
+            while True:
+                try:
+                    request = self.requests.get_nowait()
+                except queue.Empty:
+                    break
+                if request[0] == "list":
+                    request[3].put(message)
+                elif request[0] == "play":
+                    request[2].fail(message)
+            if session is not None:
+                session.close()
+
+    @staticmethod
+    def _stop(session: NativeSession, playback: ActivePlayback) -> None:
+        session.send(PLAY_CONTROL_COMMAND, play_control(playback.av_index, PLAY_STOP))
+        session.stop_commands = ()
+
+    def _deliver(
+        self, session: NativeSession, playback: ActivePlayback, media: list[tuple[int, bytes]], now: float,
+    ) -> ActivePlayback | None:
+        stream = playback.stream
+        for channel, data in media:
+            if channel not in (playback.av_index, playback.av_index + 1):
+                continue
+            video = channel == playback.av_index
+            for frame in (playback.video if video else playback.audio).feed_timed(data):
+                if frame.codec == 0:
+                    if video and frame.flags == SYNC_MESSAGE_TYPE:
+                        playback.sync = frame.timestamp
+                    continue
+                if video:
+                    if playback.sync is not None:
+                        playback.base = (playback.sync, frame.timestamp)
+                        playback.sync = None
+                    if playback.base is None or not (playback.keyframe or frame.flags & KEY_FRAME_FLAG):
+                        continue
+                    playback.keyframe = True
+                    playback.last_video = now
+                    content = playback.content_time(frame.timestamp)
+                    if stream.until is not None and content >= stream.until:
+                        stream.finish()
+                        return self._stop(session, playback)
+                    stream.add(True, frame.timestamp, content, frame.payload, bool(frame.flags & KEY_FRAME_FLAG))
+                elif playback.keyframe:
+                    stream.add(False, frame.timestamp, playback.content_time(frame.timestamp), frame.payload)
+        return playback
 
 
 def saved_camera_uid(camera_name: str) -> str:

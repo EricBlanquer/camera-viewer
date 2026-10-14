@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import icam365
-from icam365 import ACCOUNT_SECRET_CATEGORY, NativeBridge, NativeConfig, load_config, sign_in
+from icam365 import NativeBridge, NativeConfig, load_config, sign_in
 from icam365_cloud import (
     ACCOUNT_SIGN_IN_ERROR, CLOUD_SESSION_ERROR, LOGIN_URL, MAX_RESPONSE_SIZE, AccountCredentialsRejected,
     CloudSession, NoRedirect,

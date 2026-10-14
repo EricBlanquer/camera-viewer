@@ -169,8 +169,8 @@ class VideoDragTest(unittest.TestCase):
                                   root_x=video.mapToGlobal(point).x(), root_y=video.mapToGlobal(point).y())
                   for kind, point in ((X11.ButtonPress, origin), (X11.MotionNotify, target),
                                       (X11.ButtonRelease, target))]
-        display = SimpleNamespace(pending_events=lambda: len(events), next_event=lambda: events.pop(0))
-        video.x_display, video.input_window = display, object()
+        display = SimpleNamespace(pending_events=lambda: len(events), next_event=lambda: events.pop(0), flush=lambda: None)
+        video.x_display, video.input_window = display, SimpleNamespace(configure=lambda **options: None)
         try:
             video.read_mouse_events()
         finally:

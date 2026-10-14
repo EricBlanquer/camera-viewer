@@ -460,6 +460,7 @@ class ImouAccountUiTest(unittest.TestCase):
         with patch("app.stored_secret", return_value="private-application-key"), patch("app.ImouClient"), patch(
             "app.ImouReplayTunnel"
         ) as transport, patch.object(worker, "_save", side_effect=save):
+            transport.return_value.url = "http://127.0.0.1:40000/recording"
             try:
                 worker.start()
                 worker.save_recording(recording, Path(self.directory.name) / "clip.mkv")
@@ -484,6 +485,7 @@ class ImouAccountUiTest(unittest.TestCase):
         with patch("app.stored_secret", return_value="private-key"), patch("app.ImouClient") as client, patch(
             "app.ImouReplayTunnel"
         ) as transport:
+            transport.return_value.url = "http://127.0.0.1:40000/recording"
             try:
                 worker.open_recording(recording, 60)
                 worker.open_recording(recording, 120)

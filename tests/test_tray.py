@@ -11,10 +11,10 @@ from unittest.mock import Mock, patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PyQt6.QtCore import QObject, QPoint, QSettings, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, QSettings, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QPushButton, QSystemTrayIcon, QWidget
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QWidget
 
 from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, IMOU_ACCOUNT_PROVIDER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
 from icam365 import NativePreset

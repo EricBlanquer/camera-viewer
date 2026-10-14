@@ -116,10 +116,10 @@ All panes use the same inline movement panel and translucent controls, with dire
 Compatible RTSP panes also have sound and vertical tilt, native iCam365 panes have pan-and-tilt and their camera's saved positions, and O-KAM panes have pan-and-tilt, saved positions, and light when supported.
 Compatible iCam365 camera panes have a bulb button that switches white light between On and Automatic.
 Local playback stays in that camera's video pane and uses the same controls and timeline as camera microSD playback, with recordings from the last 24 hours, pause, seeking, speeds up to 8x, sound, photo, saved clips, and full-screen controls; **LIVE** returns to the camera stream.
-For an O-KAM or Imou Life account pane, the playback button offers the camera's microSD recordings and its local 24-hour recordings.
+For an O-KAM, Imou Life account, or native iCam365 pane, the playback button offers the camera's microSD recordings and its local 24-hour recordings.
 Playback and tray menus use light text on dark backgrounds, including selected and disabled items.
 Selecting O-KAM microSD playback makes that camera the selected pane while the other live feed remains visible.
-Imou microSD playback stays in its camera pane while the other live feeds continue.
+Imou and native iCam365 microSD playback stays in its camera pane while the other live feeds continue.
 The other camera views reconnect independently.
 Click either video to show or hide its own control bar; the bars are hidden initially and close after five seconds.
 Keep only one camera checked to display one video.
@@ -173,7 +173,15 @@ The native connection supports the On/Automatic light control, short directional
 The camera's saved positions are retrieved over its native connection, displayed with their saved names in tooltips, and recalled with their original position coordinates and identifiers.
 Local people and animal detection is available with the native iCam365 connection and continuous recording.
 Directory lookup and a direct native connection were verified locally; the relay path outside the home remains unverified.
-This connection does not provide camera microSD playback or talkback.
+The native connection also lists and plays the camera's microSD recordings, one day at a time, with motion and detection recordings in red on the timeline.
+Camera playback opens a separate native session, so live view, continuous recording, and local detection keep running.
+The original HEVC video keeps the camera's frame times and reaches the player with A-law sound converted to AAC through a loopback-only MPEG-TS stream; the player waits for 1.5 seconds of recording before playing and after a network pause.
+Each seek ends the current camera transfer and starts a new one on another channel, so frames still on the way from the previous position never mix with the new one.
+Pause stops the camera transfer, and playing again resumes at the paused image.
+When the camera reports faster playback, the speed button offers 2x; accelerated playback is silent.
+Playback continues from one recording file to the next and ends after ten seconds without video, such as at the end of the card.
+The download button saves the current camera recording as a Matroska file with its original frame times through another native session, at up to twice its real pace.
+Talkback is unavailable.
 
 The Imou form uses the [Dahua main-stream RTSP path](https://www.dahuasecurity.com/asset/upload/download/DS-PSD8802-A180_Operation_Manual__201709251.pdf) `/cam/realmonitor?channel=<channel>&subtype=0` and TCP port 554 by default.
 The camera must expose that RTSP stream on the local network; model support depends on the camera and its settings.
@@ -240,7 +248,7 @@ Clicking a local detection notification plays that notification's excerpt in its
 Detection notifications are sent to the desktop notification service with a click action, and fall back to the notification area message when that service is unavailable.
 Local detection clips and metadata are kept until deleted manually; the playback timeline shows detections from the last 24 hours, and turning off continuous recording pauses local analysis.
 
-For O-KAM cameras, the playback button switches the window to the recordings stored on the camera's microSD card, and **LIVE** returns to live video.
+For O-KAM cameras, **Camera recordings** in the playback menu switches the window to the recordings stored on the camera's microSD card, and **LIVE** returns to live video.
 In playback, the control bar shows a timeline with continuous recording in blue and detections in red; drag it or click a time to play from there, and use the wheel or the magnifier buttons to show a shorter or longer period.
 Playback starts while the recording is still loading, with sound, pause, and speeds up to 8x.
 The picture button saves the current image, and the download button saves the loaded recording as a Matroska file.
