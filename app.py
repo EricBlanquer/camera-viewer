@@ -597,6 +597,10 @@ def clear_device_secret(category: str, identifier: str) -> bool:
         return False
 
 
+def reconnect_delay(attempts: int) -> int:
+    return min(RECONNECT_MAX_SECONDS, 2 ** (attempts + 1))
+
+
 def account_request(request: urllib.request.Request, timeout: float) -> bytes:
     path = urllib.parse.urlsplit(request.full_url).path
     stage = {
@@ -6086,6 +6090,7 @@ class MainWindow(QMainWindow):
         self.pending_camera_replay_start: datetime | None = None
         self.pending_selection_start: tuple[str, bool] | None = None
         self.account_queue: list[tuple[str, str]] = []
+        self.failed_accounts: list[str] = []
         self.account_worker: AccountWorker | None = None
         self.account_dialog: AccountDialog | None = None
         self.imou_worker: ImouAccountWorker | None = None
@@ -6126,6 +6131,10 @@ class MainWindow(QMainWindow):
         self.reconnect_timer = QTimer(self)
         self.reconnect_timer.setSingleShot(True)
         self.reconnect_timer.timeout.connect(self.reconnect)
+        self.account_retry_attempts = 0
+        self.account_retry_timer = QTimer(self)
+        self.account_retry_timer.setSingleShot(True)
+        self.account_retry_timer.timeout.connect(self.retry_failed_accounts)
         self.overlay_timer = QTimer(self)
         self.overlay_timer.setSingleShot(True)
         self.overlay_timer.timeout.connect(lambda: self.overlay.hide_unless_in_use(self.overlay_timer))
@@ -7657,6 +7666,7 @@ class MainWindow(QMainWindow):
                 self.setup_cameras()
             return
         self.reconnect_timer.stop()
+        self.account_retry_timer.stop()
         self.retry_pending = False
         self.set_status("Finding cameras...")
         self.start_next_account_lookup()
@@ -7665,12 +7675,30 @@ class MainWindow(QMainWindow):
         username, password = self.account_queue.pop(0)
         self.start_account_lookup(username, password)
 
+    def retry_failed_accounts(self) -> None:
+        if self.account_worker is not None or self.close_pending:
+            return
+        self.account_queue = [
+            (username, password)
+            for username in self.failed_accounts
+            if (password := stored_account_password(username))
+        ]
+        self.failed_accounts = [username for username, _ in self.account_queue]
+        if self.account_queue:
+            self.start_next_account_lookup()
+
+    def schedule_account_retry(self) -> None:
+        delay = reconnect_delay(self.account_retry_attempts)
+        self.account_retry_attempts += 1
+        self.account_retry_timer.start(delay * 1000)
+        if not self.devices:
+            self.set_status(f"{self.account_error.text()} Reconnecting in {delay}s.")
+
     def start_account_lookup(self, username: str, password: str) -> None:
         if self.account_worker is not None:
             if self.account_dialog is not None:
                 self.account_dialog.show_error(ACCOUNT_LOADING_MESSAGE)
             return
-        self.account_error.hide()
         self.account_username = username
         self.account_secret = password
         self.set_status("Finding cameras...")
@@ -7683,6 +7711,11 @@ class MainWindow(QMainWindow):
     def on_devices_found(self, devices: list[AccountDevice]) -> None:
         if self.account_dialog is not None:
             self.account_dialog.accept()
+        if self.account_username in self.failed_accounts:
+            self.failed_accounts.remove(self.account_username)
+        if not self.failed_accounts:
+            self.account_retry_attempts = 0
+            self.account_error.hide()
         if not save_account_password(self.account_username, self.account_secret):
             self.set_status("The keyring could not save the account.")
         else:
@@ -7767,7 +7800,10 @@ class MainWindow(QMainWindow):
             self._finish_selected_camera()
 
     def on_account_failed(self, message: str) -> None:
-        self.retry_pending = message != ACCOUNT_REJECTED_MESSAGE and self.account_dialog is None
+        LOG.warning("O-KAM account lookup failed: %s", message)
+        if (message != ACCOUNT_REJECTED_MESSAGE and self.account_dialog is None
+                and self.account_username not in self.failed_accounts):
+            self.failed_accounts.append(self.account_username)
         self.set_status(message)
         self.account_error.setText(message)
         self.account_error.show()
@@ -7887,11 +7923,12 @@ class MainWindow(QMainWindow):
             self.sync_previews()
             if self.stream_worker is None:
                 self.watch_live()
-        elif self.retry_pending:
-            self.schedule_reconnect(self.status_text)
+        if (self.failed_accounts and self.account_worker is None and not self.close_pending
+                and not self.account_retry_timer.isActive()):
+            self.schedule_account_retry()
 
     def schedule_reconnect(self, reason: str) -> None:
-        delay = min(RECONNECT_MAX_SECONDS, 2 ** (self.reconnect_attempts + 1))
+        delay = reconnect_delay(self.reconnect_attempts)
         self.reconnect_attempts += 1
         self.reconnect_timer.start(delay * 1000)
         self.set_status(f"{reason} Reconnecting in {delay}s.")
@@ -8553,6 +8590,7 @@ class MainWindow(QMainWindow):
         self.standby_timer.stop()
         self.stop_standby_probe()
         self.reconnect_timer.stop()
+        self.account_retry_timer.stop()
         self.layout_refresh_timer.stop()
         self.camera_mask_timer.stop()
         self.retry_pending = False

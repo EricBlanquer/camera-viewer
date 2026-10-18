@@ -142,14 +142,50 @@ class ReconnectTest(unittest.TestCase):
         self.window.show()
         self.window.on_account_failed("O-KAM account lookup is unreachable.")
         self.window.on_account_finished()
-        self.assertTrue(self.window.reconnect_timer.isActive())
+        self.assertTrue(self.window.account_retry_timer.isActive())
         self.assertIn("Reconnecting in 2s.", self.window.status_text)
+
+    def test_unreachable_account_service_is_retried_while_other_cameras_play(self) -> None:
+        camera = SimpleNamespace(name="Kitchen", uid="kitchen")
+        self.window.devices = [camera]
+        self.window.device_accounts = {camera.uid: "rtsp"}
+        self.window.sync_previews = lambda: None
+        self.window.watch_live = lambda: None
+        self.window.account_username = "owner"
+        self.window.on_account_failed("O-KAM account lookup is unreachable.")
+        self.window.on_account_finished()
+        self.assertFalse(self.window.retry_pending)
+        self.assertTrue(self.window.account_retry_timer.isActive())
+        self.assertEqual(self.window.account_error.text(), "O-KAM account lookup is unreachable.")
+        lookups: list[tuple[str, str]] = []
+        with patch("app.stored_account_password", return_value="secret"), \
+                patch.object(self.window, "start_account_lookup", side_effect=lambda *lookup: lookups.append(lookup)):
+            self.window.account_retry_timer.timeout.emit()
+        self.assertEqual(lookups, [("owner", "secret")])
+
+    def test_account_retry_skips_an_account_without_a_saved_password(self) -> None:
+        self.window.failed_accounts = ["owner"]
+        with patch("app.stored_account_password", return_value=None), \
+                patch.object(self.window, "start_account_lookup") as lookup:
+            self.window.retry_failed_accounts()
+        lookup.assert_not_called()
+        self.assertEqual(self.window.failed_accounts, [])
+
+    def test_found_account_cameras_clear_the_account_retry(self) -> None:
+        self.window.account_username = "owner"
+        self.window.on_account_failed("O-KAM account lookup is unreachable.")
+        self.window.on_account_finished()
+        with patch("app.save_account_password", return_value=True):
+            self.window.on_devices_found([SimpleNamespace(name="Garden", uid="garden")])
+        self.assertEqual(self.window.failed_accounts, [])
+        self.assertFalse(self.window.account_error.isVisibleTo(self.window))
 
     def test_rejected_account_login_does_not_retry(self) -> None:
         self.window.show()
         self.window.on_account_failed(ACCOUNT_REJECTED_MESSAGE)
         self.window.on_account_finished()
         self.assertFalse(self.window.reconnect_timer.isActive())
+        self.assertFalse(self.window.account_retry_timer.isActive())
 
     def test_rejected_account_login_does_not_reopen_a_hidden_window(self) -> None:
         self.window.hide()

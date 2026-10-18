@@ -104,6 +104,7 @@ class OnboardingTest(unittest.TestCase):
         self.assertTrue(self.window.account_error.isVisibleTo(self.window))
         self.assertEqual(self.window.account_error.text(), ACCOUNT_REJECTED_MESSAGE)
         self.assertFalse(self.window.reconnect_timer.isActive())
+        self.assertFalse(self.window.account_retry_timer.isActive())
 
     def test_invalid_input_stays_in_login_form_without_starting_lookup(self) -> None:
         def submit_empty(dialog: QDialog) -> int:
