@@ -164,6 +164,23 @@ class EventTrackerTest(unittest.TestCase):
             without_frames.observe(start + timedelta(seconds=seconds), [self.hit("person", .8, box)])
         self.assertIsNone(without_frames.observe(start + timedelta(seconds=9), [])[0].cover)
 
+    def test_rest_reports_only_objects_moving_while_the_camera_is_still(self):
+        start = datetime(2026, 10, 22, 0, 13, 47)
+        tracker = EventTracker("camera", "Garden")
+        tracker.observe(start, [self.hit("animal", .6, (0, 200, 50, 100))])
+        tracker.observe(start + timedelta(seconds=1), [self.hit("animal", .6, (80, 200, 50, 100))])
+        rest = start + timedelta(seconds=2)
+        tracker.rest(rest)
+        for seconds in range(2, 6):
+            tracker.observe(start + timedelta(seconds=seconds), [self.hit("animal", .6, (80, 200, 50, 100))])
+        self.assertFalse(tracker.moved_at_rest(rest))
+        for seconds, left in ((6, 120), (7, 160)):
+            tracker.observe(start + timedelta(seconds=seconds), [self.hit("person", .8, (left, 100, 60, 150))])
+        self.assertTrue(tracker.moved_at_rest(rest))
+        self.assertFalse(tracker.moved_at_rest(start + timedelta(seconds=8)))
+        tracker.rest(None)
+        self.assertFalse(tracker.moved_at_rest(rest))
+
     def test_motionless_animal_still_confirms_an_event(self):
         start = datetime(2026, 10, 1, 5, 41, 43)
         tracker = EventTracker("camera", "Garden")

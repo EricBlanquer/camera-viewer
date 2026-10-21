@@ -127,6 +127,7 @@ STORAGE_NAME = "O-KAM Linux"
 RTSP_ACCOUNT = "rtsp"
 RTSP_CAMERAS_SETTING = "cameras/rtsp"
 RTSP_SOUND_SETTING = "audio/rtsp_sound"
+PATROL_SETTING = "movement/patrol"
 IMOU_PROVIDER = "imou"
 IMOU_ACCOUNT_PROVIDER = "imou_account"
 IMOU_ACCOUNTS_SETTING = "accounts/imou"
@@ -179,6 +180,13 @@ MAX_ACCOUNT_RESPONSE_BYTES = 1024 * 1024
 SECRET_APPLICATION_ATTRIBUTES = ("application", "okam-linux")
 MOTOR_COMMANDS = {"Left": (4, 5), "Right": (6, 7), "Up": (0, 1), "Down": (2, 3)}
 PRESET_COMMANDS = {f"Preset {index}": 29 + index * 2 for index in range(1, 6)}
+PRESET_FLAGS_FIELD = "preset_value"
+PRESET_FLAG_BITS = 16
+PATROL_STEP_SECONDS = 8
+PATROL_TRAVEL_SECONDS = 4
+PATROL_MANUAL_PAUSE_SECONDS = 30
+PATROL_MOTION_HOLD_SECONDS = 10
+PATROL_MOTION_LIMIT_SECONDS = 120
 PTZ_RESPONSE_COMMAND = 0x6019
 MOTOR_PULSE_SECONDS = 0.12
 DRAG_PIXELS_PER_STEP = 90
@@ -299,6 +307,12 @@ VIDEO_QUALITIES = {"Super HD": 100, "HD": 1, "SD": 2, "Low": 4}
 SUPER_HD_QUALITY = "Super HD"
 RESTART_REQUIRED_PIXELS = ("200", "300")
 SETTING_LIGHT = "light"
+SETTING_GUARD = "guard"
+GUARD_FIELD = "watch_preset"
+GUARD_SUPPORT_FIELD = "support_ptz_guard"
+GUARD_PATH = "set_sensor_preset.cgi?sensorid=255&presetid={preset}&"
+GUARD_RESPONSE_COMMAND = 0x60B7
+GUARD_DISABLED = 255
 SETTING_QUALITY = "quality"
 SETTING_RESPONSE_SECONDS = 5
 RESPONSE_FIELD_PATTERN = re.compile(r'(?:var\s+)?([\w\[\]]+)\s*=\s*"?([^";\r\n]*)"?\s*;')
@@ -1173,6 +1187,43 @@ def rtsp_sound_enabled(settings: QSettings | None, camera: RtspCamera) -> bool:
     return settings.value(f"{RTSP_SOUND_SETTING}/{camera.uid}", False, bool) if settings is not None else False
 
 
+def patrol_enabled(settings: QSettings | None, uid: str) -> bool:
+    return settings.value(f"{PATROL_SETTING}/{uid}", False, bool) if settings is not None else False
+
+
+def apply_patrol(
+    settings: QSettings | None, uid: str, panel: MovementControls,
+    worker: StreamWorker | RtspStreamWorker | None, enabled: bool,
+) -> None:
+    if settings is not None:
+        settings.setValue(f"{PATROL_SETTING}/{uid}", enabled)
+        settings.sync()
+    panel.set_patrol(enabled)
+    if isinstance(worker, StreamWorker):
+        worker.set_patrol(enabled)
+
+
+def available_presets(status: dict[str, str]) -> list[str]:
+    try:
+        flags = f"{int(status.get(PRESET_FLAGS_FIELD, '0')):0{PRESET_FLAG_BITS}b}"
+    except ValueError:
+        return []
+    return [command for command, flag in zip(PRESET_COMMANDS, flags) if flag == "1"]
+
+
+def patrol_order(presets: list[str]) -> list[str]:
+    return presets + presets[-2:0:-1]
+
+
+def guard_preset(status: dict[str, str]) -> str | None:
+    command = f"Preset {status.get(GUARD_FIELD, '')}"
+    return command if command in PRESET_COMMANDS else None
+
+
+def guard_path(command: str | None) -> str:
+    return GUARD_PATH.format(preset=GUARD_DISABLED if command is None else command.removeprefix("Preset "))
+
+
 def camera_time(timestamp: float) -> datetime:
     return datetime.fromtimestamp(timestamp, timezone.utc).replace(tzinfo=None)
 
@@ -1633,8 +1684,37 @@ class CornerButtonOverlay(ControlsOverlay):
         pass
 
 
+class PresetButton(QPushButton):
+    activated = pyqtSignal()
+    double_clicked = pyqtSignal()
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text)
+        self.double_click_enabled = False
+        self.click_timer = QTimer(self)
+        self.click_timer.setSingleShot(True)
+        self.click_timer.timeout.connect(self.activated.emit)
+        self.clicked.connect(self._on_clicked)
+
+    def _on_clicked(self) -> None:
+        if self.double_click_enabled:
+            self.click_timer.start(QApplication.doubleClickInterval())
+        else:
+            self.activated.emit()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if not self.double_click_enabled:
+            super().mouseDoubleClickEvent(event)
+            return
+        self.click_timer.stop()
+        self.double_clicked.emit()
+        event.accept()
+
+
 class MovementControls(QWidget):
     command_requested = pyqtSignal(str)
+    patrol_requested = pyqtSignal(bool)
+    guard_requested = pyqtSignal(object)
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
@@ -1650,44 +1730,88 @@ class MovementControls(QWidget):
             button.clicked.connect(lambda checked=False, value=direction: self.command_requested.emit(value))
             directions.addWidget(button)
             self.buttons.append(button)
+        self.patrol_active = False
+        self.patrol_button = QPushButton()
+        self.patrol_button.clicked.connect(lambda: self.patrol_requested.emit(not self.patrol_active))
+        self.patrol_button.hide()
+        self.set_patrol(False)
+        directions.addWidget(self.patrol_button)
         layout.addLayout(directions)
         self.presets = QWidget(self)
         self.presets.setObjectName("presetControls")
         presets = QHBoxLayout(self.presets)
         presets.setContentsMargins(0, 0, 0, 0)
+        self.guard_available = False
+        self.guard: str | None = None
+        self.preset_names: dict[str, str] = {}
+        self.preset_buttons: list[PresetButton] = []
         for index in range(1, 6):
             command = f"Preset {index}"
-            button = QPushButton()
+            button = PresetButton()
             set_button_icon(button, f"preset_{index}", f"Go to {command.lower()}", 40)
             button.setEnabled(False)
-            button.clicked.connect(lambda checked=False, value=command: self.command_requested.emit(value))
+            button.activated.connect(lambda value=command: self.command_requested.emit(value))
+            button.double_clicked.connect(lambda value=command: self._toggle_guard(value))
             button.setProperty("movementCommand", command)
             presets.addWidget(button)
             self.buttons.append(button)
+            self.preset_buttons.append(button)
         layout.addWidget(self.presets)
 
     def set_tilt_only(self, tilt_only: bool) -> None:
         self.set_capabilities(not tilt_only, {} if tilt_only else None)
 
+    def set_patrol(self, enabled: bool) -> None:
+        self.patrol_active = enabled
+        set_button_icon(self.patrol_button, "patrol_on" if enabled else "patrol",
+                        "Stop patrol" if enabled else "Patrol between saved positions", 40)
+
+    def set_patrol_available(self, available: bool) -> None:
+        self.patrol_button.setVisible(available)
+
+    def set_guard(self, available: bool, command: str | None) -> None:
+        self.guard_available = available
+        self.guard = command if available else None
+        for button in self.preset_buttons:
+            preset = button.property("movementCommand")
+            icon = preset.lower().replace(" ", "_")
+            set_button_icon(button, f"{icon}_on" if preset == self.guard else icon, button.toolTip(), 40)
+            button.double_click_enabled = available
+        self._update_preset_labels()
+
+    def _toggle_guard(self, command: str) -> None:
+        if self.guard_available:
+            self.guard_requested.emit(None if command == self.guard else command)
+
+    def _update_preset_labels(self) -> None:
+        for button in self.buttons[4:]:
+            command = button.property("movementCommand")
+            if command not in self.preset_names:
+                continue
+            label = f"Go to {self.preset_names[command]}"
+            if command == self.guard:
+                label += " (guard position, double-click to disable it)"
+            elif self.guard_available:
+                label += " (double-click to make it the guard position)"
+            button.setToolTip(label)
+            button.setAccessibleName(label)
+
     def set_capabilities(self, pan: bool, presets: dict[str, str] | None) -> None:
         for index, button in enumerate(self.buttons[:4]):
             button.setVisible(pan or index in (2, 3))
         available = presets if presets is not None else {f"Preset {index}": f"Preset {index}" for index in range(1, 6)}
+        self.preset_names = available
         commands = {button.property("movementCommand") for button in self.buttons[4:]}
         for command in available.keys() - commands:
-            button = QPushButton(command.removeprefix("Preset "))
+            button = PresetButton(command.removeprefix("Preset "))
             button.setFixedSize(40, 40)
             button.setProperty("movementCommand", command)
-            button.clicked.connect(lambda checked=False, value=command: self.command_requested.emit(value))
+            button.activated.connect(lambda value=command: self.command_requested.emit(value))
             self.presets.layout().addWidget(button)
             self.buttons.append(button)
         for button in self.buttons[4:]:
-            command = button.property("movementCommand")
-            button.setVisible(command in available)
-            if command in available:
-                label = f"Go to {available[command]}"
-                button.setToolTip(label)
-                button.setAccessibleName(label)
+            button.setVisible(button.property("movementCommand") in available)
+        self._update_preset_labels()
         self.presets.setVisible(bool(available))
 
 
@@ -2116,6 +2240,7 @@ class StreamWorker(QThread):
     recording_saved = pyqtSignal(str)
     recording_failed = pyqtSignal(str)
     capabilities_found = pyqtSignal(list, object)
+    guard_found = pyqtSignal(bool, object)
     detections_listed = pyqtSignal(list)
     detections_failed = pyqtSignal(str)
     setting_completed = pyqtSignal(str, object)
@@ -2154,9 +2279,24 @@ class StreamWorker(QThread):
         self.display_enabled.set()
         self.display_needs_keyframe = False
         self.main_stream = True
+        self.patrol_requested = threading.Event()
+        self.patrol_presets: list[str] = []
+        self.patrol_step = 0
+        self.patrol_next_at = 0.0
+        self.patrol_rest_at: float | None = None
+        self.patrol_hold_since: float | None = None
 
     def set_main_stream(self, enabled: bool) -> None:
         self.main_stream = enabled
+
+    def set_patrol(self, enabled: bool) -> None:
+        if enabled == self.patrol_requested.is_set():
+            return
+        LOG.info("Patrol %s for %s", "started" if enabled else "stopped", self.device.name)
+        if enabled:
+            self.patrol_requested.set()
+        else:
+            self.patrol_requested.clear()
 
     def queue_setting(self, name: str, value: object) -> bool:
         try:
@@ -2242,6 +2382,7 @@ class StreamWorker(QThread):
             frame_reader = CameraFrameReader()
             while not self.stop_requested.is_set():
                 self._process_control(session, login.user, login.password)
+                self._process_patrol(session, login.user, login.password)
                 self._process_setting(session, login.user, login.password)
                 self._process_detections(session, login.user, login.password)
                 self._update_sound(session, login.user, login.password)
@@ -2351,6 +2492,8 @@ class StreamWorker(QThread):
     def _read_capabilities(self, session: CS2Session, user: str, password: str) -> None:
         write_command(session, make_cgi_request(CAMERA_STATUS_PATH, user, password))
         status = read_response_fields(session, LOGIN_RESPONSE_COMMAND, {}, SETTING_RESPONSE_SECONDS) or {}
+        self.patrol_presets = available_presets(status)
+        self.guard_found.emit(status.get(GUARD_SUPPORT_FIELD) == "1", guard_preset(status))
         write_command(session, make_cgi_request(WHITE_LIGHT_STATUS_PATH, user, password))
         light = read_response_fields(
             session,
@@ -2380,6 +2523,10 @@ class StreamWorker(QThread):
                     )
                     is not None
                 )
+            elif name == SETTING_GUARD:
+                write_command(session, make_cgi_request(guard_path(value), user, password))
+                response = read_command_result(session, (GUARD_RESPONSE_COMMAND,), timeout=SETTING_RESPONSE_SECONDS)
+                accepted = response is not None and response[1] == 0
             else:
                 write_command(session, make_cgi_request(video_quality_path(str(value)), user, password))
                 response = read_command_result(
@@ -2518,6 +2665,7 @@ class StreamWorker(QThread):
             commands = self.controls.get_nowait()
         except queue.Empty:
             return
+        self._pause_patrol()
         try:
             for command in commands:
                 if self.stop_requested.is_set():
@@ -2532,6 +2680,53 @@ class StreamWorker(QThread):
         except (CS2Error, OSError):
             if not self.stop_requested.is_set():
                 self.control_failed.emit("Camera movement failed.")
+
+    def _pause_patrol(self) -> None:
+        self.patrol_next_at = time.monotonic() + PATROL_MANUAL_PAUSE_SECONDS
+        self.patrol_rest_at = None
+        self.patrol_hold_since = None
+        if self.local_detector is not None:
+            self.local_detector.rest(None)
+
+    def _process_patrol(self, session: CS2Session, user: str, password: str) -> None:
+        if not self.patrol_requested.is_set() or not self.patrol_presets:
+            return
+        now = time.monotonic()
+        detector = self.local_detector
+        if self.patrol_rest_at is not None and now >= self.patrol_rest_at:
+            self.patrol_rest_at = None
+            if detector is not None:
+                detector.rest(datetime.now())
+        if now < self.patrol_next_at:
+            return
+        self.patrol_next_at = now + PATROL_STEP_SECONDS
+        if self._patrol_held(detector, now):
+            return
+        order = patrol_order(self.patrol_presets)
+        self.patrol_step %= len(order)
+        command = order[self.patrol_step]
+        self.patrol_step += 1
+        self.patrol_rest_at = now + PATROL_TRAVEL_SECONDS
+        if detector is not None:
+            detector.rest(None)
+        try:
+            self._send_command(session, user, password, PRESET_COMMANDS[command])
+            self._require_control_response(session)
+        except (CS2Error, OSError) as ex:
+            LOG.warning("Patrol could not move %s to %s: %s", self.device.name, command.lower(), ex)
+
+    def _patrol_held(self, detector: DetectionPipeline | None, now: float) -> bool:
+        since = datetime.now() - timedelta(seconds=PATROL_MOTION_HOLD_SECONDS)
+        if detector is None or not detector.moved_at_rest(since):
+            self.patrol_hold_since = None
+            return False
+        if self.patrol_hold_since is None:
+            self.patrol_hold_since = now
+            LOG.info("Patrol of %s paused on movement", self.device.name)
+        if now - self.patrol_hold_since < PATROL_MOTION_LIMIT_SECONDS:
+            return True
+        self.patrol_hold_since = None
+        return False
 
     def _send_command(self, session: CS2Session, user: str, password: str, value: int) -> None:
         path = f"decoder_control.cgi?command={value}&onestep=0&"
@@ -4473,7 +4668,11 @@ class CameraPreview(QWidget):
         self.ptz_button.clicked.connect(self.toggle_ptz_panel)
         self.ptz_panel = MovementControls(self.overlay)
         self.ptz_panel.set_tilt_only(isinstance(camera, RtspCamera))
+        self.ptz_panel.set_patrol_available(not isinstance(camera, RtspCamera))
+        self.ptz_panel.set_patrol(patrol_enabled(settings, camera.uid))
         self.ptz_panel.command_requested.connect(self.move_camera)
+        self.ptz_panel.patrol_requested.connect(self.set_patrol)
+        self.ptz_panel.guard_requested.connect(lambda command: self._queue_setting(SETTING_GUARD, command))
         self.ptz_panel.hide()
         overlay_layout.addWidget(self.ptz_panel)
         if not isinstance(camera, RtspCamera):
@@ -4598,6 +4797,7 @@ class CameraPreview(QWidget):
             )
             self.worker.set_display(self.isVisible())
             self.worker.set_main_stream(self.main_stream)
+            self.worker.set_patrol(self.ptz_panel.patrol_active)
         self.worker.set_continuous(self.continuous_enabled)
         self.worker.local_detection_enabled = self.local_detection_enabled
         self.worker.local_event_callback = self.on_local_event
@@ -4622,6 +4822,7 @@ class CameraPreview(QWidget):
             self.worker.sound_failed.connect(self._on_sound_failed)
             self.worker.control_completed.connect(self._on_control_finished)
             self.worker.control_failed.connect(self._on_control_failed)
+            self.worker.guard_found.connect(self.ptz_panel.set_guard)
         self.worker.capabilities_found.connect(self._on_capabilities)
         self.worker.setting_completed.connect(self._on_setting_completed)
         self.worker.setting_failed.connect(self._on_setting_failed)
@@ -4838,6 +5039,9 @@ class CameraPreview(QWidget):
             self.control_pending = True
             self.set_movement_enabled(False)
 
+    def set_patrol(self, enabled: bool) -> None:
+        apply_patrol(self.settings, self.camera.uid, self.ptz_panel, self.worker, enabled)
+
     def move_by_drag(self, dx: int, dy: int) -> None:
         if self.zoom_level > 0 or not self.live or not isinstance(self.worker, RtspStreamWorker):
             return
@@ -4892,6 +5096,8 @@ class CameraPreview(QWidget):
         if name == SETTING_LIGHT:
             self.light_on = bool(value)
             self._update_light_action()
+        elif name == SETTING_GUARD:
+            self.ptz_panel.set_guard(True, value)
 
     def _on_setting_failed(self, _name: str, message: str) -> None:
         self.setting_pending = False
@@ -6294,6 +6500,8 @@ class MainWindow(QMainWindow):
         self.timeline.hide()
         self.ptz_panel = MovementControls(self.overlay)
         self.ptz_panel.command_requested.connect(lambda command: self.control_camera((command,)))
+        self.ptz_panel.patrol_requested.connect(self.set_patrol)
+        self.ptz_panel.guard_requested.connect(self.set_guard)
         self.camera_buttons = self.ptz_panel.buttons
         overlay_layout.addWidget(self.ptz_panel)
         self.ptz_panel.hide()
@@ -7788,6 +7996,9 @@ class MainWindow(QMainWindow):
         self.ptz_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
         self.ptz_button.setVisible(not isinstance(self.selected_device, RtspCamera))
         self.sound_button.setVisible(not isinstance(self.selected_device, RtspCamera))
+        self.ptz_panel.set_patrol_available(not isinstance(self.selected_device, RtspCamera))
+        self.ptz_panel.set_patrol(patrol_enabled(self.settings, uid))
+        self.ptz_panel.set_guard(False, None)
         self.ptz_panel.hide()
         self.stop_player()
         switching_preview = uid in self.previews or any(preview.camera.uid == uid for preview in self.retired_previews)
@@ -7994,6 +8205,7 @@ class MainWindow(QMainWindow):
                 continuous,
             )
             self.stream_worker.set_main_stream(self.main_stream_enabled(self.selected_device.uid))
+            self.stream_worker.set_patrol(self.ptz_panel.patrol_active)
         self.stream_worker.set_continuous(self.continuous_recording_enabled())
         self.stream_worker.local_detection_enabled = self.local_detection_enabled(self.selected_device.uid)
         self.stream_worker.local_event_callback = self.local_detection_ready.emit
@@ -8007,6 +8219,7 @@ class MainWindow(QMainWindow):
             self.stream_worker.control_failed.connect(self.on_control_failed)
             self.stream_worker.sound_changed.connect(self.on_sound_changed)
             self.stream_worker.sound_failed.connect(self.on_sound_failed)
+            self.stream_worker.guard_found.connect(self.ptz_panel.set_guard)
         self.stream_worker.recording_started.connect(self.on_recording_started)
         self.stream_worker.recording_saved.connect(self.on_recording_saved)
         self.stream_worker.recording_failed.connect(self.on_recording_failed)
@@ -8411,6 +8624,9 @@ class MainWindow(QMainWindow):
             self.light_on = bool(value)
             self.update_light_button()
             self.show_notice("White light on." if self.light_on else "White light off.")
+        elif name == SETTING_GUARD:
+            self.ptz_panel.set_guard(True, value)
+            self.show_notice(f"Guard position set to {value.lower()}." if value else "Guard position disabled.")
 
     def on_setting_failed(self, _name: str, message: str) -> None:
         self.setting_pending = False
@@ -8481,6 +8697,17 @@ class MainWindow(QMainWindow):
             direction, distance = ("Up" if dy > 0 else "Down"), abs(dy)
         count = min(MAX_DRAG_STEPS, max(1, round(distance / DRAG_PIXELS_PER_STEP)))
         self.control_camera((direction,) * count)
+
+    def set_guard(self, command: str | None) -> None:
+        self.queue_setting(
+            SETTING_GUARD, command,
+            f"Setting guard position to {command.lower()}..." if command else "Disabling guard position...",
+        )
+
+    def set_patrol(self, enabled: bool) -> None:
+        device = getattr(self, "selected_device", None)
+        if device is not None:
+            apply_patrol(self.settings, device.uid, self.ptz_panel, self.stream_worker, enabled)
 
     def control_camera(self, commands: tuple[str, ...]) -> None:
         if not self.stream_live or self.control_pending or self.stream_worker is None:

@@ -148,6 +148,8 @@ class DetectionTrack:
     last: datetime
     anchor: tuple[float, float, float, float]
     moved: bool = False
+    rest_anchor: tuple[float, float, float, float] | None = None
+    moved_at_rest: bool = False
 
 
 def box_overlap(first: tuple[float, float, float, float], second: tuple[float, float, float, float]) -> float:
@@ -231,6 +233,16 @@ class EventTracker:
         self.active_hits: dict[int, int] = {}
         self.score = 0.0
         self.cover_source: tuple[float, bytes, tuple[tuple[float, float, float, float], ...]] | None = None
+        self.rest_since: datetime | None = None
+
+    def rest(self, since: datetime | None) -> None:
+        self.rest_since = since
+        for track in self.tracks.values():
+            track.rest_anchor = None
+            track.moved_at_rest = False
+
+    def moved_at_rest(self, since: datetime) -> bool:
+        return any(track.moved_at_rest and track.last >= since for track in self.tracks.values())
 
     def _match(self, when: datetime, hits: list[DetectionHit]) -> dict[int, float]:
         for identifier, track in list(self.tracks.items()):
@@ -251,6 +263,9 @@ class EventTracker:
             track.box = hit.box
             track.last = when
             track.moved = track.moved or box_moved(track.anchor, hit.box)
+            if self.rest_since is not None and when >= self.rest_since:
+                track.rest_anchor = track.rest_anchor or hit.box
+                track.moved_at_rest = track.moved_at_rest or box_moved(track.rest_anchor, hit.box)
             found[identifier] = max(found.get(identifier, 0.0), hit.score)
         return found
 
@@ -713,6 +728,17 @@ class DetectionEngine:
             self.latest.move_to_end(pipeline.uid)
             self.condition.notify()
 
+    def _tracker(self, pipeline: DetectionPipeline) -> EventTracker:
+        return self.trackers.setdefault(pipeline.uid, EventTracker(pipeline.uid, pipeline.camera))
+
+    def rest(self, pipeline: DetectionPipeline, since: datetime | None) -> None:
+        with self.condition:
+            self._tracker(pipeline).rest(since)
+
+    def moved_at_rest(self, pipeline: DetectionPipeline, since: datetime) -> bool:
+        with self.condition:
+            return self._tracker(pipeline).moved_at_rest(since)
+
     def remove(self, pipeline: DetectionPipeline) -> None:
         with self.condition:
             current = self.latest.get(pipeline.uid)
@@ -783,8 +809,7 @@ class DetectionEngine:
                 self.stopped.set()
                 return
             with self.condition:
-                tracker = self.trackers.setdefault(pipeline.uid, EventTracker(pipeline.uid, pipeline.camera))
-                completed = tracker.observe(when, found, frame)
+                completed = self._tracker(pipeline).observe(when, found, frame)
             for event in completed:
                 self.schedule(event, pipeline.prefix, pipeline.on_event)
             self.processed[pipeline.uid] = self.processed.get(pipeline.uid, 0) + 1
@@ -862,6 +887,12 @@ class DetectionPipeline:
         if self.writer is not None:
             self.writer.start()
         self.engine.recover(self)
+
+    def rest(self, since: datetime | None) -> None:
+        self.engine.rest(self, since)
+
+    def moved_at_rest(self, since: datetime) -> bool:
+        return self.engine.moved_at_rest(self, since)
 
     def feed(self, frame: bytes, keyframe: bool) -> None:
         pending = self.pending

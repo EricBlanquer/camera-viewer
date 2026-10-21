@@ -11,12 +11,12 @@ from unittest.mock import Mock, patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PyQt6.QtCore import QObject, QPoint, QSettings, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, QSettings, Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QWidget
 
-from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, IMOU_ACCOUNT_PROVIDER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
+from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, IMOU_ACCOUNT_PROVIDER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, SETTING_GUARD, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
 from icam365 import NativePreset
 
 
@@ -645,6 +645,54 @@ class TrayTest(unittest.TestCase):
         self.assertEqual(preview.worker.settings.get_nowait(), ("light", True))
         preview._on_setting_completed("light", True)
         self.assertEqual(preview.light_action.text(), "Turn white light off")
+        preview.close()
+
+    def test_okam_patrol_choice_is_remembered_and_sent_to_its_worker(self) -> None:
+        camera = SimpleNamespace(name="Jardin", uid="garden")
+        preview = CameraPreview(camera, settings=self.window.settings)
+        panel = preview.ptz_panel
+        self.assertFalse(panel.patrol_button.isHidden())
+        preview.worker = StreamWorker(camera, "", io.BytesIO())
+        panel.patrol_button.click()
+        self.assertTrue(preview.worker.patrol_requested.is_set())
+        self.assertEqual(panel.patrol_button.property("iconName"), "patrol_on")
+        reopened = CameraPreview(camera, settings=self.window.settings)
+        self.assertTrue(reopened.ptz_panel.patrol_active)
+        reopened.close()
+        panel.patrol_button.click()
+        self.assertFalse(preview.worker.patrol_requested.is_set())
+        self.assertFalse(self.window.settings.value("movement/patrol/garden", True, bool))
+        entrance = CameraPreview(RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0"))
+        self.assertTrue(entrance.ptz_panel.patrol_button.isHidden())
+        entrance.close()
+        preview.close()
+
+    def test_okam_guard_position_is_chosen_by_double_click(self) -> None:
+        camera = SimpleNamespace(name="Jardin", uid="garden")
+        preview = CameraPreview(camera, settings=self.window.settings)
+        preview.worker = StreamWorker(camera, "", io.BytesIO())
+        preview.live = True
+        preview.set_movement_enabled(True)
+        panel = preview.ptz_panel
+        panel.show()
+        panel.set_guard(True, "Preset 4")
+        self.assertEqual([button.property("iconName") for button in panel.preset_buttons],
+                         ["preset_1", "preset_2", "preset_3", "preset_4_on", "preset_5"])
+        self.assertEqual(panel.preset_buttons[3].toolTip(),
+                         "Go to Preset 4 (guard position, double-click to disable it)")
+        QTest.mouseDClick(panel.preset_buttons[1], Qt.MouseButton.LeftButton)
+        self.assertEqual(preview.worker.settings.get_nowait(), (SETTING_GUARD, "Preset 2"))
+        preview._on_setting_completed(SETTING_GUARD, "Preset 2")
+        self.assertEqual(panel.preset_buttons[1].property("iconName"), "preset_2_on")
+        self.assertEqual(panel.preset_buttons[3].property("iconName"), "preset_4")
+        QTest.mouseDClick(panel.preset_buttons[1], Qt.MouseButton.LeftButton)
+        self.assertEqual(preview.worker.settings.get_nowait(), (SETTING_GUARD, None))
+        QTest.qWait(QApplication.doubleClickInterval() + 100)
+        self.assertTrue(preview.worker.controls.empty())
+        panel.preset_buttons[0].click()
+        self.assertTrue(preview.worker.controls.empty())
+        QTest.qWait(QApplication.doubleClickInterval() + 100)
+        self.assertEqual(preview.worker.controls.get_nowait(), ("Preset 1",))
         preview.close()
 
     def test_preview_camera_playback_selects_its_own_feed(self) -> None:

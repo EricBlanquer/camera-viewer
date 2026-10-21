@@ -114,6 +114,13 @@ The vertical position is remembered for each camera layout and set of displayed 
 Control overlays use the same width and height for equal-sized live videos, with spacing and button widths adapting to fit inside each video.
 All panes use the same inline movement panel and translucent controls, with directions and saved positions shown according to the connected camera's capabilities.
 Compatible RTSP panes also have sound and vertical tilt, native iCam365 panes have pan-and-tilt and their camera's saved positions, and O-KAM panes have pan-and-tilt, saved positions, and light when supported.
+On O-KAM cameras with a guard position, the guard position is shown in blue among the saved positions: double-click a saved position to make it the guard position, and double-click the blue position to disable the guard position.
+The camera returns to its guard position after it stays idle; without a guard position, it stays where it was last moved.
+With guard positions available, a single click on a saved position moves the camera once the double-click delay has passed.
+The patrol button of an O-KAM pane moves the camera back and forth between its saved positions, for example 1, 2, 3, 4, 5, 4, 3, 2, with one step every 8 seconds.
+The patrol choice is remembered per camera on this computer, and the patrol runs only while Camera Viewer keeps that camera connected.
+A manual movement pauses the patrol for 30 seconds.
+When local detection is on, a person or animal moving while the camera is still keeps it on that position until 10 seconds after the movement, for at most 2 minutes.
 Compatible iCam365 camera panes have a bulb button that switches white light between On and Automatic.
 Local playback stays in that camera's video pane and uses the same controls and timeline as camera microSD playback, with recordings from the last 24 hours, pause, seeking, speeds up to 8x, sound, photo, saved clips, and full-screen controls; **LIVE** returns to the camera stream.
 For an O-KAM, Imou Life account, or native iCam365 pane, the playback button offers the camera's microSD recordings and its local 24-hour recordings.
