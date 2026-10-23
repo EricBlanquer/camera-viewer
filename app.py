@@ -6855,7 +6855,7 @@ class MainWindow(QMainWindow):
             self.reconnect()
 
     def hide_to_tray(self) -> None:
-        self.exit_replay()
+        self.close_replays()
         if self.stream_worker is not None:
             if isinstance(self.stream_worker, StreamWorker):
                 self.stream_worker.set_display(False)
@@ -6976,6 +6976,8 @@ class MainWindow(QMainWindow):
             return
         self.hidden_pause = enabled
         LOG.info(HIDDEN_PAUSE_STATUS if enabled else "Hidden window pause ended.")
+        if enabled:
+            self.close_replays()
         self.apply_suspension()
 
     def apply_suspension(self) -> None:
@@ -7092,6 +7094,14 @@ class MainWindow(QMainWindow):
             stack.removeWidget(replay)
         if isinstance(replay.worker, StreamWorker):
             replay.worker.set_display(True)
+
+    def close_local_replays(self) -> None:
+        for uid in list(self.local_replays):
+            self.close_local_replay(uid)
+
+    def close_replays(self) -> None:
+        self.exit_replay()
+        self.close_local_replays()
 
     def _local_replay_stopped(self, replay: LocalReplayPane) -> None:
         self.retired_replays.remove(replay)
@@ -7962,8 +7972,7 @@ class MainWindow(QMainWindow):
             self.sync_previews()
             self.resume_live_if_idle()
             return
-        for replay_uid in list(self.local_replays):
-            self.close_local_replay(replay_uid)
+        self.close_local_replays()
         self.pending_camera = (username, uid)
         self.reconnect_timer.stop()
         self.retry_pending = False
@@ -8824,8 +8833,7 @@ class MainWindow(QMainWindow):
         self.imou_queue.clear()
         if self.imou_worker is not None:
             self.imou_worker.requestInterruption()
-        for uid in list(self.local_replays):
-            self.close_local_replay(uid)
+        self.close_local_replays()
         for uid, preview in list(self.previews.items()):
             del self.previews[uid]
             self._retire_preview(preview)

@@ -226,6 +226,37 @@ class StandbyTest(unittest.TestCase):
             self.application.processEvents()
         self.assertTrue(self.window.hidden_pause_timer.isActive())
 
+    def open_entrance_playback(self) -> None:
+        with patch("app.QTimer.singleShot"):
+            self.window.open_local_replay(self.entrance)
+        self.assertIs(self.preview.video_stack.currentWidget(), self.window.local_replays[self.entrance.uid])
+
+    def assert_panes_show_live_video(self) -> None:
+        self.assertEqual(self.window.local_replays, {})
+        self.assertEqual(self.window.retired_replays, [])
+        self.assertIs(self.preview.video_stack.currentWidget(), self.preview.frame)
+        self.assertIsNone(self.window.replay)
+
+    def test_hidden_window_pause_returns_playback_to_live_video(self) -> None:
+        self.settings.setValue(CONTINUOUS_SETTING, False)
+        self.window.replay = replay = Mock()
+        self.open_entrance_playback()
+        self.window.update_hidden_pause()
+        self.window.hidden_pause_timer.timeout.emit()
+        self.assertTrue(self.window.hidden_pause)
+        replay.stop.assert_called_once_with()
+        self.assert_panes_show_live_video()
+        self.assertEqual(self.window.status_text, HIDDEN_PAUSE_STATUS)
+
+    def test_hiding_to_the_tray_returns_playback_to_live_video(self) -> None:
+        self.window.replay = replay = Mock()
+        self.open_entrance_playback()
+        with patch.object(self.window, "reconnect") as reconnect:
+            self.window.hide_to_tray()
+            reconnect.assert_called_once_with()
+        replay.stop.assert_called_once_with()
+        self.assert_panes_show_live_video()
+
     def test_window_displayed_again_before_the_delay_keeps_its_connections(self) -> None:
         self.settings.setValue(CONTINUOUS_SETTING, False)
         self.window.stream_worker = worker = Mock()

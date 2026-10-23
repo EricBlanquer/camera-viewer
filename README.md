@@ -91,7 +91,7 @@ Use **Secondary stream cameras** to check the cameras that use their secondary s
 Checked cameras switch to their main stream as soon as the window is displayed, and unchecked cameras always use it.
 O-KAM and native iCam365 sessions change stream without reconnecting; Imou Life cameras reopen their video on the other stream.
 Continuous recording stores the displayed stream, and a recording segment ends when the stream changes, so each segment has a single video format.
-Without continuous recording, Camera Viewer closes its live connections and microSD detection checks 30 seconds after the window is hidden or minimized, and reopens them as soon as the window is displayed.
+Without continuous recording, Camera Viewer closes playback, its live connections, and microSD detection checks 30 seconds after the window is hidden or minimized, and reopens live video and these checks as soon as the window is displayed.
 Use **Standby while a computer is on...** to enter the host name or IP address of another computer.
 While that computer answers the system `ping` command, Camera Viewer closes its live connections, recordings, local detection, and microSD detection checks, and each video displays the standby state; the window and its layout stay in place.
 The address is checked every ten seconds; connections reopen after three consecutive checks without an answer, and at startup they wait for the first check.
@@ -234,7 +234,7 @@ When the desktop provides a notification area, Camera Viewer also shows an icon 
 Click the icon to show or hide the window, or open its menu for camera selection, layout, stream choice, standby, camera setup, recording, and local detection settings.
 Playback and camera controls are available in each camera's video pane.
 Opening Camera Viewer again from the application menu shows the running instance instead of starting a second one.
-Closing the window hides it; live video keeps running in the background so continuous recording and detection checks continue.
+Closing the window hides it and returns every pane from playback to live video; live video keeps running in the background so continuous recording and detection checks continue.
 Clicking the tray icon brings a window behind other applications to the front; clicking it while Camera Viewer is active hides it.
 Camera selection, connection retries, and account errors preserve the window's visibility, minimization, and focus.
 Video controls and status messages remain hidden while Camera Viewer is behind another application, minimized, or hidden; current messages reappear when its window becomes active.
