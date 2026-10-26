@@ -433,7 +433,9 @@ NIGHT_VISION_TIMER_MS = 60 * 1000
 NIGHT_VISION_CHECK_SECONDS = 15 * 60
 NIGHT_VISION_DESCRIPTION = ("The camera stays in black-and-white night vision during these hours and returns to automatic "
                             "day and night switching outside them. Camera Viewer applies the schedule through the camera's "
-                            "local address and device password while it is running.")
+                            "local address and device password while it is running. This configuration service is not "
+                            "encrypted: the password is not sent, but a response derived from it crosses the network, so use "
+                            "it only on the home network or through the home VPN.")
 NIGHT_VISION_SAME_TIME_MESSAGE = "Choose different start and end times."
 NIGHT_VISION_PASSWORD_MESSAGE = "The Imou camera password is unavailable in the desktop keyring."
 NIGHT_VISION_FAILURE_MESSAGE = "Unable to change the camera night vision."

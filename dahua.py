@@ -42,19 +42,9 @@ def dahua_md5(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest().upper()
 
 
-def dahua_legacy_hash(password: str) -> str:
-    digest = hashlib.md5(password.encode()).digest()
-    characters = []
-    for index in range(0, len(digest), 2):
-        value = (digest[index] + digest[index + 1]) % 62
-        characters.append(chr(value + 48 if value < 10 else value + 55 if value < 36 else value + 61))
-    return "".join(characters)
-
-
 def dahua_login_proof(username: str, password: str, realm: str, random: str) -> str:
     realm_hash = dahua_md5(f"{username}:{realm}:{password}")
-    return (f"{username}&&{dahua_md5(f'{username}:{random}:{realm_hash}')}"
-            f"{dahua_md5(f'{username}:{random}:{dahua_legacy_hash(password)}')}")
+    return f"{username}&&{dahua_md5(f'{username}:{random}:{realm_hash}')}"
 
 
 def dahua_challenge(text: str) -> tuple[str, str]:

@@ -100,6 +100,7 @@ Use **Forced night vision > camera...** to keep an Imou camera with local video 
 Outside these hours, the camera returns to its automatic day and night switching.
 Camera Viewer applies the schedule while it is running, through the camera's Dahua configuration service on TCP port 37777 with the local video access username and device password, and checks it again every 15 minutes.
 The camera keeps the last applied mode while Camera Viewer is closed; unchecking the schedule returns it to automatic switching.
+This configuration service is not encrypted, even on cameras with TLS video: the password itself is not sent, but a challenge response derived from it crosses the network, so use the schedule only on the home network or through the home VPN.
 Camera videos appear without names, title bars, borders, or gaps between their panes.
 Embedded video players synchronize with their pane size after mapping and resizing, while preserving the selected zoom and pan.
 With multiple cameras displayed, drag one video onto another with the left mouse button to exchange their positions; the order is remembered without restarting either stream.

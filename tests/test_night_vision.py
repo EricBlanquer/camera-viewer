@@ -20,7 +20,7 @@ from app import (
     night_vision_schedule, night_vision_target,
 )
 from dahua import (
-    DAHUA_DAY_NIGHT_CONFIG, DAHUA_REALM_REQUEST, DahuaClient, DahuaError, dahua_legacy_hash, set_forced_night_vision,
+    DAHUA_DAY_NIGHT_CONFIG, DAHUA_REALM_REQUEST, DahuaClient, DahuaError, set_forced_night_vision,
 )
 from imou import ImouAccount, ImouDevice
 from rtsp_tunnel import LocalRtspConnection
@@ -83,8 +83,8 @@ class DahuaClientTest(unittest.TestCase):
         connect.assert_called_once_with(("192.168.1.244", 37777), timeout=10)
         self.assertEqual(connection.sent[0], DAHUA_REALM_REQUEST)
         random = "1186367205"
-        proof = ("admin&&" + md5(f"admin:{random}:{md5('admin:Login to 2EB0B884E54CBCCD:admin')}")
-                 + md5(f"admin:{random}:6QNMIQGe")).encode()
+        realm_hash = md5("admin:Login to 2EB0B884E54CBCCD:admin")
+        proof = f"admin&&{md5(f'admin:{random}:{realm_hash}')}".encode()
         self.assertEqual(connection.sent[1][32:], proof)
         self.assertEqual(struct.unpack("<I", connection.sent[1][4:8])[0], len(proof))
         request = json.loads(connection.sent[2][32:])
@@ -93,9 +93,6 @@ class DahuaClientTest(unittest.TestCase):
         self.assertEqual(struct.unpack("<I", connection.sent[2][24:28])[0], SESSION)
         self.assertEqual(json.loads(connection.sent[3][32:])["method"], "global.logout")
         self.assertTrue(connection.closed)
-
-    def test_legacy_password_hash_matches_the_known_dahua_value(self) -> None:
-        self.assertEqual(dahua_legacy_hash("admin"), "6QNMIQGe")
 
     def test_rejected_password_is_reported_without_a_session(self) -> None:
         connection = FakeConnection(login_reply(CHALLENGE), login_reply(result=b"\x01\x00", session=0))
