@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import BinaryIO, Callable
 from datetime import datetime, timedelta, timezone
 
-from PyQt6.QtCore import QEvent, QMargins, QMetaType, QObject, QPoint, QPointF, QProcess, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QEvent, QMargins, QMetaType, QObject, QPoint, QPointF, QProcess, QRect, QRectF, QSize, QSettings, QSocketNotifier, QStandardPaths, QThread, QTime, QTimer, QUrl, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
     QAction,
     QDesktopServices,
@@ -71,6 +71,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QSpinBox,
     QSystemTrayIcon,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -106,6 +107,7 @@ from icam365 import (
     PLAYBACK_SPEED_PARAMETERS, PTZ_COMMAND, PTZ_POSITION_COMMAND, SAVE_SPEED, NativeRecording, NativeReplay, PlaybackStream,
     close_bridge, get_bridge, load_config as load_icam365_config,
 )
+from dahua import DahuaClient, DahuaError, set_forced_night_vision
 from imou import (
     IMOU_ACCOUNT_URL, IMOU_PRIVACY_MESSAGE, IMOU_REGIONS, IMOU_SECRET_MISSING_MESSAGE, IMOU_TRAFFIC_MESSAGE,
     ImouAccount, ImouClient, ImouDevice, ImouError, ImouRecording,
@@ -422,6 +424,19 @@ HIDDEN_PAUSE_DELAY_MS = 30000
 STANDBY_DESCRIPTION = ("Camera connections close while this computer answers on the network and reopen when it stops answering. "
                        "Leave the address empty to keep the cameras connected.")
 STANDBY_HOST_MESSAGE = "Enter a host name or an IP address."
+NIGHT_VISION_SETTING = "image/night_vision"
+NIGHT_VISION_TIME_FORMAT = "HH:mm"
+NIGHT_VISION_SEPARATOR = "-"
+NIGHT_VISION_DEFAULT_START = "18:00"
+NIGHT_VISION_DEFAULT_END = "08:00"
+NIGHT_VISION_TIMER_MS = 60 * 1000
+NIGHT_VISION_CHECK_SECONDS = 15 * 60
+NIGHT_VISION_DESCRIPTION = ("The camera stays in black-and-white night vision during these hours and returns to automatic "
+                            "day and night switching outside them. Camera Viewer applies the schedule through the camera's "
+                            "local address and device password while it is running.")
+NIGHT_VISION_SAME_TIME_MESSAGE = "Choose different start and end times."
+NIGHT_VISION_PASSWORD_MESSAGE = "The Imou camera password is unavailable in the desktop keyring."
+NIGHT_VISION_FAILURE_MESSAGE = "Unable to change the camera night vision."
 HOST_NAME_PATTERN = re.compile(r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*")
 DETECTION_MESSAGE_MS = 15000
 NOTIFICATIONS_SERVICE = "org.freedesktop.Notifications"
@@ -684,6 +699,30 @@ class ImouAccountWorker(QThread):
             self.failed.emit("Unable to load the Imou Life account.")
         finally:
             self.secret = None
+
+
+class NightVisionWorker(QThread):
+    completed = pyqtSignal(str, bool, bool, str)
+
+    def __init__(self, uid: str, target: tuple[str, int, str], forced: bool) -> None:
+        super().__init__()
+        self.uid = uid
+        self.target = target
+        self.forced = forced
+
+    def run(self) -> None:
+        host, channel, username = self.target
+        try:
+            password = stored_secret(IMOU_PROVIDER, self.uid)
+            if not password:
+                raise DahuaError(NIGHT_VISION_PASSWORD_MESSAGE)
+            with DahuaClient(host, username, password) as client:
+                changed = set_forced_night_vision(client, channel, self.forced)
+            self.completed.emit(self.uid, self.forced, changed, "")
+        except DahuaError as ex:
+            self.completed.emit(self.uid, self.forced, False, str(ex))
+        except Exception:
+            self.completed.emit(self.uid, self.forced, False, NIGHT_VISION_FAILURE_MESSAGE)
 
 
 class CameraFrameReader:
@@ -1201,6 +1240,42 @@ def apply_patrol(
     panel.set_patrol(enabled)
     if isinstance(worker, StreamWorker):
         worker.set_patrol(enabled)
+
+
+def night_vision_target(camera: AccountDevice | RtspCamera) -> tuple[str, int, str] | None:
+    if not isinstance(camera, RtspCamera):
+        return None
+    if camera.provider == IMOU_PROVIDER:
+        url, username = camera.url, camera.username
+    elif camera.provider == IMOU_ACCOUNT_PROVIDER and camera.local_connection is not None:
+        url, username = camera.local_connection.url, camera.local_connection.username
+    else:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        channel = urllib.parse.parse_qs(parsed.query).get("channel", ["1"])[0]
+    except ValueError:
+        return None
+    if not parsed.hostname or not username or not channel.isdecimal() or int(channel) < 1:
+        return None
+    return parsed.hostname, int(channel) - 1, username
+
+
+def night_vision_schedule(settings: QSettings, uid: str) -> tuple[QTime, QTime] | None:
+    start, separator, end = settings.value(f"{NIGHT_VISION_SETTING}/{uid}", "", str).partition(NIGHT_VISION_SEPARATOR)
+    schedule = QTime.fromString(start, NIGHT_VISION_TIME_FORMAT), QTime.fromString(end, NIGHT_VISION_TIME_FORMAT)
+    if not separator or not all(value.isValid() for value in schedule) or schedule[0] == schedule[1]:
+        return None
+    return schedule
+
+
+def night_vision_label(schedule: tuple[QTime, QTime]) -> str:
+    return f"{schedule[0].toString(NIGHT_VISION_TIME_FORMAT)} to {schedule[1].toString(NIGHT_VISION_TIME_FORMAT)}"
+
+
+def night_vision_forced(schedule: tuple[QTime, QTime], now: QTime) -> bool:
+    start, end = schedule
+    return start <= now < end if start < end else now >= start or now < end
 
 
 def available_presets(status: dict[str, str]) -> list[str]:
@@ -6162,6 +6237,54 @@ class StandbyHostDialog(QDialog):
         self.accept()
 
 
+class NightVisionDialog(QDialog):
+    def __init__(self, parent: QWidget, name: str, schedule: tuple[QTime, QTime] | None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Forced night vision · {name}")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        description = QLabel(NIGHT_VISION_DESCRIPTION)
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        self.enabled = QCheckBox("Force black-and-white night vision every day")
+        self.enabled.setChecked(schedule is not None)
+        layout.addWidget(self.enabled)
+        start, end = schedule or (QTime.fromString(NIGHT_VISION_DEFAULT_START, NIGHT_VISION_TIME_FORMAT),
+                                  QTime.fromString(NIGHT_VISION_DEFAULT_END, NIGHT_VISION_TIME_FORMAT))
+        form = QFormLayout()
+        self.start = QTimeEdit(start)
+        self.end = QTimeEdit(end)
+        for field, label in ((self.start, "From"), (self.end, "Until")):
+            field.setDisplayFormat(NIGHT_VISION_TIME_FORMAT)
+            form.addRow(label, field)
+        layout.addLayout(form)
+        self.message = QLabel()
+        self.message.setStyleSheet(FORM_ERROR_STYLE)
+        self.message.setWordWrap(True)
+        layout.addWidget(self.message)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.submit)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.enabled.toggled.connect(self.update_fields)
+        self.update_fields()
+
+    def update_fields(self) -> None:
+        self.start.setEnabled(self.enabled.isChecked())
+        self.end.setEnabled(self.enabled.isChecked())
+        self.message.clear()
+
+    def schedule(self) -> tuple[QTime, QTime] | None:
+        return (self.start.time(), self.end.time()) if self.enabled.isChecked() else None
+
+    def submit(self) -> None:
+        if self.enabled.isChecked() and self.start.time() == self.end.time():
+            self.message.setText(NIGHT_VISION_SAME_TIME_MESSAGE)
+            self.end.setFocus()
+            return
+        self.accept()
+
+
 class DesktopNotifier(QObject):
     def __init__(self, parent: QObject | None = None, bus: QDBusConnection | None = None) -> None:
         super().__init__(parent)
@@ -6358,6 +6481,14 @@ class MainWindow(QMainWindow):
         self.standby_probe.errorOccurred.connect(self.on_standby_probe_error)
         self.standby_timer = QTimer(self)
         self.standby_timer.timeout.connect(self.probe_standby_host)
+        self.night_vision_workers: dict[str, NightVisionWorker] = {}
+        self.night_vision_checks: dict[str, tuple[bool, float]] = {}
+        self.night_vision_failures: dict[str, str] = {}
+        self.night_vision_releases: set[str] = set()
+        self.night_vision_timer = QTimer(self)
+        self.night_vision_timer.timeout.connect(self.apply_night_vision)
+        self.night_vision_timer.start(NIGHT_VISION_TIMER_MS)
+        QTimer.singleShot(0, self.apply_night_vision)
         self.rtsp_cameras = load_rtsp_cameras(self.settings)
         self.imou_accounts = load_imou_accounts(self.settings)
         self.imou_cameras = load_imou_cameras(self.settings, self.imou_accounts)
@@ -6570,6 +6701,8 @@ class MainWindow(QMainWindow):
         self.camera_profiles_menu.aboutToShow.connect(self.update_camera_profiles_menu)
         self.secondary_stream_menu = menu.addMenu("Secondary stream cameras")
         self.secondary_stream_menu.aboutToShow.connect(self.update_secondary_stream_menu)
+        self.night_vision_menu = menu.addMenu("Forced night vision")
+        self.night_vision_menu.aboutToShow.connect(self.update_night_vision_menu)
         standby_action = menu.addAction("Standby while a computer is on...")
         standby_action.triggered.connect(self.configure_standby)
         add_camera_menu = menu.addMenu("Add camera")
@@ -6908,6 +7041,81 @@ class MainWindow(QMainWindow):
         self.settings.setValue(f"{SECONDARY_STREAM_CAMERAS_SETTING}/{uid}", enabled)
         self.settings.sync()
         self.apply_stream_quality()
+
+    def update_night_vision_menu(self) -> None:
+        self.night_vision_menu.clear()
+        cameras = [camera for camera in self.ordered_devices() if night_vision_target(camera) is not None]
+        for camera in cameras:
+            schedule = night_vision_schedule(self.settings, camera.uid)
+            label = camera.name if schedule is None else f"{camera.name} · {night_vision_label(schedule)}"
+            self.night_vision_menu.addAction(f"{label}...").triggered.connect(
+                lambda checked=False, value=camera: self.configure_night_vision(value)
+            )
+        if not cameras:
+            self.night_vision_menu.addAction("No cameras with local video access").setEnabled(False)
+
+    def configure_night_vision(self, camera: RtspCamera) -> None:
+        dialog = NightVisionDialog(self, camera.name, night_vision_schedule(self.settings, camera.uid))
+        if self.exec_camera_dialog(dialog) == QDialog.DialogCode.Accepted:
+            schedule = dialog.schedule()
+            setting = f"{NIGHT_VISION_SETTING}/{camera.uid}"
+            if schedule is None:
+                self.settings.remove(setting)
+                self.night_vision_releases.add(camera.uid)
+            else:
+                self.settings.setValue(setting, NIGHT_VISION_SEPARATOR.join(
+                    value.toString(NIGHT_VISION_TIME_FORMAT) for value in schedule
+                ))
+            self.settings.sync()
+            self.night_vision_checks.pop(camera.uid, None)
+            self.night_vision_failures.pop(camera.uid, None)
+            self.apply_night_vision()
+        dialog.deleteLater()
+
+    def apply_night_vision(self) -> None:
+        if self.close_pending or self.quit_requested:
+            return
+        now = QTime.currentTime()
+        for camera in self.devices:
+            target = night_vision_target(camera)
+            schedule = night_vision_schedule(self.settings, camera.uid)
+            if (target is None or camera.uid in self.night_vision_workers
+                    or schedule is None and camera.uid not in self.night_vision_releases):
+                continue
+            forced = schedule is not None and night_vision_forced(schedule, now)
+            check = self.night_vision_checks.get(camera.uid)
+            if check is not None and time.monotonic() - check[1] < NIGHT_VISION_CHECK_SECONDS and (
+                    check[0] == forced or camera.uid in self.night_vision_failures):
+                continue
+            worker = NightVisionWorker(camera.uid, target, forced)
+            worker.completed.connect(self.on_night_vision_completed)
+            worker.finished.connect(lambda uid=camera.uid: self.on_night_vision_finished(uid))
+            self.night_vision_workers[camera.uid] = worker
+            worker.start()
+
+    def on_night_vision_completed(self, uid: str, forced: bool, changed: bool, error: str) -> None:
+        self.night_vision_checks[uid] = forced, time.monotonic()
+        name = next((camera.name for camera in self.devices if camera.uid == uid), uid)
+        if error:
+            if self.night_vision_failures.get(uid) != error:
+                LOG.warning("%s forced night vision failed: %s", name, error)
+                self.show_notice(f"{name}: {error}")
+            self.night_vision_failures[uid] = error
+            return
+        self.night_vision_failures.pop(uid, None)
+        if not forced:
+            self.night_vision_releases.discard(uid)
+        if changed:
+            LOG.info("%s night vision %s.", name, "forced to black and white" if forced else "returned to automatic")
+
+    def on_night_vision_finished(self, uid: str) -> None:
+        worker = self.night_vision_workers.pop(uid, None)
+        if worker is not None:
+            worker.deleteLater()
+        if self.close_pending:
+            self.close()
+        else:
+            self.apply_night_vision()
 
     def standby_host(self) -> str:
         return self.settings.value(STANDBY_HOST_SETTING, "", str)
@@ -8825,6 +9033,7 @@ class MainWindow(QMainWindow):
             return
         self.standby_timer.stop()
         self.stop_standby_probe()
+        self.night_vision_timer.stop()
         self.reconnect_timer.stop()
         self.account_retry_timer.stop()
         self.layout_refresh_timer.stop()
@@ -8842,6 +9051,7 @@ class MainWindow(QMainWindow):
             or self.imou_worker is not None
             or self.stream_worker is not None
             or self.detection_worker is not None
+            or self.night_vision_workers
             or self.retired_previews
             or self.retired_replays
         ):

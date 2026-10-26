@@ -96,6 +96,10 @@ Use **Standby while a computer is on...** to enter the host name or IP address o
 While that computer answers the system `ping` command, Camera Viewer closes its live connections, recordings, local detection, and microSD detection checks, and each video displays the standby state; the window and its layout stay in place.
 The address is checked every ten seconds; connections reopen after three consecutive checks without an answer, and at startup they wait for the first check.
 Playback opened from a camera pane remains available during standby, and an empty address turns standby off.
+Use **Forced night vision > camera...** to keep an Imou camera with local video access in black-and-white night vision every day between two times, for example from 18:00 until 08:00, so that lamps or a television cannot make it switch repeatedly between color and infrared.
+Outside these hours, the camera returns to its automatic day and night switching.
+Camera Viewer applies the schedule while it is running, through the camera's Dahua configuration service on TCP port 37777 with the local video access username and device password, and checks it again every 15 minutes.
+The camera keeps the last applied mode while Camera Viewer is closed; unchecking the schedule returns it to automatic switching.
 Camera videos appear without names, title bars, borders, or gaps between their panes.
 Embedded video players synchronize with their pane size after mapping and resizing, while preserving the selected zoom and pan.
 With multiple cameras displayed, drag one video onto another with the left mouse button to exchange their positions; the order is remembered without restarting either stream.

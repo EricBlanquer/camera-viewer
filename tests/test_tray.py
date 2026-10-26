@@ -48,6 +48,7 @@ class TrayTest(unittest.TestCase):
             "Camera layout",
             "Camera profiles",
             "Secondary stream cameras",
+            "Forced night vision",
             "Standby while a computer is on...",
             "Add camera",
             "Continuous recording (24 h)",
