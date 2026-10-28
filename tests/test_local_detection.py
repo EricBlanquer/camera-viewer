@@ -303,6 +303,21 @@ class RecordingExcerptTest(unittest.TestCase):
                 ], check=True, capture_output=True, text=True, timeout=10)
                 self.assertAlmostEqual(float(duration.stdout), 12, delta=1)
 
+    def test_excerpt_skips_the_last_instant_of_the_previous_segment(self):
+        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
+            root = Path(directory)
+            recordings = root / "Continuous"
+            recordings.mkdir()
+            start = datetime.now().replace(microsecond=0) - timedelta(minutes=1)
+            for index in range(2):
+                make_test_video(recordings / f"Garden_{start + timedelta(seconds=index * 10):%Y%m%d_%H%M%S}.mkv", 10)
+            event = DetectionEvent("camera", "Garden", start + timedelta(seconds=14.84),
+                                   start + timedelta(seconds=16), ("person",), .9)
+            with patch("local_detection.event_directory", return_value=root / "Detections"):
+                finished = export_event(event, recordings, "Garden")
+            self.assertEqual(finished.clip_start, start + timedelta(seconds=10))
+            self.assertTrue(finished.clip.name.startswith(f"person_Garden_{start + timedelta(seconds=10):%Y%m%d_%H%M%S}_"))
+
     def test_excerpt_from_open_raw_segment_contains_decodable_video(self):
         with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
             root = Path(directory)

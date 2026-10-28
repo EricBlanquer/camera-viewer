@@ -33,6 +33,7 @@ SAMPLE_WIDTH = 640
 SAMPLE_HEIGHT = 360
 SAMPLE_BYTES = SAMPLE_WIDTH * SAMPLE_HEIGHT * 3
 EVENT_MARGIN_SECONDS = 5
+MIN_EXCERPT_SECONDS = 1
 EVENT_GAP_SECONDS = 3
 EVENT_CONFIRM_SECONDS = 2
 EVENT_MAX_SECONDS = 120
@@ -577,12 +578,10 @@ def export_event(
     if not segments:
         raise OSError("No continuous recording covers the local detection.")
     category = _event_type(event.classes)
-    clip_start = max(first, segments[0][1])
-    folder = _category_folder(event_directory(), event.first, category)
-    clip = folder / f"{category}_{prefix}_{clip_start:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.mkv"
     with tempfile.TemporaryDirectory(prefix="intraswitch_camera_event_") as temporary:
         parts = []
-        available_end = clip_start
+        clip_start: datetime | None = None
+        available_end = max(first, segments[0][1])
         for path, start, duration in segments:
             left = max(first, start, available_end)
             right = min(last, start + timedelta(seconds=duration))
@@ -603,11 +602,17 @@ def export_event(
             ]
             _run(command, timeout=90, cancel=cancel)
             if not _has_video_packets(part, cancel):
+                if right - left < timedelta(seconds=MIN_EXCERPT_SECONDS):
+                    continue
                 raise OSError("The local detection excerpt is empty.")
+            if clip_start is None:
+                clip_start = left
             parts.append(part)
             available_end = right
-        if not parts or available_end < event.last:
+        if clip_start is None or available_end < event.last:
             raise OSError("The continuous recording does not contain the detected event.")
+        folder = _category_folder(event_directory(), event.first, category)
+        clip = folder / f"{category}_{prefix}_{clip_start:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.mkv"
         target = Path(temporary) / "event.mkv"
         if len(parts) == 1:
             shutil.copyfile(parts[0], target)
