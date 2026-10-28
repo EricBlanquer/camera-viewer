@@ -232,6 +232,21 @@ LIVE_MAX_BOOST = 0.5
 LIVE_SPEED_STEP = 0.05
 MPV_AUDIO_TRACK_ON = "auto"
 MPV_AUDIO_TRACK_OFF = "no"
+# Every mpv invocation starts from these, so a change reaches live streams and
+# recording playback at once. --vo keeps x11 behind gpu because mpv exits before
+# showing anything when no GPU context can be created, which is what a graphics
+# driver upgrade without a reboot produces.
+MPV_COMMON_OPTIONS = (
+    "--no-config",
+    "--no-terminal",
+    "--really-quiet",
+    "--vo=gpu,x11",
+    "--hwdec=auto-safe",
+    "--osc=no",
+    "--input-cursor=no",
+    "--input-default-bindings=no",
+    "--force-window=yes",
+)
 RTSP_AUDIO_FILTER = "--af=lavfi=[volume=25dB,alimiter=limit=0.95]"
 AUDIO_RESPONSE_COMMAND = 0x6031
 RECONNECT_MAX_SECONDS = 30
@@ -806,15 +821,8 @@ def remux_to_matroska(
 def mpv_stream_command(socket_path: Path, window_id: int, fill: bool) -> list[str]:
     command = [
         "mpv",
-        "--no-config",
-        "--no-terminal",
-        "--really-quiet",
-        "--vo=x11",
-        "--osc=no",
-        "--input-cursor=no",
-        "--input-default-bindings=no",
+        *MPV_COMMON_OPTIONS,
         "--input-vo-keyboard=no",
-        "--force-window=yes",
         "--profile=low-latency",
         "--cache=no",
         "--untimed",
@@ -5915,8 +5923,7 @@ class LocalReplayPane(QWidget):
             self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-replay-")
             self.socket_path = Path(self.mpv_directory.name) / "control.sock"
             command = [
-                "mpv", "--no-config", "--no-terminal", "--really-quiet", "--vo=x11", "--osc=no",
-                "--input-default-bindings=no", "--input-cursor=no", "--force-window=yes", "--keep-open=yes",
+                "mpv", *MPV_COMMON_OPTIONS, "--keep-open=yes",
                 f"--input-ipc-server={self.socket_path}", f"--wid={int(self.video.winId())}",
             ]
             if isinstance(self.camera, RtspCamera):
