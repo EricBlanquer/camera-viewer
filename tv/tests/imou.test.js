@@ -329,7 +329,7 @@ test("RTP rejects gaps, missing fragments, malformed aggregation and excessive f
     /exceeded/,
   );
 });
-test("session negotiates video-only TCP playback, keeps it alive and acknowledges stop", async (t) => {
+function mockCloudAccess(t) {
   const original = global.XMLHttpRequest;
   global.XMLHttpRequest = class {
     open(method, url) {
@@ -348,6 +348,9 @@ test("session negotiates video-only TCP playback, keeps it alive and acknowledge
   t.after(() => {
     global.XMLHttpRequest = original;
   });
+}
+test("session negotiates video-only TCP playback, keeps it alive and acknowledges stop", async (t) => {
+  mockCloudAccess(t);
   const messages = [];
   const listeners = new Set();
   const native = {
@@ -663,7 +666,43 @@ test("local authentication stops after rejected credentials without cloud fallba
     ),
   );
   assert.equal(f.session.state, "closed");
-  assert.deepEqual(f.errors, ["Imou stream rejected (RTSP 401)"]);
+  assert.deepEqual(f.errors, [imou.PASSWORD_REJECTED]);
+});
+test("a local camera refusing the TV after authentication reports the refusal", async (t) => {
+  const f = fixture();
+  t.after(() => f.session.finishClose());
+  await f.session.open();
+  f.session.event({ type: "tcp-ready", id: f.session.id });
+  f.event(
+    reply(
+      1,
+      401,
+      'WWW-Authenticate: Digest realm="Login", nonce="testnonce"\r\n',
+    ),
+  );
+  await settle();
+  f.event(reply(2, 403));
+  assert.equal(f.session.state, "closed");
+  assert.deepEqual(f.errors, [imou.ACCESS_REFUSED]);
+});
+test("a cloud stream refusal keeps its RTSP status", async (t) => {
+  mockCloudAccess(t);
+  const errors = [];
+  const session = new imou.Session(camera, {
+    postMessage() {},
+    addEventListener() {},
+    removeEventListener() {},
+  }, {
+    status() {},
+    video() {},
+    error: (message) => errors.push(message),
+  });
+  t.after(() => session.finishClose());
+  await session.open();
+  session.event({ id: session.id, type: "tcp-ready" });
+  session.event({ id: session.id, type: "tcp-data", data: reply(1, 403).buffer });
+  assert.equal(session.state, "closed");
+  assert.deepEqual(errors, ["Imou stream rejected (RTSP 403)"]);
 });
 test("closing during local authentication discards late digests", async () => {
   const f = fixture(localCamera, true);

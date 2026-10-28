@@ -22,6 +22,8 @@
     ["right", "3"],
   ]);
   const MOVE_DURATION_MS = 500;
+  const PASSWORD_REJECTED = "Imou camera rejected the password";
+  const ACCESS_REFUSED = "Imou camera refused the TV (RTSP 403)";
   const accounts = new Map();
   let nextId = 1;
   function uuid() {
@@ -807,6 +809,12 @@
           this.send(pending.method, pending.address, pending.headers, true);
           return;
         }
+        if (this.config.local && status === 401) {
+          throw new Error(PASSWORD_REJECTED);
+        }
+        if (this.config.local && status === 403) {
+          throw new Error(ACCESS_REFUSED);
+        }
         throw new Error("Imou stream rejected (RTSP " + status + ")");
       }
       if (pending.method === "DESCRIBE") {
@@ -970,6 +978,8 @@
     }
   }
   const api = {
+    PASSWORD_REJECTED,
+    ACCESS_REFUSED,
     validate,
     signature,
     Account,

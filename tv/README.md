@@ -33,6 +33,7 @@ The secondary and main streams of the four cameras, and the iCam365 and O-KAM st
 Simultaneous playback through AVPlay on this TV stopped one feed while packets continued arriving.
 The application therefore decodes the feeds on the TV using FFmpeg workers and renders them to independent canvases, at up to 960 × 540 pixels per cell and 1920 × 1080 pixels in full screen.
 Four distinct camera connections and advancing decoded images were verified; remote networks remain unverified.
+After rejected passwords, Cuisine answered RTSP 403 to the TV for about two minutes while accepting the same password from a computer.
 Audio, PTZ, playback, recording, detection, and an on-TV account setup interface are outside this application's current scope.
 
 This build targets ARMv7 NaCl-enabled Samsung TVs.
@@ -90,6 +91,8 @@ For local Imou Life access, an entry contains `type: "imou"`, `name`, and `local
 TLS cameras additionally require `local.certificate_sha256`, the lowercase 64-character SHA-256 fingerprint verified during desktop camera setup.
 The TV authenticates its RTSP requests using Digest authentication and receives `/cam/realmonitor?channel=<channel>&subtype=1` in the grid and the HD main stream at `subtype=0` in full screen.
 Local access requires the TV to reach the camera's private address and has no cloud fallback.
+A local camera that rejects its device password stops reconnecting: the TV does not resubmit that password before the application restarts, and provisioning another password reconnects at once.
+A local camera that refuses the TV with RTSP 403 is retried after three minutes instead of ten seconds.
 A local entry may also contain the `account`, `device_id`, and `channel_id` of a cloud entry; the TV then uses the Imou Open Platform only to move the camera.
 The Linux viewer's saved camera settings and desktop keyring can supply the local connection and credential during setup.
 

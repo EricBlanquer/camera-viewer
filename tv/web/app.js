@@ -22,6 +22,8 @@ const ACCOUNT_SIGN_IN_INTERVAL = 300000;
 const ACCOUNT_REFRESH_FAILED = "Account credential refresh failed";
 const MAX_ACCOUNT_RESPONSE_LENGTH = 1048576;
 const MAX_ACCOUNT_PASSWORD_LENGTH = 128;
+const RECONNECT_DELAY = 10000;
+const REFUSED_RECONNECT_DELAY = 180000;
 const events = [];
 const accountSignIns = new Map();
 let nativeReady = false;
@@ -220,6 +222,7 @@ class CameraPane {
     this.reconnectTimer = null;
     this.lastProgress = null;
     this.credentialRejected = false;
+    this.rejectedPassword = null;
     this.element = document.createElement("section");
     this.element.className = "camera";
     this.element.innerHTML = '<canvas></canvas><p class="status"></p>';
@@ -238,6 +241,12 @@ class CameraPane {
   }
   wantsHd() {
     return fullScreen === this.index || Boolean(this.camera && this.camera.always_hd);
+  }
+  passwordRejected() {
+    return Boolean(
+      this.camera && this.camera.local &&
+        this.camera.local.password === this.rejectedPassword,
+    );
   }
   rectangle() {
     if (fullScreen === this.index) {
@@ -274,7 +283,10 @@ class CameraPane {
   async connect(camera) {
     const sameCamera = this.sameCamera(camera);
     this.stop({ preserveImage: sameCamera });
-    if (!sameCamera) this.credentialRejected = false;
+    if (!sameCamera) {
+      this.credentialRejected = false;
+      this.rejectedPassword = null;
+    }
     this.camera = camera;
     const current = this.generation;
     if (!camera || !nativeReady || document.hidden) {
@@ -285,6 +297,11 @@ class CameraPane {
         state: camera ? "waiting" : "empty",
       };
       this.statusElement.textContent = camera ? "Waiting for TV transport" : "";
+      return;
+    }
+    if (this.passwordRejected()) {
+      this.metrics = { frames: 0, bytes: 0, playtime: 0, state: "error" };
+      this.status(ImouVideo.PASSWORD_REJECTED);
       return;
     }
     this.status(this.hasImage ? "Reconnecting" : "Connecting");
@@ -309,6 +326,9 @@ class CameraPane {
         error: (message, relay) => {
           this.credentialRejected =
             message === CameraProtocol.AUTHENTICATION_REJECTED;
+          if (message === ImouVideo.PASSWORD_REJECTED) {
+            this.rejectedPassword = camera.local.password;
+          }
           this.failed(message, relay);
         },
       });
@@ -376,7 +396,13 @@ class CameraPane {
     this.stop({ preserveImage: true });
     this.metrics.state = "error";
     this.status(message);
-    this.reconnectTimer = setTimeout(() => this.connect(this.camera), 10000);
+    if (this.passwordRejected()) return;
+    this.reconnectTimer = setTimeout(
+      () => this.connect(this.camera),
+      message === ImouVideo.ACCESS_REFUSED
+        ? REFUSED_RECONNECT_DELAY
+        : RECONNECT_DELAY,
+    );
   }
   stop({ preserveImage = false } = {}) {
     this.generation++;

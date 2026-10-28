@@ -5,9 +5,21 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const protocol = require("../web/protocol.js");
 const imou = require("../web/imou.js");
+const localImouCamera = {
+  type: "imou",
+  name: "Kitchen",
+  local: {
+    host: "192.168.1.210",
+    port: 554,
+    channel: 1,
+    username: "admin",
+    password: "test",
+  },
+};
 function viewer(options = {}) {
   const listeners = {};
   const intervals = [];
+  const timeouts = [];
   const sessions = [];
   const messages = [];
   const screenSaverStates = [];
@@ -168,7 +180,7 @@ function viewer(options = {}) {
     },
     setInterval: (callback) => intervals.push(callback),
     clearInterval: () => {},
-    setTimeout: () => 1,
+    setTimeout: (callback, delay) => timeouts.push({ callback, delay }),
     clearTimeout: () => {},
     ImageData: class {
       constructor(data) {
@@ -212,6 +224,7 @@ function viewer(options = {}) {
     nodes,
     sessions,
     intervals,
+    timeouts,
     messages,
     exits: () => exits,
     accountRequests,
@@ -355,17 +368,7 @@ test("stalled rendering closes only the affected connection", async () => {
 });
 test("local Imou reconnects retain images only for the same local camera and channel", async () => {
   const app = viewer();
-  const camera = {
-    type: "imou",
-    name: "Kitchen",
-    local: {
-      host: "192.168.1.210",
-      port: 554,
-      channel: 1,
-      username: "admin",
-      password: "test",
-    },
-  };
+  const camera = localImouCamera;
   app.context.window.cameraViewer.configure([camera]);
   app.emit({ type: "transport-ready" });
   await Promise.resolve();
@@ -384,6 +387,43 @@ test("local Imou reconnects retain images only for the same local camera and cha
     await pane.connect({ ...camera, local: { ...camera.local, ...change } });
     assert.equal(pane.canvas.image, null);
   }
+});
+test("a local Imou password rejected by the camera is not submitted again", async () => {
+  const app = viewer();
+  app.context.window.cameraViewer.configure([localImouCamera]);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  const pane = app.pane(0);
+  const timers = app.timeouts.length;
+  pane.session.callbacks.error(imou.PASSWORD_REJECTED);
+  assert.equal(app.timeouts.length, timers);
+  app.setHidden(true);
+  app.setHidden(false);
+  await Promise.resolve();
+  assert.equal(app.sessions.length, 1);
+  assert.equal(pane.session, null);
+  assert.equal(pane.statusElement.textContent, imou.PASSWORD_REJECTED);
+  assert.equal(app.context.window.cameraViewer.state()[0].state, "error");
+  app.context.window.cameraViewer.configure([{
+    ...localImouCamera,
+    local: { ...localImouCamera.local, password: "updated" },
+  }]);
+  await Promise.resolve();
+  assert.equal(app.sessions.length, 2);
+  assert.equal(app.sessions[1].config.local.password, "updated");
+});
+test("a local Imou camera refusing the TV is retried after three minutes", async () => {
+  const app = viewer();
+  app.context.window.cameraViewer.configure([localImouCamera]);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  const pane = app.pane(0);
+  pane.session.callbacks.error(imou.ACCESS_REFUSED);
+  assert.equal(app.timeouts.at(-1).delay, 180000);
+  await app.timeouts.at(-1).callback();
+  assert.equal(app.sessions.length, 2);
+  pane.session.callbacks.error("Imou connection timed out");
+  assert.equal(app.timeouts.at(-1).delay, 10000);
 });
 test("OK shows the selected camera in full screen and Back returns to the grid", async () => {
   const app = viewer();
