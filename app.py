@@ -232,10 +232,6 @@ LIVE_MAX_BOOST = 0.5
 LIVE_SPEED_STEP = 0.05
 MPV_AUDIO_TRACK_ON = "auto"
 MPV_AUDIO_TRACK_OFF = "no"
-# Every mpv invocation starts from these, so a change reaches live streams and
-# recording playback at once. --vo keeps x11 behind gpu because mpv exits before
-# showing anything when no GPU context can be created, which is what a graphics
-# driver upgrade without a reboot produces.
 MPV_COMMON_OPTIONS = (
     "--no-config",
     "--no-terminal",
