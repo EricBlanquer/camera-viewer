@@ -16,7 +16,7 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QWidget
 
-from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, IMOU_ACCOUNT_PROVIDER, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, SETTING_GUARD, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
+from app import AspectVideoFrame, CameraPreview, ICAM365_SERVER, IMOU_ACCOUNT_PROVIDER, POSITION_CORRECTION, LocalReplayPane, MainWindow, RTSP_ACCOUNT, RTSP_DENOISE_FILTER, SETTING_GUARD, RtspCamera, RtspStreamWorker, StreamWorker, icam365_light_request, icam365_ptz_request, load_rtsp_cameras, mpv_rtsp_command, valid_rtsp_url
 from icam365 import NativePreset
 
 
@@ -667,6 +667,41 @@ class TrayTest(unittest.TestCase):
         self.assertTrue(entrance.ptz_panel.patrol_button.isHidden())
         entrance.close()
         preview.close()
+
+    def test_okam_position_correction_is_sent_to_its_worker(self) -> None:
+        camera = SimpleNamespace(name="Jardin", uid="garden")
+        preview = CameraPreview(camera, settings=self.window.settings)
+        panel = preview.ptz_panel
+        self.assertFalse(panel.correction_button.isHidden())
+        self.assertFalse(panel.correction_button.isEnabled())
+        preview.worker = StreamWorker(camera, "", io.BytesIO())
+        preview.live = True
+        preview.set_movement_enabled(True)
+        panel.correction_button.click()
+        self.assertEqual(preview.worker.controls.get_nowait(), (POSITION_CORRECTION,))
+        self.assertFalse(panel.correction_button.isEnabled())
+        preview._on_control_finished(POSITION_CORRECTION)
+        self.assertTrue(panel.correction_button.isEnabled())
+        entrance = CameraPreview(RtspCamera("rtsp:entrance", "Entrée", "rtsp://192.0.2.10:8001/0"))
+        self.assertTrue(entrance.ptz_panel.correction_button.isHidden())
+        entrance.close()
+        preview.close()
+
+    def test_selected_okam_position_correction_reports_its_progress(self) -> None:
+        camera = SimpleNamespace(name="Jardin", uid="garden")
+        self.window.selected_device = camera
+        self.window.stream_worker = StreamWorker(camera, "", io.BytesIO())
+        self.window.stream_live = True
+        self.window.set_controls_enabled(True)
+        self.assertTrue(self.window.ptz_panel.correction_button.isEnabled())
+        with patch.object(self.window, "show_notice") as notice:
+            self.window.ptz_panel.correction_button.click()
+            self.assertEqual(self.window.stream_worker.controls.get_nowait(), (POSITION_CORRECTION,))
+            self.assertFalse(self.window.ptz_panel.correction_button.isEnabled())
+            self.window.on_control_completed(POSITION_CORRECTION)
+        self.assertEqual([call.args[0] for call in notice.call_args_list],
+                         ["Correcting the camera position...", "Camera position corrected."])
+        self.assertTrue(self.window.ptz_panel.correction_button.isEnabled())
 
     def test_okam_guard_position_is_chosen_by_double_click(self) -> None:
         camera = SimpleNamespace(name="Jardin", uid="garden")

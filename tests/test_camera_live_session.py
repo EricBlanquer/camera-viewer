@@ -12,9 +12,10 @@ from okam_native.p2p import P2PError
 
 from app import (
     CAMERA_STATUS_PATH, GUARD_RESPONSE_COMMAND, PATROL_MANUAL_PAUSE_SECONDS, PATROL_MOTION_LIMIT_SECONDS,
-    PATROL_STEP_SECONDS, PRESET_COMMANDS, PTZ_RESPONSE_COMMAND, SETTING_GUARD, CameraFrameReader, StreamWorker,
-    available_presets, guard_preset, patrol_order,
+    PATROL_STEP_SECONDS, POSITION_CORRECTION, POSITION_CORRECTION_COMMAND, PRESET_COMMANDS, PTZ_RESPONSE_COMMAND,
+    SETTING_GUARD, CameraFrameReader, StreamWorker, available_presets, guard_preset, patrol_order,
 )
+from camera_position import MATCHED, MISPLACED, SAVED, SUSPECTED
 
 
 class CameraLiveSessionTest(unittest.TestCase):
@@ -119,7 +120,7 @@ class CameraLiveSessionTest(unittest.TestCase):
     def test_patrol_stays_while_something_moves_in_front_of_the_camera(self) -> None:
         clock = SimpleNamespace(now=100.0)
         worker = self.patrol_worker()
-        detector = worker.local_detector = Mock()
+        detector = worker.local_detector = Mock(latest_frame=None)
         detector.moved_at_rest.side_effect = lambda since: 100 < clock.now < 125
         read = self.patrol_read(worker, clock, 100 + PATROL_STEP_SECONDS * 5)
         requests, _ = self.stream(worker, clock, read, control_result=(PTZ_RESPONSE_COMMAND, 0))
@@ -131,7 +132,7 @@ class CameraLiveSessionTest(unittest.TestCase):
     def test_patrol_resumes_when_movement_lasts_too_long(self) -> None:
         clock = SimpleNamespace(now=100.0)
         worker = self.patrol_worker()
-        worker.local_detector = Mock()
+        worker.local_detector = Mock(latest_frame=None)
         worker.local_detector.moved_at_rest.side_effect = lambda since: clock.now > 100
         read = self.patrol_read(worker, clock, 100 + PATROL_STEP_SECONDS * 2 + PATROL_MOTION_LIMIT_SECONDS)
         requests, _ = self.stream(worker, clock, read, control_result=(PTZ_RESPONSE_COMMAND, 0))
@@ -159,6 +160,66 @@ class CameraLiveSessionTest(unittest.TestCase):
             "set_sensor_preset.cgi?sensorid=255&presetid=255&",
         ])
         self.assertEqual(completed, [(SETTING_GUARD, "Preset 4"), (SETTING_GUARD, None)])
+
+    def test_position_correction_waits_for_the_camera_and_returns_to_the_last_position(self) -> None:
+        clock = SimpleNamespace(now=100.0)
+        worker = StreamWorker(SimpleNamespace(uid="uid", name="Garden", device_password=""), "", io.BytesIO())
+        completed: list[str] = []
+        worker.control_completed.connect(completed.append)
+        read = self.patrol_read(worker, clock, 130, {
+            101: lambda: worker.queue_control(("Preset 4",)),
+            103: lambda: worker.queue_control((POSITION_CORRECTION,)),
+            105: lambda: worker.queue_control(("Preset 2",)),
+        })
+        requests, _ = self.stream(worker, clock, read, control_result=(PTZ_RESPONSE_COMMAND, 0),
+                                  status=lambda: {"center_status": "1" if clock.now < 115 else "0"})
+        self.assertEqual(self.ptz_commands(requests), [
+            PRESET_COMMANDS["Preset 4"], POSITION_CORRECTION_COMMAND, PRESET_COMMANDS["Preset 4"],
+            PRESET_COMMANDS["Preset 2"],
+        ])
+        self.assertEqual(completed, ["Preset 4", POSITION_CORRECTION, "Preset 2"])
+        correction = requests.index(f"decoder_control.cgi?command={POSITION_CORRECTION_COMMAND}&onestep=0&")
+        self.assertEqual(requests[correction + 1:correction + 7], [CAMERA_STATUS_PATH] * 6)
+
+    def test_camera_away_from_its_position_is_corrected_at_most_every_half_hour(self) -> None:
+        clock = SimpleNamespace(now=100.0)
+        worker = StreamWorker(SimpleNamespace(uid="uid", name="Garden", device_password=""), "", io.BytesIO())
+        completed: list[str] = []
+        worker.control_completed.connect(completed.append)
+        checks: list[SimpleNamespace] = []
+
+        def check(_uid: str, preset: str, _started: float, trusted: bool, _references: object) -> SimpleNamespace:
+            checks.append(SimpleNamespace(preset=preset, trusted=trusted))
+            return SimpleNamespace(preset=preset, observe=lambda sample, now: SAVED if trusted else MISPLACED)
+
+        read = self.patrol_read(worker, clock, 150, {
+            101: lambda: worker.queue_control(("Preset 4",)),
+            140: lambda: worker.queue_control(("Preset 4",)),
+        })
+        with patch("app.PositionCheck", side_effect=check), self.assertLogs("okam-linux", "WARNING") as logs:
+            requests, _ = self.stream(worker, clock, read, control_result=(PTZ_RESPONSE_COMMAND, 0),
+                                      status=lambda: {"center_status": "1" if clock.now < 110 else "0"})
+        self.assertEqual(self.ptz_commands(requests), [
+            PRESET_COMMANDS["Preset 4"], POSITION_CORRECTION_COMMAND, PRESET_COMMANDS["Preset 4"],
+            PRESET_COMMANDS["Preset 4"],
+        ])
+        self.assertEqual([(item.preset, item.trusted) for item in checks],
+                         [("Preset 4", False), ("Preset 4", True), ("Preset 4", False)])
+        self.assertEqual(completed, ["Preset 4", "Preset 4"])
+        self.assertEqual(worker.position_corrected_at, 101)
+        self.assertEqual(sum("already corrected" in line for line in logs.output), 1)
+
+    def test_patrol_stays_on_a_position_until_its_view_is_confirmed(self) -> None:
+        clock = SimpleNamespace(now=100.0)
+        worker = self.patrol_worker()
+
+        def check(_uid: str, preset: str, _started: float, _trusted: bool, _references: object) -> SimpleNamespace:
+            return SimpleNamespace(preset=preset, observe=lambda sample, now: SUSPECTED if now < 120 else MATCHED)
+
+        read = self.patrol_read(worker, clock, 130)
+        with patch("app.PositionCheck", side_effect=check):
+            requests, _ = self.stream(worker, clock, read, control_result=(PTZ_RESPONSE_COMMAND, 0))
+        self.assertEqual(self.moves(requests), [1, 2])
 
     def test_saved_positions_and_guard_come_from_the_camera_status(self) -> None:
         self.assertEqual(available_presets({"preset_value": "63488"}), [f"Preset {index}" for index in range(1, 6)])
@@ -191,6 +252,11 @@ class CameraLiveSessionTest(unittest.TestCase):
         return read
 
     @staticmethod
+    def ptz_commands(requests: list[str]) -> list[int]:
+        prefix = "decoder_control.cgi?command="
+        return [int(request.removeprefix(prefix).split("&")[0]) for request in requests if request.startswith(prefix)]
+
+    @staticmethod
     def moves(requests: list[str]) -> list[int]:
         presets = {f"decoder_control.cgi?command={value}&onestep=0&": int(command.removeprefix("Preset "))
                    for command, value in PRESET_COMMANDS.items()}
@@ -198,7 +264,8 @@ class CameraLiveSessionTest(unittest.TestCase):
 
     def stream(self, worker: StreamWorker, clock: SimpleNamespace, read: object,
                inspect: object = lambda frame: (True, False),
-               control_result: tuple[int, int] | None = None) -> tuple[list[str], list[int]]:
+               control_result: tuple[int, int] | None = None,
+               status: object = lambda: None) -> tuple[list[str], list[int]]:
         requests: list[str] = []
         responses: list[int] = []
         if not isinstance(worker.player, Mock):
@@ -211,7 +278,7 @@ class CameraLiveSessionTest(unittest.TestCase):
                 patch("app.write_command", side_effect=lambda session, request: requests.append(request)), \
                 patch("app.read_command_result", return_value=control_result), \
                 patch("app.datetime", wraps=datetime) as wall_clock, \
-                patch("app.read_response_fields", side_effect=lambda *arguments: responses.append(arguments[1])), \
+                patch("app.read_response_fields", side_effect=lambda *arguments: responses.append(arguments[1]) or status()), \
                 patch("app.inspect_h264", side_effect=inspect), \
                 patch("app.update_local_detector", return_value=None), \
                 patch("app.CameraFrameReader.read", read), \

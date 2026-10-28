@@ -119,6 +119,9 @@ from rtsp_tunnel import (
 from local_detection import (
     DetectionEngine, DetectionEvent, DetectionPipeline, add_missing_covers, load_events, model_path, organize_events,
 )
+from camera_position import (
+    MISPLACED, PENDING, SAVED, SUSPECTED, PositionCheck, PositionCorrection, PositionReferences,
+)
 from Xlib import X as X11, Xutil, display as xdisplay
 from Xlib.protocol import event as xevent
 
@@ -189,6 +192,11 @@ PATROL_TRAVEL_SECONDS = 4
 PATROL_MANUAL_PAUSE_SECONDS = 30
 PATROL_MOTION_HOLD_SECONDS = 10
 PATROL_MOTION_LIMIT_SECONDS = 120
+POSITION_CORRECTION = "Correct position"
+POSITION_CORRECTION_FAILED = "Camera position correction failed."
+POSITION_CORRECTION_COMMAND = 25
+POSITION_CORRECTION_INTERVAL_SECONDS = 1800
+POSITION_DIRECTORY = LOG_DIRECTORY / "positions"
 PTZ_RESPONSE_COMMAND = 0x6019
 MOTOR_PULSE_SECONDS = 0.12
 DRAG_PIXELS_PER_STEP = 90
@@ -1813,6 +1821,12 @@ class MovementControls(QWidget):
         self.patrol_button.hide()
         self.set_patrol(False)
         directions.addWidget(self.patrol_button)
+        self.correction_button = QPushButton()
+        set_button_icon(self.correction_button, "correct_position", "Correct the camera position", 40)
+        self.correction_button.setEnabled(False)
+        self.correction_button.clicked.connect(lambda: self.command_requested.emit(POSITION_CORRECTION))
+        self.correction_button.hide()
+        directions.addWidget(self.correction_button)
         layout.addLayout(directions)
         self.presets = QWidget(self)
         self.presets.setObjectName("presetControls")
@@ -1843,8 +1857,9 @@ class MovementControls(QWidget):
         set_button_icon(self.patrol_button, "patrol_on" if enabled else "patrol",
                         "Stop patrol" if enabled else "Patrol between saved positions", 40)
 
-    def set_patrol_available(self, available: bool) -> None:
+    def set_position_tools_available(self, available: bool) -> None:
         self.patrol_button.setVisible(available)
+        self.correction_button.setVisible(available)
 
     def set_guard(self, available: bool, command: str | None) -> None:
         self.guard_available = available
@@ -2362,6 +2377,11 @@ class StreamWorker(QThread):
         self.patrol_next_at = 0.0
         self.patrol_rest_at: float | None = None
         self.patrol_hold_since: float | None = None
+        self.position_references = PositionReferences(POSITION_DIRECTORY)
+        self.position_check: PositionCheck | None = None
+        self.position_correction: PositionCorrection | None = None
+        self.position_corrected_at: float | None = None
+        self.last_preset: str | None = None
 
     def set_main_stream(self, enabled: bool) -> None:
         self.main_stream = enabled
@@ -2459,6 +2479,8 @@ class StreamWorker(QThread):
             frame_reader = CameraFrameReader()
             while not self.stop_requested.is_set():
                 self._process_control(session, login.user, login.password)
+                self._process_correction(session, login.user, login.password)
+                self._process_position(session, login.user, login.password)
                 self._process_patrol(session, login.user, login.password)
                 self._process_setting(session, login.user, login.password)
                 self._process_detections(session, login.user, login.password)
@@ -2738,11 +2760,21 @@ class StreamWorker(QThread):
         self.audio_player = None
 
     def _process_control(self, session: CS2Session, user: str, password: str) -> None:
+        if self.position_correction is not None:
+            return
         try:
             commands = self.controls.get_nowait()
         except queue.Empty:
             return
         self._pause_patrol()
+        self.position_check = None
+        if commands == (POSITION_CORRECTION,):
+            try:
+                self._start_correction(session, user, password, self.last_preset, False)
+            except (CS2Error, OSError):
+                if not self.stop_requested.is_set():
+                    self.control_failed.emit(POSITION_CORRECTION_FAILED)
+            return
         try:
             for command in commands:
                 if self.stop_requested.is_set():
@@ -2752,11 +2784,86 @@ class StreamWorker(QThread):
                 else:
                     self._send_command(session, user, password, PRESET_COMMANDS[command])
                     self._require_control_response(session)
+                    self._watch_position(command, False)
             if not self.stop_requested.is_set():
                 self.control_completed.emit(commands[0] if len(commands) == 1 else "Drag")
         except (CS2Error, OSError):
             if not self.stop_requested.is_set():
                 self.control_failed.emit("Camera movement failed.")
+
+    def _watch_position(self, preset: str, trusted: bool) -> None:
+        self.last_preset = preset
+        self.position_check = PositionCheck(self.device.uid, preset, time.monotonic(), trusted, self.position_references)
+
+    def _start_correction(
+        self, session: CS2Session, user: str, password: str, preset: str | None, automatic: bool
+    ) -> None:
+        self._pause_patrol()
+        self.position_check = None
+        self._send_command(session, user, password, POSITION_CORRECTION_COMMAND)
+        self._require_control_response(session)
+        self.position_correction = PositionCorrection(preset, automatic, time.monotonic())
+        if automatic:
+            self.position_corrected_at = self.position_correction.started
+        LOG.info("Correcting the position of %s", self.device.name)
+
+    def _process_correction(self, session: CS2Session, user: str, password: str) -> None:
+        correction = self.position_correction
+        if correction is None or time.monotonic() < correction.next_status_at:
+            return
+        try:
+            write_command(session, make_cgi_request(CAMERA_STATUS_PATH, user, password))
+            status = read_response_fields(session, LOGIN_RESPONSE_COMMAND, {}, SETTING_RESPONSE_SECONDS)
+            now = time.monotonic()
+            if not correction.finished(status, now):
+                return
+            self.position_correction = None
+            self.patrol_next_at = now + PATROL_STEP_SECONDS
+            LOG.info("Corrected the position of %s", self.device.name)
+            if correction.preset is not None:
+                self._send_command(session, user, password, PRESET_COMMANDS[correction.preset])
+                self._require_control_response(session)
+                self._watch_position(correction.preset, True)
+        except (CS2Error, OSError) as ex:
+            self.position_correction = None
+            LOG.warning("Position correction of %s failed: %s", self.device.name, ex)
+            if not correction.automatic and not self.stop_requested.is_set():
+                self.control_failed.emit(POSITION_CORRECTION_FAILED)
+            return
+        if not correction.automatic:
+            self.control_completed.emit(POSITION_CORRECTION)
+
+    def _process_position(self, session: CS2Session, user: str, password: str) -> None:
+        check = self.position_check
+        if check is None or self.position_correction is not None:
+            return
+        detector = self.local_detector
+        now = time.monotonic()
+        try:
+            result = check.observe(detector.latest_frame if detector is not None else None, now)
+        except OSError as ex:
+            self.position_check = None
+            LOG.warning("Position check of %s stopped: %s", self.device.name, ex)
+            return
+        if result == PENDING:
+            return
+        if result == SUSPECTED:
+            self.patrol_next_at = max(self.patrol_next_at, now + PATROL_STEP_SECONDS)
+            return
+        self.position_check = None
+        if result == SAVED:
+            LOG.info("Saved the reference image of %s at %s", self.device.name, check.preset.lower())
+        if result != MISPLACED:
+            return
+        LOG.warning("%s is away from %s", self.device.name, check.preset.lower())
+        if self.position_corrected_at is not None and now - self.position_corrected_at < POSITION_CORRECTION_INTERVAL_SECONDS:
+            LOG.warning("Position of %s was already corrected less than %d minutes ago", self.device.name,
+                        POSITION_CORRECTION_INTERVAL_SECONDS // 60)
+            return
+        try:
+            self._start_correction(session, user, password, check.preset, True)
+        except (CS2Error, OSError) as ex:
+            LOG.warning("Position correction of %s failed: %s", self.device.name, ex)
 
     def _pause_patrol(self) -> None:
         self.patrol_next_at = time.monotonic() + PATROL_MANUAL_PAUSE_SECONDS
@@ -2766,7 +2873,7 @@ class StreamWorker(QThread):
             self.local_detector.rest(None)
 
     def _process_patrol(self, session: CS2Session, user: str, password: str) -> None:
-        if not self.patrol_requested.is_set() or not self.patrol_presets:
+        if not self.patrol_requested.is_set() or not self.patrol_presets or self.position_correction is not None:
             return
         now = time.monotonic()
         detector = self.local_detector
@@ -2789,6 +2896,7 @@ class StreamWorker(QThread):
         try:
             self._send_command(session, user, password, PRESET_COMMANDS[command])
             self._require_control_response(session)
+            self._watch_position(command, False)
         except (CS2Error, OSError) as ex:
             LOG.warning("Patrol could not move %s to %s: %s", self.device.name, command.lower(), ex)
 
@@ -4745,7 +4853,7 @@ class CameraPreview(QWidget):
         self.ptz_button.clicked.connect(self.toggle_ptz_panel)
         self.ptz_panel = MovementControls(self.overlay)
         self.ptz_panel.set_tilt_only(isinstance(camera, RtspCamera))
-        self.ptz_panel.set_patrol_available(not isinstance(camera, RtspCamera))
+        self.ptz_panel.set_position_tools_available(not isinstance(camera, RtspCamera))
         self.ptz_panel.set_patrol(patrol_enabled(settings, camera.uid))
         self.ptz_panel.command_requested.connect(self.move_camera)
         self.ptz_panel.patrol_requested.connect(self.set_patrol)
@@ -4802,6 +4910,7 @@ class CameraPreview(QWidget):
 
     def set_movement_enabled(self, enabled: bool) -> None:
         self.ptz_button.setEnabled(enabled)
+        self.ptz_panel.correction_button.setEnabled(enabled)
         for button in self.ptz_panel.buttons:
             button.setEnabled(enabled)
 
@@ -8215,7 +8324,7 @@ class MainWindow(QMainWindow):
         self.ptz_button.setEnabled(not isinstance(self.selected_device, RtspCamera))
         self.ptz_button.setVisible(not isinstance(self.selected_device, RtspCamera))
         self.sound_button.setVisible(not isinstance(self.selected_device, RtspCamera))
-        self.ptz_panel.set_patrol_available(not isinstance(self.selected_device, RtspCamera))
+        self.ptz_panel.set_position_tools_available(not isinstance(self.selected_device, RtspCamera))
         self.ptz_panel.set_patrol(patrol_enabled(self.settings, uid))
         self.ptz_panel.set_guard(False, None)
         self.ptz_panel.hide()
@@ -8543,6 +8652,7 @@ class MainWindow(QMainWindow):
         self.ptz_panel.set_capabilities(*options)
         for button in self.camera_buttons:
             button.setEnabled(enabled and (not rtsp or self.rtsp_ptz_available) and not button.isHidden())
+        self.ptz_panel.correction_button.setEnabled(enabled and not rtsp)
         self.ptz_button.setEnabled(enabled and (not rtsp or self.rtsp_ptz_available))
 
     def on_rtsp_ptz_available(self) -> None:
@@ -8940,7 +9050,9 @@ class MainWindow(QMainWindow):
         self.control_pending = True
         self.set_controls_enabled(False)
         command = commands[0]
-        if command.startswith("Preset "):
+        if command == POSITION_CORRECTION:
+            self.show_notice("Correcting the camera position...")
+        elif command.startswith("Preset "):
             self.show_notice(f"Moving camera to {command.lower()}...")
         else:
             self.show_notice(f"Moving camera {command.lower()}...")
@@ -8950,6 +9062,8 @@ class MainWindow(QMainWindow):
         self.set_controls_enabled(self.stream_live)
         if command == "Drag":
             self.show_notice("Camera moved with mouse.")
+        elif command == POSITION_CORRECTION:
+            self.show_notice("Camera position corrected.")
         elif command.startswith("Preset "):
             self.show_notice(f"Camera moved to {command.lower()}.")
         else:

@@ -126,6 +126,11 @@ The patrol button of an O-KAM pane moves the camera back and forth between its s
 The patrol choice is remembered per camera on this computer, and the patrol runs only while Camera Viewer keeps that camera connected.
 A manual movement pauses the patrol for 30 seconds.
 When local detection is on, a person or animal moving while the camera is still keeps it on that position until 10 seconds after the movement, for at most 2 minutes.
+The correction button of an O-KAM pane makes the camera recalibrate its pan and tilt, which takes about 20 seconds, then returns it to the saved position last recalled by Camera Viewer; other movements wait until the correction ends.
+When local detection is on, each saved position recalled by Camera Viewer is checked once the image stays still: it is compared with a reference image of that position, kept separately for color and infrared views in `~/.cache/okam-linux/positions`.
+The first still image of a position becomes its reference.
+An image that still differs after 12 seconds triggers a position correction, a return to the saved position, and a new reference image; a camera is corrected automatically at most once every 30 minutes.
+A patrol stays on a position while its image is being confirmed.
 Compatible iCam365 camera panes have a bulb button that switches white light between On and Automatic.
 Local playback stays in that camera's video pane and uses the same controls and timeline as camera microSD playback, with recordings from the last 24 hours, pause, seeking, speeds up to 8x, sound, photo, saved clips, and full-screen controls; **LIVE** returns to the camera stream.
 For an O-KAM, Imou Life account, or native iCam365 pane, the playback button offers the camera's microSD recordings and its local 24-hour recordings.
@@ -231,6 +236,7 @@ The magnifier buttons zoom the picture locally.
 For O-KAM cameras, the arrow buttons send short pan and tilt pulses to the camera.
 For O-KAM cameras, drag the video horizontally or vertically with the right mouse button to move it by up to four short pulses; the left button also moves the camera when only one camera is displayed.
 For O-KAM cameras, **Preset 1** through **Preset 5** recall its saved positions.
+For O-KAM cameras, the correction button recalibrates the camera position and returns to the last recalled saved position.
 For compatible iCam365 cameras, **PTZ** offers the movements available through the connected transport: Up and Down over the local HTTP endpoint, or pan-and-tilt and saved positions over the native connection.
 
 The title bar provides the desktop's minimize, maximize, and close buttons, and the window remains available from the taskbar.

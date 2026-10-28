@@ -342,11 +342,11 @@ def event_directory() -> Path:
     return directory
 
 
-def _camera_key(uid: str) -> str:
+def camera_key(uid: str) -> str:
     return hashlib.sha256(uid.encode("utf-8")).hexdigest()[:16]
 
 
-def _private_folder(root: Path, *parts: str) -> Path:
+def private_folder(root: Path, *parts: str) -> Path:
     folder = root
     for part in parts:
         folder = folder / part
@@ -356,7 +356,7 @@ def _private_folder(root: Path, *parts: str) -> Path:
 
 
 def _event_folder(root: Path, uid: str, day: datetime) -> Path:
-    return _private_folder(root, day.strftime(EVENT_DAY_FORMAT), METADATA_FOLDER, _camera_key(uid))
+    return private_folder(root, day.strftime(EVENT_DAY_FORMAT), METADATA_FOLDER, camera_key(uid))
 
 
 def _current_classes(names: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -371,7 +371,7 @@ def _event_type(classes: tuple[str, ...]) -> str:
 
 
 def _category_folder(root: Path, day: datetime, category: str) -> Path:
-    return _private_folder(root, day.strftime(EVENT_DAY_FORMAT), category)
+    return private_folder(root, day.strftime(EVENT_DAY_FORMAT), category)
 
 
 def _remove_empty_folders(root: Path, folder: Path) -> None:
@@ -444,7 +444,7 @@ def organize_events() -> None:
 
 def _organize_event(root: Path, metadata: Path) -> None:
     document = json.loads(metadata.read_text(encoding="utf-8"))
-    if metadata.parent.name != _camera_key(document["uid"]):
+    if metadata.parent.name != camera_key(document["uid"]):
         raise ValueError("Invalid local detection camera folder.")
     day = datetime.fromisoformat(document["first"])
     classes = list(_current_classes(document["classes"]))
@@ -477,7 +477,7 @@ def load_events(uid: str, now: datetime | None = None) -> list[DetectionEvent]:
     days = [cutoff + timedelta(days=offset) for offset in range((current.date() - cutoff.date()).days + 1)]
     events = []
     for path in (path for day in days
-                 for path in (root / day.strftime(EVENT_DAY_FORMAT) / METADATA_FOLDER / _camera_key(uid)).glob("*.json")):
+                 for path in (root / day.strftime(EVENT_DAY_FORMAT) / METADATA_FOLDER / camera_key(uid)).glob("*.json")):
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
             first = datetime.fromisoformat(document["first"])
@@ -768,7 +768,7 @@ class DetectionEngine:
             LOG.warning("Local detection export queue is full; event remains pending: %s", path)
 
     def recover(self, pipeline: DetectionPipeline) -> None:
-        for path in event_directory().glob(f"*/{METADATA_FOLDER}/{_camera_key(pipeline.uid)}/*.json"):
+        for path in event_directory().glob(f"*/{METADATA_FOLDER}/{camera_key(pipeline.uid)}/*.json"):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if data["status"] != "pending" or data["uid"] != pipeline.uid:
@@ -865,6 +865,7 @@ class DetectionPipeline:
         self.on_event = on_event
         self.on_error = on_error
         self.stopped = threading.Event()
+        self.latest_frame: tuple[bytes, float] | None = None
         self.pending: queue.Queue[bytes | None] | None = queue.Queue(maxsize=16) if raw_input else None
         self.needs_keyframe = raw_input
         command = [
@@ -946,7 +947,9 @@ class DetectionPipeline:
                         return
                     parts.append(data)
                     remaining -= len(data)
-                self.engine.submit(self, b"".join(parts), datetime.now())
+                frame = b"".join(parts)
+                self.latest_frame = frame, time.monotonic()
+                self.engine.submit(self, frame, datetime.now())
         except OSError as ex:
             if not self.stopped.is_set():
                 LOG.warning("Local detection decoder failed for %s: %s", self.camera, ex)
