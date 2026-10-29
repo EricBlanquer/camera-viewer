@@ -100,6 +100,7 @@ class MotionGate:
         self.reference = None
         self.hits: list[DetectionHit] = []
         self.candidate_score = 0.0
+        self.inferred = False
 
     def _prepare(self, frame: bytes):
         image = self.np.frombuffer(frame, self.np.uint8).reshape(SAMPLE_HEIGHT, SAMPLE_WIDTH, 3)
@@ -112,7 +113,9 @@ class MotionGate:
 
     def detect(self, frame: bytes, detector: YoloXDetector) -> list[DetectionHit]:
         image = self._prepare(frame)
-        if self.reference is not None and self.candidate_score < MOTION_CANDIDATE_SCORE and not self._changed(image):
+        self.inferred = (self.reference is None or self.candidate_score >= MOTION_CANDIDATE_SCORE
+                         or self._changed(image))
+        if not self.inferred:
             return self.hits
         self.hits = detector.infer(frame)
         self.candidate_score = detector.candidate_score
@@ -754,6 +757,7 @@ class DetectionEngine:
         self.trackers: dict[str, EventTracker] = {}
         self.gates: dict[str, MotionGate] = {}
         self.processed: dict[str, int] = {}
+        self.analyzed: dict[str, int] = {}
         self.exports: queue.Queue[tuple[Path, DetectionEvent, str, Callable[[DetectionEvent], None]]] = queue.Queue(maxsize=32)
         self.scheduled_paths: set[Path] = set()
         self.stopped = threading.Event()
@@ -859,8 +863,10 @@ class DetectionEngine:
             for event in completed:
                 self.schedule(event, pipeline.prefix, pipeline.on_event)
             self.processed[pipeline.uid] = self.processed.get(pipeline.uid, 0) + 1
+            self.analyzed[pipeline.uid] = self.analyzed.get(pipeline.uid, 0) + int(gate.inferred)
             if self.processed[pipeline.uid] % 30 == 0:
-                LOG.info("Local detection processed %d frames for %s", self.processed[pipeline.uid], pipeline.camera)
+                LOG.info("Local detection processed %d frames for %s, %d through the model",
+                         self.processed[pipeline.uid], pipeline.camera, self.analyzed[pipeline.uid])
 
     def _export(self) -> None:
         while not self.stopped.is_set():

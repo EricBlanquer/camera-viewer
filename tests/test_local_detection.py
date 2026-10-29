@@ -236,11 +236,13 @@ class MotionGateTest(unittest.TestCase):
     def test_first_frame_runs_the_detector(self):
         self.assertEqual(self.gate.detect(motion_frame(), self.detector), self.hits)
         self.assertEqual(self.detector.infer.call_count, 1)
+        self.assertTrue(self.gate.inferred)
 
     def test_unchanged_frame_reuses_the_last_detections(self):
         self.gate.detect(motion_frame(), self.detector)
         self.assertEqual(self.gate.detect(motion_frame(), self.detector), self.hits)
         self.assertEqual(self.detector.infer.call_count, 1)
+        self.assertFalse(self.gate.inferred)
 
     def test_change_below_the_area_threshold_reuses_the_last_detections(self):
         self.gate.detect(motion_frame(), self.detector)
@@ -286,6 +288,7 @@ class DetectionEngineMotionTest(unittest.TestCase):
                 engine.remove(pipeline)
                 self.submit_and_wait(engine, pipeline, motion_frame(block_side=threshold_side(2)))
                 self.assertEqual(detector.infer.call_count, 3)
+                self.assertEqual((engine.processed["uid"], engine.analyzed["uid"]), (4, 3))
             finally:
                 engine.stopped.set()
                 engine.inference.join(timeout=5)
