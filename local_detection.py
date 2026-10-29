@@ -34,7 +34,7 @@ SAMPLE_HEIGHT = 360
 SAMPLE_BYTES = SAMPLE_WIDTH * SAMPLE_HEIGHT * 3
 MOTION_BLUR_SIZE = 5
 MOTION_PIXEL_THRESHOLD = 15
-MOTION_AREA_THRESHOLD = 0.0005
+MOTION_AREA_THRESHOLD = 0.002
 MOTION_CANDIDATE_SCORE = 0.25
 EVENT_MARGIN_SECONDS = 5
 MIN_EXCERPT_SECONDS = 1
@@ -92,11 +92,12 @@ def install_model(path: Path | None = None) -> Path:
 
 
 class MotionGate:
-    def __init__(self) -> None:
+    def __init__(self, area_threshold: float = MOTION_AREA_THRESHOLD) -> None:
         import cv2
         import numpy as np
         self.cv2 = cv2
         self.np = np
+        self.area_threshold = area_threshold
         self.reference = None
         self.hits: list[DetectionHit] = []
         self.candidate_score = 0.0
@@ -109,7 +110,7 @@ class MotionGate:
 
     def _changed(self, image) -> bool:
         changed = self.np.count_nonzero(self.cv2.absdiff(self.reference, image) > MOTION_PIXEL_THRESHOLD)
-        return changed > MOTION_AREA_THRESHOLD * image.size
+        return changed > self.area_threshold * image.size
 
     def detect(self, frame: bytes, detector: YoloXDetector) -> list[DetectionHit]:
         image = self._prepare(frame)
@@ -847,7 +848,7 @@ class DetectionEngine:
                     break
                 _, (pipeline, frame, when) = self.latest.popitem(last=False)
                 if pipeline.uid not in self.gates:
-                    self.gates[pipeline.uid] = MotionGate()
+                    self.gates[pipeline.uid] = MotionGate(pipeline.motion_area)
                 gate = self.gates[pipeline.uid]
             if pipeline.stopped.is_set():
                 continue
@@ -908,7 +909,7 @@ class DetectionPipeline:
         self, engine: DetectionEngine, uid: str, camera: str, prefix: str,
         input_args: list[str], on_event: Callable[[DetectionEvent], None],
         on_error: Callable[[str], None], input_descriptor: int | None = None,
-        raw_input: bool = False,
+        raw_input: bool = False, motion_area: float = MOTION_AREA_THRESHOLD,
     ) -> None:
         self.engine = engine
         self.uid = uid
@@ -916,6 +917,7 @@ class DetectionPipeline:
         self.prefix = prefix
         self.on_event = on_event
         self.on_error = on_error
+        self.motion_area = motion_area
         self.stopped = threading.Event()
         self.latest_frame: tuple[bytes, float] | None = None
         self.pending: queue.Queue[bytes | None] | None = queue.Queue(maxsize=16) if raw_input else None

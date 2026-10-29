@@ -18,8 +18,8 @@ from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication, QMenu, QWidget
 
 from app import (
-    LOCAL_DETECTION_CAMERAS_SETTING, LocalReplayPane, MainWindow, RtspCamera,
-    measured_video_rate, update_local_detector,
+    LOCAL_DETECTION_CAMERAS_SETTING, LOCAL_MOTION_AREA_SETTING, LocalReplayPane, MainWindow, RtspCamera,
+    local_motion_area, measured_video_rate, update_local_detector,
 )
 from local_detection import (
     COVER_NAME, MOTION_AREA_THRESHOLD, MOTION_CANDIDATE_SCORE, MOTION_PIXEL_THRESHOLD, SAMPLE_BYTES,
@@ -270,13 +270,21 @@ class MotionGateTest(unittest.TestCase):
             self.gate.detect(motion_frame(), self.detector)
         self.assertEqual(self.detector.infer.call_count, 4)
 
+    def test_camera_area_threshold_replaces_the_default(self):
+        gate = MotionGate(MOTION_AREA_THRESHOLD * 4)
+        gate.detect(motion_frame(), self.detector)
+        gate.detect(motion_frame(block_side=threshold_side(2)), self.detector)
+        self.assertEqual(self.detector.infer.call_count, 1)
+        gate.detect(motion_frame(block_side=threshold_side(8)), self.detector)
+        self.assertEqual(self.detector.infer.call_count, 2)
+
 
 class DetectionEngineMotionTest(unittest.TestCase):
     def test_engine_skips_the_detector_until_the_image_changes_and_restarts_after_removal(self):
         detector = Mock(candidate_score=0.0)
         detector.infer.return_value = []
         pipeline = SimpleNamespace(uid="uid", camera="Jardin", prefix="Jardin", stopped=threading.Event(),
-                                   on_event=Mock(), on_error=Mock())
+                                   on_event=Mock(), on_error=Mock(), motion_area=MOTION_AREA_THRESHOLD)
         with tempfile.TemporaryDirectory() as directory, \
                 patch("local_detection.YoloXDetector", return_value=detector), \
                 patch("local_detection.model_path", return_value=Path(directory) / "model.onnx"):
@@ -650,6 +658,18 @@ class RecordingExcerptTest(unittest.TestCase):
             self.assertIsNone(update_local_detector(worker, RtspCamera("camera", "Garden", "rtsp://example.invalid"), lambda: []))
             engine.assert_not_called()
 
+    def test_decoder_receives_the_camera_motion_area(self):
+        worker = SimpleNamespace(
+            local_detection_enabled=True, local_detector=None, continuous=SimpleNamespace(poll=lambda: None),
+            continuous_enabled=SimpleNamespace(is_set=lambda: True), local_event_callback=Mock(),
+            local_error_callback=Mock(), local_detection_retry_at=0.0, local_motion_area=.015,
+        )
+        with patch("app.model_path", return_value=Path(__file__)), patch("app.local_detection_engine"), \
+                patch("app.DetectionPipeline") as pipeline:
+            update_local_detector(worker, RtspCamera("camera", "Garden", "rtsp://example.invalid"),
+                                  lambda: ([], None, False))
+        self.assertEqual(pipeline.call_args.args[-1], .015)
+
 
 class CameraDetectionSettingsTest(unittest.TestCase):
     @classmethod
@@ -676,6 +696,12 @@ class CameraDetectionSettingsTest(unittest.TestCase):
         self.window.quit_requested = True
         self.window.close()
         self.directory.cleanup()
+
+    def test_motion_area_is_read_per_camera_in_percent(self):
+        self.settings.setValue(f"{LOCAL_MOTION_AREA_SETTING}/rtsp:entrance", 1.5)
+        self.assertAlmostEqual(local_motion_area(self.settings, "rtsp:entrance"), .015)
+        self.assertEqual(local_motion_area(self.settings, self.garden.uid), MOTION_AREA_THRESHOLD)
+        self.assertEqual(local_motion_area(None, "rtsp:entrance"), MOTION_AREA_THRESHOLD)
 
     def test_camera_choices_persist_and_master_toggle_preserves_independent_preferences(self):
         self.window.set_camera_local_detection(self.living.uid, False)

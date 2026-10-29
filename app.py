@@ -117,7 +117,8 @@ from rtsp_tunnel import (
     RtspWebSocketTunnel, rtsp_certificate_sha256,
 )
 from local_detection import (
-    DetectionEngine, DetectionEvent, DetectionPipeline, add_missing_covers, load_events, model_path, organize_events,
+    MOTION_AREA_THRESHOLD, DetectionEngine, DetectionEvent, DetectionPipeline, add_missing_covers, load_events,
+    model_path, organize_events,
 )
 from camera_position import (
     MISPLACED, PENDING, SAVED, SUSPECTED, PositionCheck, PositionCorrection, PositionReferences,
@@ -430,6 +431,7 @@ CONTINUOUS_SETTING = "recording/continuous"
 DETECTION_SETTING = "detections/last_seen"
 LOCAL_DETECTION_SETTING = "detections/local_enabled"
 LOCAL_DETECTION_CAMERAS_SETTING = "detections/camera_enabled"
+LOCAL_MOTION_AREA_SETTING = "detections/motion_area_percent"
 SECONDARY_STREAM_CAMERAS_SETTING = "view/secondary_stream"
 STANDBY_HOST_SETTING = "standby/host"
 STANDBY_PROBE_COMMAND = "ping"
@@ -1475,6 +1477,7 @@ def update_local_detector(
         worker.local_detector = DetectionPipeline(
             local_detection_engine(), camera.uid, camera.name, continuous_prefix(camera),
             input_args, worker.local_event_callback, worker.local_error_callback, descriptor, raw_input,
+            worker.local_motion_area,
         )
         LOG.info("Local detection started for %s", camera.name)
         return worker.local_detector
@@ -1483,6 +1486,12 @@ def update_local_detector(
         LOG.warning("Local detection unavailable for %s: %s", camera.name, ex)
         worker.local_error_callback(f"Local detection unavailable for {camera.name}.")
         return None
+
+
+def local_motion_area(settings: QSettings | None, uid: str) -> float:
+    if settings is None:
+        return MOTION_AREA_THRESHOLD
+    return settings.value(f"{LOCAL_MOTION_AREA_SETTING}/{uid}", MOTION_AREA_THRESHOLD * 100, float) / 100
 
 
 def continuous_prefix(camera: AccountDevice | RtspCamera) -> str:
@@ -2364,6 +2373,7 @@ class StreamWorker(QThread):
         self.continuous = continuous
         self.continuous_enabled = threading.Event()
         self.local_detection_enabled = False
+        self.local_motion_area = MOTION_AREA_THRESHOLD
         self.local_detection_retry_at = 0.0
         self.local_detector: DetectionPipeline | None = None
         self.local_frame_times: deque[float] = deque(maxlen=90)
@@ -4223,6 +4233,7 @@ class RtspStreamWorker(QThread):
         self.stop_requested = threading.Event()
         self.continuous_enabled = threading.Event()
         self.local_detection_enabled = False
+        self.local_motion_area = MOTION_AREA_THRESHOLD
         self.local_detection_retry_at = 0.0
         self.local_detector: DetectionPipeline | None = None
         self.local_event_callback: Callable[[DetectionEvent], None] | None = None
@@ -4990,6 +5001,7 @@ class CameraPreview(QWidget):
             self.worker.set_patrol(self.ptz_panel.patrol_active)
         self.worker.set_continuous(self.continuous_enabled)
         self.worker.local_detection_enabled = self.local_detection_enabled
+        self.worker.local_motion_area = local_motion_area(self.settings, self.camera.uid)
         self.worker.local_event_callback = self.on_local_event
         if self.on_local_error is not None:
             self.worker.local_error_callback = self.on_local_error
@@ -7948,6 +7960,7 @@ class MainWindow(QMainWindow):
         self.settings.remove(f"{RTSP_SOUND_SETTING}/{camera.uid}")
         self.settings.remove(f"{CAMERA_VISIBLE_SETTING}/{camera.uid}")
         self.settings.remove(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{camera.uid}")
+        self.settings.remove(f"{LOCAL_MOTION_AREA_SETTING}/{camera.uid}")
         self.settings.remove("camera/selected_uid")
         self.settings.remove("camera/selected_account")
         self.settings.sync()
@@ -8116,6 +8129,7 @@ class MainWindow(QMainWindow):
             self.settings.remove(f"{RTSP_SOUND_SETTING}/{camera.uid}")
             self.settings.remove(f"{CAMERA_VISIBLE_SETTING}/{camera.uid}")
             self.settings.remove(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{camera.uid}")
+            self.settings.remove(f"{LOCAL_MOTION_AREA_SETTING}/{camera.uid}")
         self.save_imou_accounts()
         self.sync_previews()
 
@@ -8539,6 +8553,7 @@ class MainWindow(QMainWindow):
             self.stream_worker.set_patrol(self.ptz_panel.patrol_active)
         self.stream_worker.set_continuous(self.continuous_recording_enabled())
         self.stream_worker.local_detection_enabled = self.local_detection_enabled(self.selected_device.uid)
+        self.stream_worker.local_motion_area = local_motion_area(self.settings, self.selected_device.uid)
         self.stream_worker.local_event_callback = self.local_detection_ready.emit
         self.stream_worker.local_error_callback = self.local_detection_failed.emit
         if isinstance(self.stream_worker, StreamWorker):
