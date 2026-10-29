@@ -22,8 +22,8 @@ from app import (
     local_motion_area, measured_video_rate, update_local_detector,
 )
 from local_detection import (
-    COVER_NAME, MOTION_AREA_THRESHOLD, MOTION_CANDIDATE_SCORE, MOTION_PIXEL_THRESHOLD, SAMPLE_BYTES,
-    SAMPLE_HEIGHT, SAMPLE_WIDTH, SCORE_THRESHOLD, DetectionEngine, DetectionEvent, DetectionHit,
+    COVER_NAME, EVENT_MARGIN_SECONDS, MOTION_AREA_THRESHOLD, MOTION_CANDIDATE_SCORE, MOTION_PIXEL_THRESHOLD,
+    SAMPLE_BYTES, SAMPLE_HEIGHT, SAMPLE_WIDTH, SCORE_THRESHOLD, DetectionEngine, DetectionEvent, DetectionHit,
     DetectionPipeline, EventTracker, MotionGate, YoloXDetector, add_missing_covers, encode_cover, export_event,
     install_model, load_events, organize_events, save_event,
 )
@@ -376,30 +376,31 @@ class RecordingExcerptTest(unittest.TestCase):
             recordings = root / "Continuous"
             recordings.mkdir()
             start = datetime.now().replace(microsecond=0) - timedelta(minutes=1)
+            segment = 2 * EVENT_MARGIN_SECONDS
             for index in range(2):
-                path = recordings / f"Garden_{start + timedelta(seconds=index * 10):%Y%m%d_%H%M%S}.mkv"
+                path = recordings / f"Garden_{start + timedelta(seconds=index * segment):%Y%m%d_%H%M%S}.mkv"
                 subprocess.run([
                     "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=8",
-                    "-t", "10", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", str(path),
+                    "-t", str(segment), "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", str(path),
                 ], check=True, capture_output=True, timeout=15)
-            event = DetectionEvent("camera", "Garden", start + timedelta(seconds=9),
-                                   start + timedelta(seconds=11), ("person",), .9)
+            event = DetectionEvent("camera", "Garden", start + timedelta(seconds=segment - 1),
+                                   start + timedelta(seconds=segment + 1), ("person",), .9)
             with patch("local_detection.event_directory", return_value=root / "Detections"):
                 finished = export_event(event, recordings, "Garden")
                 self.assertIsNotNone(finished.clip)
-                self.assertEqual(finished.clip_start, start + timedelta(seconds=4))
+                self.assertEqual(finished.clip_start, start + timedelta(seconds=segment - 1 - EVENT_MARGIN_SECONDS))
                 day = root / "Detections" / f"{event.first:%Y-%m-%d}"
                 self.assertEqual(finished.clip.parent, day / "person")
                 self.assertTrue(finished.clip.name.startswith("person_Garden_"))
                 metadata = day / ".metadata" / hashlib.sha256(b"camera").hexdigest()[:16] / "event.json"
                 metadata.parent.mkdir(parents=True)
                 save_event(metadata, finished, "ready")
-                self.assertEqual(load_events("camera", start + timedelta(seconds=20)), [finished])
+                self.assertEqual(load_events("camera", start + timedelta(seconds=2 * segment)), [finished])
                 duration = subprocess.run([
                     "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1",
                     str(finished.clip),
                 ], check=True, capture_output=True, text=True, timeout=10)
-                self.assertAlmostEqual(float(duration.stdout), 12, delta=1)
+                self.assertAlmostEqual(float(duration.stdout), 2 + 2 * EVENT_MARGIN_SECONDS, delta=1)
 
     def test_excerpt_skips_the_last_instant_of_the_previous_segment(self):
         with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
@@ -407,10 +408,12 @@ class RecordingExcerptTest(unittest.TestCase):
             recordings = root / "Continuous"
             recordings.mkdir()
             start = datetime.now().replace(microsecond=0) - timedelta(minutes=1)
-            for index in range(2):
-                make_test_video(recordings / f"Garden_{start + timedelta(seconds=index * 10):%Y%m%d_%H%M%S}.mkv", 10)
-            event = DetectionEvent("camera", "Garden", start + timedelta(seconds=14.84),
-                                   start + timedelta(seconds=16), ("person",), .9)
+            make_test_video(recordings / f"Garden_{start:%Y%m%d_%H%M%S}.mkv", 10)
+            make_test_video(recordings / f"Garden_{start + timedelta(seconds=10):%Y%m%d_%H%M%S}.mkv",
+                            2 * EVENT_MARGIN_SECONDS + 2)
+            first = 10 + EVENT_MARGIN_SECONDS - .16
+            event = DetectionEvent("camera", "Garden", start + timedelta(seconds=first),
+                                   start + timedelta(seconds=first + 1.16), ("person",), .9)
             with patch("local_detection.event_directory", return_value=root / "Detections"):
                 finished = export_event(event, recordings, "Garden")
             self.assertEqual(finished.clip_start, start + timedelta(seconds=10))
@@ -433,7 +436,7 @@ class RecordingExcerptTest(unittest.TestCase):
                                    start + timedelta(seconds=22), ("animal",), .8)
             with patch("local_detection.event_directory", return_value=root / "Detections"):
                 finished = export_event(event, recordings, "Garden")
-                self.assertEqual(finished.clip_start, start + timedelta(seconds=15))
+                self.assertEqual(finished.clip_start, start + timedelta(seconds=20 - EVENT_MARGIN_SECONDS))
                 packets = subprocess.run([
                     "ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0",
                     "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(finished.clip),
@@ -451,7 +454,7 @@ class RecordingExcerptTest(unittest.TestCase):
             detected = DetectionEvent("camera", "Garden", start + timedelta(seconds=10),
                                       start + timedelta(seconds=14), ("person",), .9, cover=cover)
             undetected_image = DetectionEvent("camera", "Garden", start + timedelta(seconds=20),
-                                              start + timedelta(seconds=24), ("animal",), .8)
+                                              start + timedelta(seconds=26), ("animal",), .8)
             with patch("local_detection.event_directory", return_value=root / "Detections"):
                 finished = export_event(detected, recordings, "Garden")
                 extracted = export_event(undetected_image, recordings, "Garden")
@@ -468,7 +471,8 @@ class RecordingExcerptTest(unittest.TestCase):
             self.assertEqual(finished.cover, cover)
             self.assertEqual(attached_image(extracted.clip), extracted.cover)
             detection_frame = subprocess.run([
-                "ffmpeg", "-v", "error", "-ss", "7", "-i", str(extracted.clip), "-frames:v", "1",
+                "ffmpeg", "-v", "error", "-ss", str(EVENT_MARGIN_SECONDS + 3), "-i", str(extracted.clip),
+                "-frames:v", "1",
                 "-vf", "scale=640:-2", "-f", "image2", "-c:v", "png", "pipe:1",
             ], check=True, capture_output=True, timeout=10).stdout
             first_frame = subprocess.run([

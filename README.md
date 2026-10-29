@@ -257,7 +257,7 @@ The model runs only when the frame, blurred in grayscale, differs from the camer
 The minimum area is 0.2 % of the frame; `detections/motion_area_percent/<camera ID>` in `~/.config/O-KAM Linux/O-KAM Linux.conf` sets another percentage for one camera, read when its connection starts.
 A person shape confirms an event only after its position or size changes, so motionless scenery that resembles a person is ignored.
 Cats, dogs, and birds recognized by the model are reported as animals without naming the species, because dark animals in infrared images are often confused.
-Event excerpts include up to five seconds before and after the detected passage and are stored without audio in `Videos/O-KAM Linux/Detections`, using the system's configured Videos folder.
+Event excerpts include up to ten seconds before and after the detected passage and are stored without audio in `Videos/O-KAM Linux/Detections`, using the system's configured Videos folder.
 Each excerpt embeds, as its `cover_land.jpg` Matroska cover, the analyzed frame with the highest detection score, with the detected people or animals outlined.
 File managers that use embedded covers, such as Dolphin, show this image as the excerpt's thumbnail instead of the first frame.
 When the analyzed frame is unavailable, such as for a detection recovered after an interruption, the cover comes from the excerpt at the middle of the detected passage.
