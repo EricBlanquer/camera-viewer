@@ -7,7 +7,7 @@ It does not require Home Assistant, Wine, Waydroid, or the phone while viewing.
 
 ## Install
 
-Requirements: Python 3.11 or newer, PyQt6, python3-xlib, mpv, ffmpeg with ffplay, Git, OpenCV, NumPy, and the `ping` command for standby.
+Requirements: Python 3.11 or newer, PyQt6, python3-xlib, mpv, ffmpeg with ffplay, Git, and the `ping` command for standby.
 O-KAM and Imou accounts also require `secret-tool` with an unlocked desktop keyring and network access to their account services.
 On this computer these programs are already installed.
 
@@ -17,7 +17,7 @@ cd camera-viewer
 ./install.sh
 ```
 
-The installer creates a virtual environment, installs the pinned transport package, downloads and verifies the official wake configuration and [OpenCV Zoo YOLOX-s model](https://huggingface.co/opencv/opencv_zoo/tree/main/models/object_detection_yolox), and adds a **Camera Viewer** application launcher.
+The installer creates a virtual environment, installs the pinned transport package and OpenCV 5.0 with NumPy 2, downloads and verifies the official wake configuration and [OpenCV Zoo YOLOX-s model](https://huggingface.co/opencv/opencv_zoo/tree/main/models/object_detection_yolox), and adds a **Camera Viewer** application launcher.
 It also starts Camera Viewer in the notification area when the desktop session opens, without waking the camera until the window is shown.
 It keeps the vendor wake configuration in `~/.local/share/okam-linux/vendor` with owner-only permissions.
 

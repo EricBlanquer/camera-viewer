@@ -13,9 +13,7 @@ python3 -m venv --system-site-packages "$app_dir/.venv"
 "$app_dir/.venv/bin/python" -m pip install --no-deps -e "$app_dir/vendor/okam-ha-native"
 "$app_dir/.venv/bin/python" -m pip install "cs2pppp==0.2.11"
 "$app_dir/.venv/bin/python" -m pip install 'websocket-client>=1.9,<2'
-if ! "$app_dir/.venv/bin/python" -c 'import cv2, numpy' >/dev/null 2>&1; then
-    "$app_dir/.venv/bin/python" -m pip install 'opencv-python-headless>=4.6,<5' 'numpy>=1.24,<3'
-fi
+"$app_dir/.venv/bin/python" -m pip install 'opencv-python-headless==5.0.0.93' 'numpy>=2,<3'
 "$app_dir/.venv/bin/python" "$app_dir/local_detection.py" --install-model
 mkdir -p "$data_dir" "$desktop_dir"
 if [ ! -f "$data_dir/device_wakeup_server.dart" ]; then
