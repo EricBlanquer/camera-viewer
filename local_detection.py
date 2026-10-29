@@ -32,6 +32,10 @@ SCORE_THRESHOLD = 0.55
 SAMPLE_WIDTH = 640
 SAMPLE_HEIGHT = 360
 SAMPLE_BYTES = SAMPLE_WIDTH * SAMPLE_HEIGHT * 3
+MOTION_BLUR_SIZE = 5
+MOTION_PIXEL_THRESHOLD = 15
+MOTION_AREA_THRESHOLD = 0.0005
+MOTION_CANDIDATE_SCORE = 0.25
 EVENT_MARGIN_SECONDS = 5
 MIN_EXCERPT_SECONDS = 1
 EVENT_GAP_SECONDS = 3
@@ -87,6 +91,35 @@ def install_model(path: Path | None = None) -> Path:
         Path(temporary).unlink(missing_ok=True)
 
 
+class MotionGate:
+    def __init__(self) -> None:
+        import cv2
+        import numpy as np
+        self.cv2 = cv2
+        self.np = np
+        self.reference = None
+        self.hits: list[DetectionHit] = []
+        self.candidate_score = 0.0
+
+    def _prepare(self, frame: bytes):
+        image = self.np.frombuffer(frame, self.np.uint8).reshape(SAMPLE_HEIGHT, SAMPLE_WIDTH, 3)
+        gray = self.cv2.cvtColor(image, self.cv2.COLOR_BGR2GRAY)
+        return self.cv2.GaussianBlur(gray, (MOTION_BLUR_SIZE, MOTION_BLUR_SIZE), 0)
+
+    def _changed(self, image) -> bool:
+        changed = self.np.count_nonzero(self.cv2.absdiff(self.reference, image) > MOTION_PIXEL_THRESHOLD)
+        return changed > MOTION_AREA_THRESHOLD * image.size
+
+    def detect(self, frame: bytes, detector: YoloXDetector) -> list[DetectionHit]:
+        image = self._prepare(frame)
+        if self.reference is not None and self.candidate_score < MOTION_CANDIDATE_SCORE and not self._changed(image):
+            return self.hits
+        self.hits = detector.infer(frame)
+        self.candidate_score = detector.candidate_score
+        self.reference = image
+        return self.hits
+
+
 class YoloXDetector:
     def __init__(self, path: Path, threshold: float = SCORE_THRESHOLD) -> None:
         import cv2
@@ -105,6 +138,7 @@ class YoloXDetector:
             strides.append(np.full((side * side, 1), stride))
         self.grids = np.concatenate(grids)
         self.strides = np.concatenate(strides)
+        self.candidate_score = 0.0
 
     def infer(self, frame: bytes) -> list[DetectionHit]:
         cv2, np = self.cv2, self.np
@@ -114,6 +148,8 @@ class YoloXDetector:
         self.net.setInput(cv2.dnn.blobFromImage(image, swapRB=True))
         output = self.net.forward().reshape(-1, 85)
         scores = output[:, 4:5] * output[:, 5:]
+        inside = (output[:, 1] + self.grids[:, 1]) * self.strides[:, 0] < SAMPLE_HEIGHT
+        self.candidate_score = float(scores[inside][:, sorted(CLASS_NAMES)].max(initial=0.0))
         classes = np.argmax(scores, axis=1)
         best = scores[np.arange(len(scores)), classes]
         found = []
@@ -716,6 +752,7 @@ class DetectionEngine:
         self.condition = threading.Condition()
         self.latest: OrderedDict[str, tuple[DetectionPipeline, bytes, datetime]] = OrderedDict()
         self.trackers: dict[str, EventTracker] = {}
+        self.gates: dict[str, MotionGate] = {}
         self.processed: dict[str, int] = {}
         self.exports: queue.Queue[tuple[Path, DetectionEvent, str, Callable[[DetectionEvent], None]]] = queue.Queue(maxsize=32)
         self.scheduled_paths: set[Path] = set()
@@ -750,6 +787,7 @@ class DetectionEngine:
             if current is not None and current[0] is pipeline:
                 del self.latest[pipeline.uid]
             tracker = self.trackers.pop(pipeline.uid, None)
+            self.gates.pop(pipeline.uid, None)
         if tracker is not None and tracker.first is not None:
             self.schedule(tracker.finish(), pipeline.prefix, pipeline.on_event)
 
@@ -804,10 +842,13 @@ class DetectionEngine:
                 if self.stopped.is_set():
                     break
                 _, (pipeline, frame, when) = self.latest.popitem(last=False)
+                if pipeline.uid not in self.gates:
+                    self.gates[pipeline.uid] = MotionGate()
+                gate = self.gates[pipeline.uid]
             if pipeline.stopped.is_set():
                 continue
             try:
-                found = detector.infer(frame)
+                found = gate.detect(frame, detector)
             except Exception as ex:
                 LOG.error("Local detection inference stopped: %s", ex)
                 pipeline.on_error(f"Local detection stopped: {ex}")

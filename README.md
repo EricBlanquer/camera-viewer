@@ -253,6 +253,7 @@ The tray menu enables local detection of people and animals while continuous rec
 Use **Local detection cameras** to enable or disable analysis and notifications independently for each camera.
 The global detection switch preserves these camera choices; disabling a camera's detection keeps its video and continuous recording running.
 It analyzes one 640 × 360 frame per second with the SHA-256-verified OpenCV Zoo YOLOX-s model and confirms an event when the same object appears twice within two seconds.
+The model runs only when the frame, blurred in grayscale, differs from the camera's last analyzed frame over a minimum area, or when that analysis saw a possible person or animal below the detection threshold; otherwise the frame reuses that analysis's detections.
 A person shape confirms an event only after its position or size changes, so motionless scenery that resembles a person is ignored.
 Cats, dogs, and birds recognized by the model are reported as animals without naming the species, because dark animals in infrared images are often confused.
 Event excerpts include up to five seconds before and after the detected passage and are stored without audio in `Videos/O-KAM Linux/Detections`, using the system's configured Videos folder.

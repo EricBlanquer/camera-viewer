@@ -4,6 +4,7 @@ import os
 import json
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -21,9 +22,10 @@ from app import (
     measured_video_rate, update_local_detector,
 )
 from local_detection import (
-    COVER_NAME, SAMPLE_BYTES, SCORE_THRESHOLD, DetectionEngine, DetectionEvent, DetectionHit, DetectionPipeline,
-    EventTracker, YoloXDetector, add_missing_covers, encode_cover, export_event, install_model, load_events,
-    organize_events, save_event,
+    COVER_NAME, MOTION_AREA_THRESHOLD, MOTION_CANDIDATE_SCORE, MOTION_PIXEL_THRESHOLD, SAMPLE_BYTES,
+    SAMPLE_HEIGHT, SAMPLE_WIDTH, SCORE_THRESHOLD, DetectionEngine, DetectionEvent, DetectionHit,
+    DetectionPipeline, EventTracker, MotionGate, YoloXDetector, add_missing_covers, encode_cover, export_event,
+    install_model, load_events, organize_events, save_event,
 )
 
 
@@ -210,6 +212,91 @@ class DetectorTest(unittest.TestCase):
         detector.cv2 = cv2
         hits = detector.infer(bytes(640 * 360 * 3))
         self.assertEqual(sorted((hit.name, round(hit.score, 2)) for hit in hits), [("animal", .7), ("person", .9)])
+        self.assertAlmostEqual(detector.candidate_score, .9, places=5)
+
+
+def motion_frame(brightness=90, block_side=0):
+    import numpy as np
+    image = np.full((SAMPLE_HEIGHT, SAMPLE_WIDTH, 3), brightness, np.uint8)
+    image[100:100 + block_side, 200:200 + block_side] = brightness + 4 * MOTION_PIXEL_THRESHOLD
+    return image.tobytes()
+
+
+def threshold_side(factor):
+    return int((MOTION_AREA_THRESHOLD * SAMPLE_WIDTH * SAMPLE_HEIGHT * factor) ** 0.5)
+
+
+class MotionGateTest(unittest.TestCase):
+    def setUp(self):
+        self.hits = [DetectionHit("person", .8, (10, 20, 30, 60))]
+        self.detector = Mock(candidate_score=0.0)
+        self.detector.infer.return_value = self.hits
+        self.gate = MotionGate()
+
+    def test_first_frame_runs_the_detector(self):
+        self.assertEqual(self.gate.detect(motion_frame(), self.detector), self.hits)
+        self.assertEqual(self.detector.infer.call_count, 1)
+
+    def test_unchanged_frame_reuses_the_last_detections(self):
+        self.gate.detect(motion_frame(), self.detector)
+        self.assertEqual(self.gate.detect(motion_frame(), self.detector), self.hits)
+        self.assertEqual(self.detector.infer.call_count, 1)
+
+    def test_change_below_the_area_threshold_reuses_the_last_detections(self):
+        self.gate.detect(motion_frame(), self.detector)
+        self.gate.detect(motion_frame(block_side=threshold_side(.5)), self.detector)
+        self.assertEqual(self.detector.infer.call_count, 1)
+
+    def test_change_above_the_area_threshold_runs_the_detector(self):
+        self.gate.detect(motion_frame(), self.detector)
+        self.detector.infer.return_value = []
+        self.assertEqual(self.gate.detect(motion_frame(block_side=threshold_side(2)), self.detector), [])
+        self.assertEqual(self.detector.infer.call_count, 2)
+
+    def test_gradual_change_is_measured_against_the_last_analyzed_frame(self):
+        step = MOTION_PIXEL_THRESHOLD // 2
+        for index in range(4):
+            self.gate.detect(motion_frame(brightness=90 + index * step), self.detector)
+        self.assertEqual(self.detector.infer.call_count, 2)
+
+    def test_still_frames_keep_running_the_detector_while_a_candidate_is_close_to_the_threshold(self):
+        self.detector.candidate_score = MOTION_CANDIDATE_SCORE
+        for _ in range(3):
+            self.gate.detect(motion_frame(), self.detector)
+        self.detector.candidate_score = MOTION_CANDIDATE_SCORE / 2
+        for _ in range(3):
+            self.gate.detect(motion_frame(), self.detector)
+        self.assertEqual(self.detector.infer.call_count, 4)
+
+
+class DetectionEngineMotionTest(unittest.TestCase):
+    def test_engine_skips_the_detector_until_the_image_changes_and_restarts_after_removal(self):
+        detector = Mock(candidate_score=0.0)
+        detector.infer.return_value = []
+        pipeline = SimpleNamespace(uid="uid", camera="Jardin", prefix="Jardin", stopped=threading.Event(),
+                                   on_event=Mock(), on_error=Mock())
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("local_detection.YoloXDetector", return_value=detector), \
+                patch("local_detection.model_path", return_value=Path(directory) / "model.onnx"):
+            engine = DetectionEngine(Path(directory))
+            try:
+                for frame in (motion_frame(), motion_frame(), motion_frame(block_side=threshold_side(2))):
+                    self.submit_and_wait(engine, pipeline, frame)
+                self.assertEqual(detector.infer.call_count, 2)
+                engine.remove(pipeline)
+                self.submit_and_wait(engine, pipeline, motion_frame(block_side=threshold_side(2)))
+                self.assertEqual(detector.infer.call_count, 3)
+            finally:
+                engine.stopped.set()
+                engine.inference.join(timeout=5)
+
+    @staticmethod
+    def submit_and_wait(engine, pipeline, frame):
+        expected = engine.processed.get(pipeline.uid, 0) + 1
+        engine.submit(pipeline, frame, datetime.now())
+        deadline = time.monotonic() + 5
+        while engine.processed.get(pipeline.uid, 0) < expected and time.monotonic() < deadline:
+            time.sleep(.01)
 
 
 class ModelInstallationTest(unittest.TestCase):
