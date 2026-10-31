@@ -411,8 +411,29 @@ def _event_type(classes: tuple[str, ...]) -> str:
     return "_".join(sorted(names))
 
 
-def _category_folder(root: Path, day: datetime, category: str) -> Path:
-    return private_folder(root, day.strftime(EVENT_DAY_FORMAT), category)
+def camera_folder_name(camera: str) -> str:
+    name = camera.replace("/", "_").replace("\0", "_").strip()
+    return name if name and not name.startswith(".") else "Camera"
+
+
+def _clip_folder(root: Path, day: datetime, category: str, camera: str) -> Path:
+    return private_folder(root, day.strftime(EVENT_DAY_FORMAT), category, camera_folder_name(camera))
+
+
+def _event_types() -> list[str]:
+    names = sorted(set(CLASS_NAMES.values()) | LEGACY_ANIMAL_CLASSES)
+    types = {"_".join(sorted(name for index, name in enumerate(names) if mask >> index & 1))
+             for mask in range(1, 1 << len(names))}
+    return sorted(types, key=len, reverse=True)
+
+
+def _clip_name(source: Path, category: str) -> str:
+    name = source.name.removeprefix(f"{source.parent.name}_")
+    for event_type in _event_types():
+        if name.startswith(f"{event_type}_"):
+            name = name.removeprefix(f"{event_type}_")
+            break
+    return f"{category}_{name}"
 
 
 def _remove_empty_folders(root: Path, folder: Path) -> None:
@@ -470,7 +491,7 @@ def _is_day_folder(folder: Path) -> bool:
     return True
 
 
-def organize_events() -> None:
+def organize_events(camera_folders: dict[str, str] | None = None) -> None:
     root = event_directory()
     documents = [
         *root.glob("*/*.json"), *root.glob(f"{METADATA_FOLDER}/*/*.json"),
@@ -478,12 +499,12 @@ def organize_events() -> None:
     ]
     for metadata in documents:
         try:
-            _organize_event(root, metadata)
+            _organize_event(root, metadata, camera_folders or {})
         except (OSError, ValueError, KeyError, TypeError) as ex:
             LOG.warning("Could not organize local detection %s: %s", metadata, ex)
 
 
-def _organize_event(root: Path, metadata: Path) -> None:
+def _organize_event(root: Path, metadata: Path, camera_folders: dict[str, str]) -> None:
     document = json.loads(metadata.read_text(encoding="utf-8"))
     if metadata.parent.name != camera_key(document["uid"]):
         raise ValueError("Invalid local detection camera folder.")
@@ -495,7 +516,8 @@ def _organize_event(root: Path, metadata: Path) -> None:
     if document["status"] == "ready" and name:
         source = _clip_path(metadata.parent if Path(name).parent == Path(".") else root, name)
         category = _event_type(tuple(classes))
-        destination = _category_folder(root, day, category) / f"{category}_{source.name.removeprefix(f'{source.parent.name}_')}"
+        camera = camera_folders.get(document["uid"]) or document["camera"]
+        destination = _clip_folder(root, day, category, camera) / _clip_name(source, category)
         if destination != source:
             _move_clip(source, destination)
             _remove_empty_folders(root, source.parent)
@@ -651,7 +673,7 @@ def export_event(
             available_end = right
         if clip_start is None or available_end < event.last:
             raise OSError("The continuous recording does not contain the detected event.")
-        folder = _category_folder(event_directory(), event.first, category)
+        folder = _clip_folder(event_directory(), event.first, category, event.camera)
         clip = folder / f"{category}_{prefix}_{clip_start:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.mkv"
         target = Path(temporary) / "event.mkv"
         if len(parts) == 1:
@@ -822,7 +844,7 @@ class DetectionEngine:
                 if data["status"] != "pending" or data["uid"] != pipeline.uid:
                     continue
                 event = DetectionEvent(
-                    pipeline.uid, data["camera"], datetime.fromisoformat(data["first"]),
+                    pipeline.uid, pipeline.camera, datetime.fromisoformat(data["first"]),
                     datetime.fromisoformat(data["last"]), _current_classes(data["classes"]), float(data["score"]),
                 )
                 if datetime.now() - event.last > RECORDING_RETENTION:

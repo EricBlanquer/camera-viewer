@@ -949,6 +949,14 @@ def v380_lens_uid(did: int, lens: int) -> str:
     return f"rtsp:v380-{did}-{lens}"
 
 
+def detection_camera_name(camera: AccountDevice | RtspCamera) -> str:
+    if isinstance(camera, RtspCamera) and camera.provider == V380_PROVIDER:
+        suffix = f" {camera.lens + 1}"
+        if camera.name.endswith(suffix) and len(camera.name) > len(suffix):
+            return camera.name.removesuffix(suffix)
+    return camera.name
+
+
 def v380_cameras(did: int, base_name: str, username: str) -> list[RtspCamera]:
     device_uid = v380_device_uid(did)
     names = [f"{base_name} {lens + 1}" for lens in range(v380.LENS_COUNT)]
@@ -1616,7 +1624,7 @@ def update_local_detector(
             raise OSError("The local detection model is missing; run ./install.sh.")
         input_args, descriptor, raw_input = source()
         worker.local_detector = DetectionPipeline(
-            local_detection_engine(), camera.uid, camera.name, continuous_prefix(camera),
+            local_detection_engine(), camera.uid, detection_camera_name(camera), continuous_prefix(camera),
             input_args, worker.local_event_callback, worker.local_error_callback, descriptor, raw_input,
             worker.local_motion_area,
             stacked_lenses=v380.LENS_COUNT if isinstance(camera, RtspCamera) and camera.provider == V380_PROVIDER else 1,
@@ -9610,7 +9618,8 @@ def main() -> int:
     if not instance_server.listen(server_name):
         return 1
     try:
-        organize_events()
+        organize_events({camera.uid: detection_camera_name(camera)
+                         for camera in load_rtsp_cameras(QSettings(STORAGE_NAME, STORAGE_NAME))})
     except OSError as ex:
         LOG.warning("Could not organize local detections: %s", ex)
     threading.Thread(target=add_missing_covers, daemon=True).start()

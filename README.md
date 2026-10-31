@@ -274,7 +274,8 @@ Each excerpt embeds, as its `cover_land.jpg` Matroska cover, the analyzed frame 
 File managers that use embedded covers, such as Dolphin, show this image as the excerpt's thumbnail instead of the first frame.
 When the analyzed frame is unavailable, such as for a detection recovered after an interruption, the cover comes from the excerpt at the middle of the detected passage.
 At startup, excerpts listed in the day folders' metadata without a cover receive one in the background; other folders are left unchanged.
-The `Detections` folder groups excerpts by day in `YYYY-MM-DD` folders, then in `animal` and `person` folders; clips with both types use the `animal_person` folder, and each clip name starts with its type and camera name.
+The `Detections` folder groups excerpts by day in `YYYY-MM-DD` folders, then in `animal` and `person` folders, then in one folder per camera; clips with both types use the `animal_person` folder, and each clip name starts with its type and camera name.
+The lenses of a multi-lens V380 camera share one camera folder, and existing excerpts are moved into their camera folder when Camera Viewer starts.
 Each day folder also contains a hidden `.metadata` folder describing its detections for the playback timeline.
 Local detections appear in red on the local playback timeline, and its Previous and Next buttons jump between detected passages.
 Clicking a local detection notification plays that notification's excerpt in its camera pane, including when the viewer was hidden in the notification area.

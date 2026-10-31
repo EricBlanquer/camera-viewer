@@ -390,7 +390,7 @@ class RecordingExcerptTest(unittest.TestCase):
                 self.assertIsNotNone(finished.clip)
                 self.assertEqual(finished.clip_start, start + timedelta(seconds=segment - 1 - EVENT_MARGIN_SECONDS))
                 day = root / "Detections" / f"{event.first:%Y-%m-%d}"
-                self.assertEqual(finished.clip.parent, day / "person")
+                self.assertEqual(finished.clip.parent, day / "person" / "Garden")
                 self.assertTrue(finished.clip.name.startswith("person_Garden_"))
                 metadata = day / ".metadata" / hashlib.sha256(b"camera").hexdigest()[:16] / "event.json"
                 metadata.parent.mkdir(parents=True)
@@ -544,7 +544,7 @@ class RecordingExcerptTest(unittest.TestCase):
                                                    ("dog",), .7), "pending")
                 organize_events()
                 organize_events()
-                relocated = root / f"{first:%Y-%m-%d}" / "animal_person" / f"animal_person_{clip.name}"
+                relocated = root / f"{first:%Y-%m-%d}" / "animal_person" / "Garden" / f"animal_person_{clip.name}"
                 relocated_metadata = root / f"{first:%Y-%m-%d}" / ".metadata" / camera_folder.name / metadata.name
                 relocated_pending = relocated_metadata.with_name(pending.name)
                 self.assertEqual(relocated.read_bytes(), b"existing video")
@@ -588,9 +588,9 @@ class RecordingExcerptTest(unittest.TestCase):
                 ), "ready")
                 organize_events()
                 organize_events()
-                sorted_clips = [root / "2026-10-01" / "person" / clips[0].name,
-                                root / "2026-09-30" / "person" / clips[1].name]
-                animal_clip = root / "2026-10-01" / "animal" / "animal_Garden_20261001_054138_cfa036ea.mkv"
+                sorted_clips = [root / "2026-10-01" / "person" / "Entrance" / clips[0].name,
+                                root / "2026-09-30" / "person" / "Entrance" / clips[1].name]
+                animal_clip = root / "2026-10-01" / "animal" / "Garden" / "animal_Garden_20261001_054138_cfa036ea.mkv"
                 documents = [root / day / ".metadata" / metadata_folder.name / f"{index}.json"
                              for index, day in enumerate(("2026-10-01", "2026-09-30", "2026-10-01"))]
                 self.assertEqual([path.read_bytes() for path in sorted_clips], [b"video 0", b"video 1"])
@@ -607,6 +607,35 @@ class RecordingExcerptTest(unittest.TestCase):
                                  [path.relative_to(root).as_posix() for path in sorted_clips])
                 self.assertEqual([event.clip for event in load_events("camera", datetime(2026, 10, 1, 12))],
                                  [sorted_clips[0], animal_clip])
+
+    def test_existing_type_folders_gain_a_camera_folder(self):
+        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
+            root = Path(directory) / "Detections"
+            clips = []
+            cameras = (("rtsp:v380-1-1", "House 2"), ("rtsp:v380-1-2", "House 3"), ("entrance", "Entrance/Door"))
+            with patch("local_detection.event_directory", return_value=root):
+                for index, (uid, camera) in enumerate(cameras):
+                    clip_start = datetime(2026, 10, 31, 18, index)
+                    folder = root / "2026-10-31" / "person"
+                    folder.mkdir(parents=True, exist_ok=True)
+                    clip = folder / f"person_{index}_{clip_start:%Y%m%d_%H%M%S}.mkv"
+                    clip.write_bytes(b"video %d" % index)
+                    metadata = root / "2026-10-31" / ".metadata" / hashlib.sha256(uid.encode()).hexdigest()[:16]
+                    metadata.mkdir(parents=True, exist_ok=True)
+                    save_event(metadata / "event.json", DetectionEvent(
+                        uid, camera, clip_start + timedelta(seconds=5), clip_start + timedelta(seconds=7),
+                        ("person",), .8, clip, clip_start,
+                    ), "ready")
+                    clips.append(clip)
+                folders = {"rtsp:v380-1-1": "House", "rtsp:v380-1-2": "House"}
+                organize_events(folders)
+                organize_events(folders)
+                person = root / "2026-10-31" / "person"
+                expected = [person / "House" / clips[0].name, person / "House" / clips[1].name,
+                            person / "Entrance_Door" / clips[2].name]
+                self.assertEqual([path.read_bytes() for path in expected], [b"video 0", b"video 1", b"video 2"])
+                self.assertEqual(sorted(path.name for path in person.iterdir()), ["Entrance_Door", "House"])
+                self.assertEqual(load_events("rtsp:v380-1-1", datetime(2026, 10, 31, 19))[0].clip, expected[0])
 
     def test_personal_folder_with_archived_metadata_is_left_alone(self):
         with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
@@ -637,7 +666,7 @@ class RecordingExcerptTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
             root = Path(directory) / "Detections"
             engine = SimpleNamespace(_enqueue=Mock())
-            pipeline = SimpleNamespace(uid="camera", prefix="Garden", on_event=Mock())
+            pipeline = SimpleNamespace(uid="camera", camera="Garden", prefix="Garden", on_event=Mock())
             now = datetime.now()
             with patch("local_detection.event_directory", return_value=root):
                 paths = []
