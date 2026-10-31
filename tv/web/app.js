@@ -3,7 +3,22 @@ const transport = document.getElementById("transport");
 const debugPanel = document.getElementById("debug-panel");
 const logElement = document.getElementById("log");
 const STORAGE_KEY = "camera-viewer-config-v1";
-const GRID_SIZE = 4;
+const GRID_LAYOUT = {
+  size: 2,
+  cells: [[0, 0, 1, 1], [1, 0, 1, 1], [0, 1, 1, 1], [1, 1, 1, 1]],
+};
+const MOSAIC_LAYOUT = {
+  size: 3,
+  cells: [
+    [1, 1, 2, 2],
+    [0, 0, 1, 1],
+    [1, 0, 1, 1],
+    [2, 0, 1, 1],
+    [0, 1, 1, 1],
+    [0, 2, 1, 1],
+  ],
+};
+const MAX_CAMERAS = MOSAIC_LAYOUT.cells.length;
 const SCREEN_WIDTH = 1920;
 const SCREEN_HEIGHT = 1080;
 const KEY_ENTER = 13;
@@ -58,8 +73,8 @@ function refreshOverlay() {
 function validateConfiguration(configuration) {
   if (
     !Array.isArray(configuration) || !configuration.length ||
-    configuration.length > GRID_SIZE
-  ) throw new Error("Configure between one and four cameras");
+    configuration.length > MAX_CAMERAS
+  ) throw new Error("Configure between one and six cameras");
   configuration.forEach((camera) => {
     if (
       !camera || !["icam365", "okam", "imou", "stream"].includes(camera.type) ||
@@ -83,8 +98,57 @@ function configure(configuration) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(configuration));
   cameras = configuration;
   showGrid();
+  applyLayout();
   connect();
   return cameras.length;
+}
+function currentLayout() {
+  return cameras.length > GRID_LAYOUT.cells.length ? MOSAIC_LAYOUT : GRID_LAYOUT;
+}
+function layoutPanes() {
+  return panes.slice(0, currentLayout().cells.length);
+}
+function applyLayout() {
+  const layout = currentLayout();
+  panes.forEach((pane, index) => {
+    const cell = layout.cells[index];
+    pane.element.hidden = !cell;
+    if (!cell) return;
+    const [column, row, columns, rows] = cell;
+    const unit = 100 / layout.size;
+    pane.element.style.setProperty("--left", column * unit + "%");
+    pane.element.style.setProperty("--top", row * unit + "%");
+    pane.element.style.setProperty("--width", columns * unit + "%");
+    pane.element.style.setProperty("--height", rows * unit + "%");
+  });
+  if (!layout.cells[selected]) select(0);
+}
+function center(rectangle) {
+  return {
+    x: rectangle.x + rectangle.width / 2,
+    y: rectangle.y + rectangle.height / 2,
+  };
+}
+function neighbor(index, direction) {
+  const origin = center(panes[index].rectangle());
+  const horizontal = direction === "left" || direction === "right";
+  const sign = direction === "left" || direction === "up" ? -1 : 1;
+  let best = index;
+  let bestScore = Infinity;
+  layoutPanes().forEach((pane, position) => {
+    const target = center(pane.rectangle());
+    const along = (horizontal ? target.x - origin.x : target.y - origin.y) *
+      sign;
+    const across = Math.abs(
+      horizontal ? target.y - origin.y : target.x - origin.x,
+    );
+    const score = along + 2 * across;
+    if (position !== index && along > 0 && score < bestScore) {
+      best = position;
+      bestScore = score;
+    }
+  });
+  return best;
 }
 function validAccount(camera) {
   const cloud = camera.cloud_session;
@@ -252,11 +316,15 @@ class CameraPane {
     if (fullScreen === this.index) {
       return { x: 0, y: 0, width: SCREEN_WIDTH, height: SCREEN_HEIGHT };
     }
+    const layout = currentLayout();
+    const cell = layout.cells[this.index];
+    if (!cell) return { x: 0, y: 0, width: 0, height: 0 };
+    const [column, row, columns, rows] = cell;
     return {
-      x: this.index % 2 * SCREEN_WIDTH / 2,
-      y: Math.floor(this.index / 2) * SCREEN_HEIGHT / 2,
-      width: SCREEN_WIDTH / 2,
-      height: SCREEN_HEIGHT / 2,
+      x: column * SCREEN_WIDTH / layout.size,
+      y: row * SCREEN_HEIGHT / layout.size,
+      width: columns * SCREEN_WIDTH / layout.size,
+      height: rows * SCREEN_HEIGHT / layout.size,
     };
   }
   sameCamera(camera) {
@@ -443,7 +511,7 @@ class CameraPane {
   }
 }
 const panes = Array.from(
-  { length: GRID_SIZE },
+  { length: MAX_CAMERAS },
   (_, index) => new CameraPane(index),
 );
 function connect() {
@@ -453,7 +521,7 @@ function stop() {
   panes.forEach((pane) => pane.stop());
 }
 function state() {
-  return panes.map((pane) =>
+  return layoutPanes().map((pane) =>
     Object.assign({
       name: pane.camera ? pane.camera.name : null,
       rectangle: pane.rectangle(),
@@ -522,8 +590,9 @@ document.addEventListener("keydown", (event) => {
   } else if (fullScreen !== null) {
     panes[fullScreen].move(MOVE_KEYS.get(event.keyCode));
   } else if (event.keyCode === KEY_ENTER) showFullScreen(selected);
-  else if ([37, 39].includes(event.keyCode)) select(selected ^ 1);
-  else if ([38, 40].includes(event.keyCode)) select(selected ^ 2);
+  else if (MOVE_KEYS.has(event.keyCode)) {
+    select(neighbor(selected, MOVE_KEYS.get(event.keyCode)));
+  }
 });
 document.addEventListener("visibilitychange", () => {
   log(document.hidden ? "Viewer hidden" : "Viewer displayed");
@@ -540,4 +609,5 @@ try {
   log("Camera setup required");
 }
 select(0);
+applyLayout();
 preventScreenSaver(!document.hidden);

@@ -10,7 +10,8 @@ A generic stream camera plays an H.264 or HEVC RTSP feed from a private LAN host
 Vendor-protocol camera video never passes through a PC; a generic stream camera reaches the TV from the host that publishes its RTSP feed.
 The TV launcher uses a 128 × 128 PNG generated from the desktop application's camera icon.
 
-Four equal cells remain visible in a 2 × 2 grid, including when only one or two cameras are configured.
+Up to four cameras fill four equal cells in a 2 × 2 grid, which stay visible when only one or two cameras are configured.
+Five or six cameras use the desktop full-screen mosaic: a 3 × 3 grid where the first camera spans the bottom-right 2 × 2 cells and the others fill the top row, then the left column.
 Each cell has its own session, H.264 or HEVC software decoder, status, and reconnection timer.
 Camera titles and labels in unused cells are hidden.
 The full-screen grid has an opaque black background, including unused cells.
@@ -78,7 +79,7 @@ Use the TV's actual LAN address in the following commands.
 
 The last command prints a debug port.
 Install Python's `websocket-client` package for the provisioning helper.
-Store an array of one to four camera configurations in a private JSON file outside the checkout and set its permissions to `600`.
+Store an array of one to six camera configurations in a private JSON file outside the checkout and set its permissions to `600`.
 Any entry may add `always_hd: true` to keep that camera on its main stream in the grid instead of its secondary stream.
 An iCam365 entry contains `type: "icam365"`, `name`, `p2p_id`, `p2p_platform`, and `password` from an authenticated device detail response.
 Its optional `cloud_session` uses the same private metadata described in the root README, including the account `username` and `area_code`.
@@ -125,7 +126,7 @@ Without `account_password`, provision a current iCam365 account session when the
 
 ## Remote control
 
-The arrow keys select a cell, and OK shows the selected camera in full screen on its main stream.
+The arrow keys select the nearest cell in their direction, and OK shows the selected camera in full screen on its main stream.
 In full screen, the arrow keys move a motorized camera: an iCam365 camera that reports pan-tilt support, an O-KAM camera, or a local Imou Life camera whose entry includes its account.
 An iCam365 or O-KAM camera moves while the key is held and stops 120 ms after the last key press; an Imou Life camera moves for 500 ms per request.
 Back returns from full screen to the grid; from the grid, it exits the application.

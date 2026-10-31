@@ -31,6 +31,13 @@ function viewer(options = {}) {
     const classes = new Set();
     return {
       textContent: "",
+      hidden: false,
+      style: {
+        properties: {},
+        setProperty(name, value) {
+          this.properties[name] = value;
+        },
+      },
       classList: {
         add: (value) => classes.add(value),
         remove: (value) => classes.delete(value),
@@ -267,6 +274,84 @@ test("four fixed cells and the debug overlay depend on decoded video", async () 
   app.context.window.cameraViewer.stop();
   app.render(0);
   assert.equal(app.nodes["debug-panel"].hidden, false);
+});
+function sixCameras(app) {
+  return ["House", "Entrance", "Street", "Kitchen", "Living", "Garden"].map((
+    name,
+    index,
+  ) => ({ ...app.camera, name, p2p_id: "TEST-" + (index + 1) + "-ABCDE" }));
+}
+test("six cameras use the desktop mosaic with the first camera large", async () => {
+  const app = viewer();
+  assert.equal(app.context.window.cameraViewer.configure(sixCameras(app)), 6);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  const state = JSON.parse(
+    JSON.stringify(app.context.window.cameraViewer.state()),
+  );
+  assert.deepEqual(state.map((pane) => pane.rectangle), [
+    { x: 640, y: 360, width: 1280, height: 720 },
+    { x: 0, y: 0, width: 640, height: 360 },
+    { x: 640, y: 0, width: 640, height: 360 },
+    { x: 1280, y: 0, width: 640, height: 360 },
+    { x: 0, y: 360, width: 640, height: 360 },
+    { x: 0, y: 720, width: 640, height: 360 },
+  ]);
+  assert.deepEqual(state.map((pane) => pane.name), [
+    "House",
+    "Entrance",
+    "Street",
+    "Kitchen",
+    "Living",
+    "Garden",
+  ]);
+  const big = app.pane(0).element.style.properties;
+  assert.ok(Math.abs(parseFloat(big["--left"]) - 100 / 3) < 0.001);
+  assert.ok(Math.abs(parseFloat(big["--width"]) - 200 / 3) < 0.001);
+  assert.equal(app.pane(5).element.hidden, false);
+});
+test("arrow keys follow the mosaic geometry", async () => {
+  const app = viewer();
+  app.context.window.cameraViewer.configure(sixCameras(app));
+  const selected = () =>
+    [0, 1, 2, 3, 4, 5].find((index) =>
+      app.pane(index).element.classList.contains("selected")
+    );
+  assert.equal(selected(), 0);
+  app.press(37);
+  assert.equal(selected(), 4);
+  app.press(38);
+  assert.equal(selected(), 1);
+  app.press(39);
+  assert.equal(selected(), 2);
+  app.press(39);
+  assert.equal(selected(), 3);
+  app.press(39);
+  assert.equal(selected(), 3);
+  app.press(40);
+  assert.equal(selected(), 0);
+});
+test("returning to four cameras restores the two by two grid", async () => {
+  const app = viewer();
+  app.context.window.cameraViewer.configure(sixCameras(app));
+  app.press(37);
+  app.context.window.cameraViewer.configure(sixCameras(app).slice(0, 2));
+  assert.equal(app.context.window.cameraViewer.state().length, 4);
+  assert.equal(app.pane(4).element.hidden, true);
+  assert.equal(app.pane(5).element.hidden, true);
+  assert.equal(app.pane(0).element.classList.contains("selected"), true);
+  assert.equal(app.pane(1).element.style.properties["--left"], "50%");
+});
+test("more than six cameras are rejected", () => {
+  const app = viewer();
+  assert.throws(
+    () =>
+      app.context.window.cameraViewer.configure([
+        ...sixCameras(app),
+        app.camera,
+      ]),
+    /between one and six/,
+  );
 });
 test("reconnection retains the last image until a new decoded frame arrives", async () => {
   const app = viewer();

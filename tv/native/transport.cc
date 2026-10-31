@@ -23,6 +23,7 @@ namespace {
 const size_t MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const int MAX_OUTPUT_WIDTH = 1920;
 const int MAX_OUTPUT_HEIGHT = 1080;
+const int MAX_STREAMS = 6;
 uint16_t NetworkOrder(uint16_t value) { return static_cast<uint16_t>((value >> 8) | (value << 8)); }
 std::string BufferBytes(const pp::Var& value) {
   if (!value.is_array_buffer()) return std::string();
@@ -111,7 +112,7 @@ class Transport : public pp::Instance {
     std::string command = message.Get("command").is_string() ? message.Get("command").AsString() : "";
     int id = message.Get("id").is_int() ? message.Get("id").AsInt() : 0;
     int stream = message.Get("stream").is_int() ? message.Get("stream").AsInt() : 0;
-    if (stream < 0 || stream > 3) return;
+    if (stream < 0 || stream >= MAX_STREAMS) return;
     if (command == "udp-open" && channels_.count(id) == 0 && channels_.size() < 8) {
       channels_[id].reset(new UdpChannel(this, id));
       channels_[id]->Bind();
