@@ -1,4 +1,5 @@
 import struct
+import threading
 import unittest
 
 import v380
@@ -55,6 +56,28 @@ class V380ConfigTest(unittest.TestCase):
         self.assertEqual(set(v380.LIGHT_COMMANDS), {"on", "off", "auto"})
         for command in (*v380.PTZ_COMMANDS.values(), *v380.LIGHT_COMMANDS.values(), v380.PTZ_STOP):
             self.assertEqual(len(command), 16)
+
+
+class V380ContinuousLensTest(unittest.TestCase):
+    def _bridge(self) -> v380.NativeBridge:
+        bridge = object.__new__(v380.NativeBridge)
+        bridge.continuous_lens_lock = threading.Lock()
+        bridge.continuous_lenses = set()
+        return bridge
+
+    def test_continuous_host_is_the_lowest_registered_lens(self) -> None:
+        bridge = self._bridge()
+        self.assertIsNone(bridge.continuous_host_lens())
+        bridge.register_continuous_lens(1)
+        bridge.register_continuous_lens(2)
+        self.assertEqual(bridge.continuous_host_lens(), 1)
+        bridge.register_continuous_lens(0)
+        self.assertEqual(bridge.continuous_host_lens(), 0)
+        bridge.unregister_continuous_lens(0)
+        self.assertEqual(bridge.continuous_host_lens(), 1)
+        bridge.unregister_continuous_lens(1)
+        bridge.unregister_continuous_lens(2)
+        self.assertIsNone(bridge.continuous_host_lens())
 
 
 if __name__ == "__main__":

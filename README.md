@@ -212,7 +212,7 @@ For access away from the camera's network, the computer needs a route to its loc
 Use **Add camera > V380 camera...** to add a V380 camera over its local protocol on TCP port 8800, without the phone.
 The form discovers the V380 cameras on the local network and asks for the camera name, username, and device password set in the V380 Pro app.
 The viewer authenticates with the AES-based V380 handshake, decrypts the camera's HEVC video and G.711 audio, and feeds the existing player and recording through a loopback-only MPEG-TS stream, so the phone and the vendor cloud are not needed.
-A multi-lens V380 camera that stacks its lenses into one tall frame is shown as one 16:9 pane per lens, named with a trailing number, all sharing a single camera connection; one continuous recording of the full frame covers every lens.
+A multi-lens V380 camera that stacks its lenses into one tall frame is shown as one 16:9 pane per lens, named with a trailing number, all sharing a single camera connection; one continuous recording of the full frame covers every lens and is made by the lowest-numbered lens on display, so hiding the first lens keeps the recording and detection running.
 The white light and short directional pan and tilt use the shared controls, and a vertical or horizontal mouse drag moves the camera.
 Local people and animal detection is available and enabled by default for V380 cameras; it runs on the full stacked frame, so a single detector covers every lens without per-lens precision.
 The V380 camera's own microSD recordings are not played in the viewer; its local 24-hour recordings use the continuous recording on this computer.

@@ -389,6 +389,8 @@ class NativeBridge:
         self.ptz_supported = True
         self.subscribers: set[queue.Queue] = set()
         self.subscriber_lock = threading.Lock()
+        self.continuous_lens_lock = threading.Lock()
+        self.continuous_lenses: set[int] = set()
         self.control_requests: queue.Queue[bytes] = queue.Queue(maxsize=16)
         self.video_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=128)
         self.audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=512)
@@ -396,6 +398,18 @@ class NativeBridge:
         self.server, self.server_thread, self.url = start_media_server(self)
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+
+    def register_continuous_lens(self, lens: int) -> None:
+        with self.continuous_lens_lock:
+            self.continuous_lenses.add(lens)
+
+    def unregister_continuous_lens(self, lens: int) -> None:
+        with self.continuous_lens_lock:
+            self.continuous_lenses.discard(lens)
+
+    def continuous_host_lens(self) -> int | None:
+        with self.continuous_lens_lock:
+            return min(self.continuous_lenses) if self.continuous_lenses else None
 
     def control(self, payload: bytes) -> bool:
         try:
