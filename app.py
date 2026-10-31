@@ -1072,6 +1072,18 @@ def nearest_fullscreen_alignment(slack: int, top: int) -> str:
     return min(FULLSCREEN_ALIGNMENTS, key=lambda alignment: abs(fullscreen_alignment_top(alignment, slack) - top))
 
 
+def optimal_grid_columns(count: int, width: int, height: int) -> int:
+    if count <= 1 or width <= 0 or height <= 0:
+        return max(1, count)
+    best_columns, best_tile = 1, 0.0
+    for columns in range(1, count + 1):
+        rows = math.ceil(count / columns)
+        tile = min(width / columns, height / rows * VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT)
+        if tile > best_tile + 0.5 or (abs(tile - best_tile) <= 0.5 and columns > best_columns):
+            best_columns, best_tile = columns, tile
+    return best_columns
+
+
 def camera_continuous_allowed(camera: AccountDevice | RtspCamera) -> bool:
     return (not isinstance(camera, RtspCamera) or camera.provider != IMOU_ACCOUNT_PROVIDER
             or camera.local_connection is not None
@@ -7696,12 +7708,20 @@ class MainWindow(QMainWindow):
         self.settings.sync()
         self.sync_previews()
 
+    def relayout_grid_for_screen(self) -> None:
+        if self.solo_uid is None and not self.isMinimized() and self.effective_camera_layout() == "grid":
+            self.sync_previews()
+
     def camera_grid_dimensions(self) -> tuple[int, int]:
         count = len(self.visible_devices())
         layout = self.effective_camera_layout()
         if not count or len(self.displayed_devices()) < count:
             return 1, 1
         if layout == "grid":
+            geometry = (self.screen() or QApplication.primaryScreen()).geometry()
+            if self.isFullScreen() and geometry.width() > geometry.height():
+                columns = max(CAMERA_GRID_COLUMNS, optimal_grid_columns(count, geometry.width(), geometry.height()))
+                return columns, math.ceil(count / columns)
             return CAMERA_GRID_COLUMNS, max(CAMERA_GRID_MIN_ROWS, math.ceil(count / CAMERA_GRID_COLUMNS))
         columns = 1 if layout == "vertical" or count == 1 else CAMERA_GRID_COLUMNS
         return columns, math.ceil(count / columns)
@@ -9128,6 +9148,8 @@ class MainWindow(QMainWindow):
             self.centralWidget().setStyleSheet("background-color: black;" if self.isFullScreen()
                                               else "background-color: #171717;")
             self.dragged_alignment = None
+            if not self.isMinimized():
+                QTimer.singleShot(0, self.relayout_grid_for_screen)
             self.align_fullscreen_videos()
             self.apply_stream_quality()
             self.update_hidden_pause()
