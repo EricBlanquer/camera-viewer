@@ -4492,7 +4492,8 @@ class RtspStreamWorker(QThread):
                 "-i", f"/proc/self/fd/{playlist_fd}",
             ]
         elif self.camera.provider == V380_PROVIDER:
-            command += ["-analyzeduration", "10000000", "-probesize", "50000000", "-i", self.v380_bridge.url]
+            command += ["-fflags", "+genpts", "-analyzeduration", "10000000", "-probesize", "50000000",
+                        "-i", self.v380_bridge.url]
         else:
             bridge = get_bridge(self.camera.uid)
             command += (["-i", bridge.url] if bridge is not None else ["-rtsp_transport", self.camera.transport, "-i", self.camera.url])
