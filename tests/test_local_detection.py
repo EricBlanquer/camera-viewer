@@ -707,6 +707,12 @@ class CameraDetectionSettingsTest(unittest.TestCase):
         self.assertEqual(local_motion_area(self.settings, self.garden.uid), MOTION_AREA_THRESHOLD)
         self.assertEqual(local_motion_area(None, "rtsp:entrance"), MOTION_AREA_THRESHOLD)
 
+    def test_v380_cameras_join_motion_detection_by_default(self):
+        uid = "rtsp:v380-99933817"
+        self.assertTrue(self.window.camera_local_detection_enabled(uid))
+        self.settings.setValue(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{uid}", False)
+        self.assertFalse(self.window.camera_local_detection_enabled(uid))
+
     def test_camera_choices_persist_and_master_toggle_preserves_independent_preferences(self):
         self.window.set_camera_local_detection(self.living.uid, False)
         self.assertTrue(self.window.stream_worker.local_detection_enabled)

@@ -7337,7 +7337,7 @@ class MainWindow(QMainWindow):
         return self.settings.value(CONTINUOUS_SETTING, True, bool)
 
     def camera_local_detection_enabled(self, uid: str) -> bool:
-        return self.settings.value(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{uid}", not uid.startswith("rtsp:v380-"), bool)
+        return self.settings.value(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{uid}", True, bool)
 
     def local_detection_enabled(self, uid: str | None = None) -> bool:
         return self.settings.value(LOCAL_DETECTION_SETTING, True, bool) and (
