@@ -904,12 +904,44 @@ class DetectionEngine:
         self.exporter.join(timeout=2)
 
 
+def detection_grid_side(stacked_lenses: int) -> int:
+    return max(1, math.ceil(math.sqrt(stacked_lenses)))
+
+
+def _grid_offset(cells: int, size: str) -> str:
+    return "+".join([size] * cells) or "0"
+
+
+def detection_video_filter(stacked_lenses: int) -> str:
+    scale = f"scale={SAMPLE_WIDTH}:{SAMPLE_HEIGHT}:flags=fast_bilinear"
+    if stacked_lenses <= 1:
+        return f"fps=1,{scale}"
+    side = detection_grid_side(stacked_lenses)
+    columns = min(stacked_lenses, side)
+    rows = math.ceil(stacked_lenses / side)
+    outputs = "".join(f"[s{lens}]" for lens in range(stacked_lenses))
+    crops = ";".join(
+        f"[s{lens}]crop=iw:ih/{stacked_lenses}:0:{lens}*ih/{stacked_lenses}[l{lens}]"
+        for lens in range(stacked_lenses)
+    )
+    tiles = "".join(f"[l{lens}]" for lens in range(stacked_lenses))
+    layout = "|".join(
+        f"{_grid_offset(lens % side, 'w0')}_{_grid_offset(lens // side, 'h0')}" for lens in range(stacked_lenses)
+    )
+    return (
+        f"fps=1,split={stacked_lenses}{outputs};{crops};"
+        f"{tiles}xstack=inputs={stacked_lenses}:layout={layout}:fill=black,"
+        f"pad=iw*{side}/{columns}:ih*{side}/{rows}:0:0:black,{scale}"
+    )
+
+
 class DetectionPipeline:
     def __init__(
         self, engine: DetectionEngine, uid: str, camera: str, prefix: str,
         input_args: list[str], on_event: Callable[[DetectionEvent], None],
         on_error: Callable[[str], None], input_descriptor: int | None = None,
         raw_input: bool = False, motion_area: float = MOTION_AREA_THRESHOLD,
+        stacked_lenses: int = 1,
     ) -> None:
         self.engine = engine
         self.uid = uid
@@ -917,7 +949,7 @@ class DetectionPipeline:
         self.prefix = prefix
         self.on_event = on_event
         self.on_error = on_error
-        self.motion_area = motion_area
+        self.motion_area = motion_area / detection_grid_side(stacked_lenses) ** 2
         self.stopped = threading.Event()
         self.latest_frame: tuple[bytes, float] | None = None
         self.pending: queue.Queue[bytes | None] | None = queue.Queue(maxsize=16) if raw_input else None
@@ -925,7 +957,7 @@ class DetectionPipeline:
         command = [
             "ffmpeg", "-nostdin", "-v", "error", "-threads", "2", "-probesize", "65536",
             "-analyzeduration", "1000000", *input_args, "-an", "-sn", "-vf",
-            "fps=1,scale=640:360:flags=fast_bilinear", "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1",
+            detection_video_filter(stacked_lenses), "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1",
         ]
         try:
             self.process = subprocess.Popen(

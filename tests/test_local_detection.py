@@ -24,8 +24,8 @@ from app import (
 from local_detection import (
     COVER_NAME, EVENT_MARGIN_SECONDS, MOTION_AREA_THRESHOLD, MOTION_CANDIDATE_SCORE, MOTION_PIXEL_THRESHOLD,
     SAMPLE_BYTES, SAMPLE_HEIGHT, SAMPLE_WIDTH, SCORE_THRESHOLD, DetectionEngine, DetectionEvent, DetectionHit,
-    DetectionPipeline, EventTracker, MotionGate, YoloXDetector, add_missing_covers, encode_cover, export_event,
-    install_model, load_events, organize_events, save_event,
+    DetectionPipeline, EventTracker, MotionGate, YoloXDetector, add_missing_covers, detection_video_filter,
+    encode_cover, export_event, install_model, load_events, organize_events, save_event,
 )
 
 
@@ -672,7 +672,12 @@ class RecordingExcerptTest(unittest.TestCase):
                 patch("app.DetectionPipeline") as pipeline:
             update_local_detector(worker, RtspCamera("camera", "Garden", "rtsp://example.invalid"),
                                   lambda: ([], None, False))
-        self.assertEqual(pipeline.call_args.args[-1], .015)
+            self.assertEqual(pipeline.call_args.args[-1], .015)
+            self.assertEqual(pipeline.call_args.kwargs["stacked_lenses"], 1)
+            worker.local_detector = None
+            update_local_detector(worker, RtspCamera("rtsp:v380-1-0", "House 1", "", "tcp", "v380", "admin",
+                                                     device_uid="rtsp:v380-1", lens=0), lambda: ([], None, False))
+            self.assertEqual(pipeline.call_args.kwargs["stacked_lenses"], 3)
 
 
 class CameraDetectionSettingsTest(unittest.TestCase):
@@ -812,6 +817,61 @@ class LocalReplayTest(unittest.TestCase):
                 show_window.assert_called_once_with()
             window.quit_requested = True
             window.close()
+
+
+class StackedLensDetectionTest(unittest.TestCase):
+    LENS_COLORS = ("red", "lime", "blue")
+
+    def _first_frame(self, lenses: int) -> tuple[bytes, DetectionPipeline]:
+        sources = ";".join(
+            f"color=c={color}:s=192x108:r=2:d=3[c{lens}]" for lens, color in enumerate(self.LENS_COLORS[:lenses])
+        )
+        stack = "".join(f"[c{lens}]" for lens in range(lenses))
+        frames = []
+        engine = SimpleNamespace(
+            recover=lambda pipeline: None, remove=lambda pipeline: None,
+            submit=lambda pipeline, frame, when: frames.append(frame),
+        )
+        pipeline = DetectionPipeline(
+            engine, "camera", "House", "House",
+            ["-f", "lavfi", "-i", f"{sources};{stack}vstack=inputs={lenses}[out0]"],
+            lambda event: None, lambda error: self.fail(error), stacked_lenses=lenses,
+        )
+        self.addCleanup(pipeline.close)
+        deadline = time.monotonic() + 10
+        while not frames and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertTrue(frames)
+        return frames[0], pipeline
+
+    def _color(self, frame: bytes, column: int, row: int) -> tuple[int, int, int]:
+        x = SAMPLE_WIDTH // 4 + column * SAMPLE_WIDTH // 2
+        y = SAMPLE_HEIGHT // 4 + row * SAMPLE_HEIGHT // 2
+        offset = (y * SAMPLE_WIDTH + x) * 3
+        return tuple(frame[offset:offset + 3])
+
+    def _assert_color(self, actual: tuple[int, int, int], expected: tuple[int, int, int]) -> None:
+        for value, target in zip(actual, expected):
+            self.assertLess(abs(value - target), 40, (actual, expected))
+
+    def test_single_lens_filter_is_unchanged(self) -> None:
+        self.assertEqual(detection_video_filter(1), "fps=1,scale=640:360:flags=fast_bilinear")
+
+    def test_three_stacked_lenses_keep_their_proportions_in_a_grid(self) -> None:
+        frame, pipeline = self._first_frame(3)
+        self.assertEqual(len(frame), SAMPLE_BYTES)
+        self._assert_color(self._color(frame, 0, 0), (0, 0, 255))
+        self._assert_color(self._color(frame, 1, 0), (0, 255, 0))
+        self._assert_color(self._color(frame, 0, 1), (255, 0, 0))
+        self._assert_color(self._color(frame, 1, 1), (0, 0, 0))
+        self.assertAlmostEqual(pipeline.motion_area, MOTION_AREA_THRESHOLD / 4)
+
+    def test_two_stacked_lenses_fill_the_top_row(self) -> None:
+        frame, _ = self._first_frame(2)
+        self._assert_color(self._color(frame, 0, 0), (0, 0, 255))
+        self._assert_color(self._color(frame, 1, 0), (0, 255, 0))
+        self._assert_color(self._color(frame, 0, 1), (0, 0, 0))
+        self._assert_color(self._color(frame, 1, 1), (0, 0, 0))
 
 
 if __name__ == "__main__":

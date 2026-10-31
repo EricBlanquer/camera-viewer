@@ -1619,6 +1619,7 @@ def update_local_detector(
             local_detection_engine(), camera.uid, camera.name, continuous_prefix(camera),
             input_args, worker.local_event_callback, worker.local_error_callback, descriptor, raw_input,
             worker.local_motion_area,
+            stacked_lenses=v380.LENS_COUNT if isinstance(camera, RtspCamera) and camera.provider == V380_PROVIDER else 1,
         )
         LOG.info("Local detection started for %s", camera.name)
         return worker.local_detector
