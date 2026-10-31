@@ -81,6 +81,7 @@ Use **Camera layout > Grid 2 × 2** for two columns and at least two rows, with 
 With three cameras, the fourth cell stays empty; additional cameras extend the grid by rows.
 Adjacent empty cells form one transparent area without separators.
 Full-screen view displays empty cells on a black background; leaving full screen restores their transparency.
+In full screen, the grid view arranges the cameras as a mosaic of different 16:9 sizes that fills a landscape screen with almost no black border; the first cameras in the order take the larger tiles, and camera counts without a clean fill keep the uniform grid.
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 Use **Camera profiles > Save current view...** to name the checked cameras, their order, and the camera layout.
 Choosing a saved profile restores that selection, order, and layout; the profile matching the current view is checked.
