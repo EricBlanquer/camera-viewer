@@ -8,6 +8,7 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import functools
 import math
 import os
 import queue
@@ -1070,6 +1071,88 @@ def fullscreen_alignment_top(alignment: str, slack: int) -> int:
 
 def nearest_fullscreen_alignment(slack: int, top: int) -> str:
     return min(FULLSCREEN_ALIGNMENTS, key=lambda alignment: abs(fullscreen_alignment_top(alignment, slack) - top))
+
+
+MOSAIC_TILE_ASPECT = VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT
+MOSAIC_MAX_CAMERAS = 12
+MOSAIC_MAX_CELLS = 12
+MOSAIC_MIN_COVERAGE = 0.9
+
+
+@functools.lru_cache(maxsize=None)
+def _mosaic_pack(count: int, aspect: float) -> tuple[float, tuple[tuple[float, float, float, float], ...]]:
+    if count == 1:
+        if aspect >= MOSAIC_TILE_ASPECT:
+            tile_w, tile_h = MOSAIC_TILE_ASPECT / aspect, 1.0
+        else:
+            tile_w, tile_h = 1.0, aspect / MOSAIC_TILE_ASPECT
+        return tile_w * tile_h, (((1 - tile_w) / 2, (1 - tile_h) / 2, tile_w, tile_h),)
+    best = (-1.0, ())
+    ratios = [index / 12 for index in range(1, 12)]
+    for first in range(1, count):
+        second = count - first
+        for ratio in ratios:
+            left_cov, left = _mosaic_pack(first, round(ratio * aspect, 2))
+            right_cov, right = _mosaic_pack(second, round((1 - ratio) * aspect, 2))
+            coverage = left_cov * ratio + right_cov * (1 - ratio)
+            if coverage > best[0]:
+                placed = tuple((x * ratio, y, w * ratio, h) for x, y, w, h in left)
+                placed += tuple((ratio + x * (1 - ratio), y, w * (1 - ratio), h) for x, y, w, h in right)
+                best = (coverage, placed)
+            top_cov, top = _mosaic_pack(first, round(aspect / ratio, 2))
+            bottom_cov, bottom = _mosaic_pack(second, round(aspect / (1 - ratio), 2))
+            coverage = top_cov * ratio + bottom_cov * (1 - ratio)
+            if coverage > best[0]:
+                placed = tuple((x, y * ratio, w, h * ratio) for x, y, w, h in top)
+                placed += tuple((x, ratio + y * (1 - ratio), w, h * (1 - ratio)) for x, y, w, h in bottom)
+                best = (coverage, placed)
+    return best
+
+
+def _compute_mosaic_grid(count: int, aspect: float) -> tuple[int, list[tuple[int, int, int, int]]] | None:
+    if not 2 <= count <= MOSAIC_MAX_CAMERAS or aspect <= 0:
+        return None
+    coverage, rects = _mosaic_pack(count, round(aspect, 2))
+    if coverage < MOSAIC_MIN_COVERAGE:
+        return None
+    for cells in range(2, MOSAIC_MAX_CELLS + 1):
+        spans = []
+        for x, y, w, h in rects:
+            left, top = round(x * cells), round(y * cells)
+            colspan, rowspan = round(w * cells), round(h * cells)
+            if colspan < 1 or rowspan < 1 or abs(x * cells - left) > 0.08 or abs(y * cells - top) > 0.08 \
+                    or abs(w * cells - colspan) > 0.08 or abs(h * cells - rowspan) > 0.08:
+                break
+            spans.append((top, left, rowspan, colspan))
+        else:
+            if all(0 <= r and 0 <= c and r + rs <= cells and c + cs <= cells for r, c, rs, cs in spans):
+                spans.sort(key=lambda span: (-span[2] * span[3], span[0], span[1]))
+                return cells, spans
+    return None
+
+
+_MOSAIC_CACHE: dict[tuple[int, float], tuple[int, list[tuple[int, int, int, int]]] | None] = {}
+_MOSAIC_LOCK = threading.Lock()
+
+
+def mosaic_grid(count: int, width: int, height: int) -> tuple[int, list[tuple[int, int, int, int]]] | None:
+    """A square cell grid and one (row, col, rowspan, colspan) span per tile that fills the screen
+    with varied 16:9 sizes, read from the cache that precompute_mosaics fills in the background;
+    returns None (uniform grid) when the layout is not yet computed or has no clean fill."""
+    if width <= 0 or height <= 0:
+        return None
+    with _MOSAIC_LOCK:
+        return _MOSAIC_CACHE.get((count, round(width / height, 2)))
+
+
+def precompute_mosaics(width: int, height: int, counts: range = range(2, 10)) -> None:
+    if width <= 0 or height <= 0:
+        return
+    aspect = round(width / height, 2)
+    for count in counts:
+        result = _compute_mosaic_grid(count, aspect)
+        with _MOSAIC_LOCK:
+            _MOSAIC_CACHE[(count, aspect)] = result
 
 
 def camera_continuous_allowed(camera: AccountDevice | RtspCamera) -> bool:
@@ -6614,6 +6697,7 @@ class DialogPlacement(QObject):
 class MainWindow(QMainWindow):
     local_detection_ready = pyqtSignal(object)
     local_detection_failed = pyqtSignal(str)
+    mosaics_ready = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -6760,6 +6844,7 @@ class MainWindow(QMainWindow):
         self.video.pointer_moved.connect(self.corner_overlay.reveal)
         self.solo_uid: str | None = None
         self.solo_fullscreen = False
+        self.fullscreen_mosaic = False
         self.video_grid = QGridLayout()
         self.video_grid.setContentsMargins(0, 0, 0, 0)
         self.video_grid.setSpacing(0)
@@ -6892,10 +6977,18 @@ class MainWindow(QMainWindow):
         self.set_status("Connecting to camera...")
         self.apply_standby_host()
         self.update_hidden_pause()
+        self.mosaics_ready.connect(self.update_fullscreen_mosaic)
+        screen_geometry = (self.screen() or QApplication.primaryScreen()).geometry()
+        threading.Thread(target=self._precompute_mosaics,
+                         args=(screen_geometry.width(), screen_geometry.height()), daemon=True).start()
         if self.accounts or self.rtsp_cameras or self.imou_accounts:
             QTimer.singleShot(0, self.find_cameras)
         else:
             QTimer.singleShot(0, self.setup_cameras)
+
+    def _precompute_mosaics(self, width: int, height: int) -> None:
+        precompute_mosaics(width, height)
+        self.mosaics_ready.emit()
 
     def set_status(self, text: str) -> None:
         self.base_status = text
@@ -7696,11 +7789,24 @@ class MainWindow(QMainWindow):
         self.settings.sync()
         self.sync_previews()
 
+    def current_mosaic(self) -> tuple[int, list[tuple[int, int, int, int]]] | None:
+        if (not self.fullscreen_mosaic or self.solo_uid is not None or self.isMinimized()
+                or self.effective_camera_layout() != "grid"):
+            return None
+        displayed = self.displayed_devices()
+        if len(displayed) != len(self.visible_devices()):
+            return None
+        geometry = (self.screen() or QApplication.primaryScreen()).geometry()
+        return mosaic_grid(len(displayed), geometry.width(), geometry.height())
+
     def camera_grid_dimensions(self) -> tuple[int, int]:
         count = len(self.visible_devices())
         layout = self.effective_camera_layout()
         if not count or len(self.displayed_devices()) < count:
             return 1, 1
+        mosaic = self.current_mosaic()
+        if mosaic is not None:
+            return mosaic[0], mosaic[0]
         if layout == "grid":
             return CAMERA_GRID_COLUMNS, max(CAMERA_GRID_MIN_ROWS, math.ceil(count / CAMERA_GRID_COLUMNS))
         columns = 1 if layout == "vertical" or count == 1 else CAMERA_GRID_COLUMNS
@@ -7864,13 +7970,17 @@ class MainWindow(QMainWindow):
             self.video_grid.setColumnStretch(column, 1 if column < columns else 0)
         for row in range(max(rows, self.video_grid.rowCount())):
             self.video_grid.setRowStretch(row, 1 if row < rows else 0)
-        cells = iter(divmod(index, columns) for index in range(len(displayed)))
+        mosaic = self.current_mosaic()
+        if mosaic is not None:
+            cells = iter(mosaic[1])
+        else:
+            cells = iter((row, column, 1, 1) for row, column in (divmod(index, columns) for index in range(len(displayed))))
         for camera in visible:
             shown = camera.uid in displayed
-            row, column = next(cells) if shown else (0, 0)
+            row, column, rowspan, colspan = next(cells) if shown else (0, 0, 1, 1)
             if selected is not None and camera.uid == selected.uid:
                 if shown:
-                    self.video_grid.addWidget(self.primary_pane, row, column)
+                    self.video_grid.addWidget(self.primary_pane, row, column, rowspan, colspan)
                 continue
             preview = self.previews.get(camera.uid)
             if preview is None:
@@ -7889,12 +7999,12 @@ class MainWindow(QMainWindow):
                 preview.solo_requested.connect(lambda uid=camera.uid: self.toggle_solo_camera(uid))
                 self.previews[camera.uid] = preview
                 if shown:
-                    self.video_grid.addWidget(preview, row, column)
+                    self.video_grid.addWidget(preview, row, column, rowspan, colspan)
                 preview.setVisible(shown)
                 preview.set_main_stream(self.main_stream_enabled(camera.uid))
                 preview.set_suspended(self.suspension_status())
             elif shown:
-                self.video_grid.addWidget(preview, row, column)
+                self.video_grid.addWidget(preview, row, column, rowspan, colspan)
                 preview.show()
             else:
                 self.video_grid.removeWidget(preview)
@@ -9092,10 +9202,22 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
+        if getattr(self, "previews", None) is not None:
+            self.update_fullscreen_mosaic()
         if getattr(self, "previews", None) and self.effective_camera_layout() != self.preview_layout:
             self.layout_refresh_timer.start(0)
         if getattr(self, "camera_mask_timer", None) is not None:
             self.camera_mask_timer.start(0)
+
+    def update_fullscreen_mosaic(self) -> None:
+        geometry = (self.screen() or QApplication.primaryScreen()).geometry()
+        desired = (self.isFullScreen() and not self.isMinimized() and self.solo_uid is None
+                   and self.effective_camera_layout() == "grid"
+                   and len(self.displayed_devices()) == len(self.visible_devices())
+                   and mosaic_grid(len(self.visible_devices()), geometry.width(), geometry.height()) is not None)
+        if desired != self.fullscreen_mosaic:
+            self.fullscreen_mosaic = desired
+            self.sync_previews()
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
