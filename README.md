@@ -216,6 +216,8 @@ A multi-lens V380 camera that stacks its lenses into one tall frame is shown as 
 The white light and short directional pan and tilt use the shared controls, and a vertical or horizontal mouse drag moves the camera.
 Local people and animal detection is available and enabled by default for V380 cameras; a single detector covers every lens, which it sees side by side in a 2 × 2 grid at their own proportions, with the motion threshold applied per lens.
 The V380 camera's own microSD recordings are not played in the viewer; its local 24-hour recordings use the continuous recording on this computer.
+A V380 camera accepts a single stream client: a second simultaneous login makes the camera drop both connections.
+With a `relay_url` (an `rtsp://` address on the local network, such as a mediamtx server) in the camera's entry of `~/.config/camera-viewer/v380.json`, the viewer that holds the camera connection also publishes each lens as 640 × 360 H.264 at 12 fps to `<relay_url>1`, `<relay_url>2` and `<relay_url>3`, so other screens can watch the camera without logging in to it.
 For access away from the camera's network, the computer needs a route to its local IP address, such as a VPN.
 
 Each camera keeps its 16:9 ratio in single-camera and multi-camera views, including when the window is resized.

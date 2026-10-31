@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import queue
+import re
 import secrets
 import socket
 import struct
@@ -12,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,6 +90,17 @@ AAC_FRAME_SAMPLES = 1024
 MUXER_STOPPED_MESSAGE = "The V380 media muxer stopped."
 LENS_COUNT = 3
 MAX_FRAME_BYTES = 8 * 1024 * 1024
+RELAY_FPS = 12
+RELAY_WIDTH = 640
+RELAY_HEIGHT = 360
+RELAY_GOP = "24"
+RELAY_BITRATE = "700k"
+RELAY_MAXRATE = "900k"
+RELAY_BUFFER = "1200k"
+RELAY_START_DELAY_SECONDS = 10
+RELAY_MAX_RETRY_SECONDS = 300
+RELAY_STABLE_SECONDS = 60
+RELAY_PATH_PATTERN = re.compile(r"/[A-Za-z0-9_/-]{1,64}")
 
 LOG = logging.getLogger("okam-linux.v380")
 _CONFIG_LOCK = threading.Lock()
@@ -99,6 +112,37 @@ def _is_local_address(address: str) -> bool:
     except ValueError:
         return False
     return host.is_private and not (host.is_loopback or host.is_multicast or host.is_unspecified)
+
+
+def valid_relay_url(url: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed.port
+    except ValueError:
+        return False
+    return (parsed.scheme == "rtsp" and parsed.hostname is not None and _is_local_address(parsed.hostname)
+            and parsed.username is None and parsed.password is None and not parsed.query
+            and not parsed.fragment and RELAY_PATH_PATTERN.fullmatch(parsed.path) is not None)
+
+
+def relay_command(source: str, relay_url: str, lenses: int = LENS_COUNT) -> list[str]:
+    outputs = "".join(f"[s{lens}]" for lens in range(lenses))
+    crops = ";".join(
+        f"[s{lens}]crop=iw:ih/{lenses}:0:{lens}*ih/{lenses},scale={RELAY_WIDTH}:{RELAY_HEIGHT}[l{lens}]"
+        for lens in range(lenses)
+    )
+    command = [
+        "ffmpeg", "-nostdin", "-nostats", "-loglevel", "error", "-hwaccel", "auto",
+        "-analyzeduration", "10000000", "-probesize", "50000000", "-i", source, "-an",
+        "-filter_complex", f"[0:v]fps={RELAY_FPS},split={lenses}{outputs};{crops}",
+    ]
+    for lens in range(lenses):
+        command += [
+            "-map", f"[l{lens}]", "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+            "-pix_fmt", "yuv420p", "-g", RELAY_GOP, "-b:v", RELAY_BITRATE, "-maxrate", RELAY_MAXRATE,
+            "-bufsize", RELAY_BUFFER, "-f", "rtsp", "-rtsp_transport", "tcp", f"{relay_url}{lens + 1}",
+        ]
+    return command
 
 
 def _ecb_encrypt(key: bytes, data: bytes) -> bytes:
@@ -136,6 +180,7 @@ class V380Config:
     port: int = DEFAULT_PORT
     username: str = DEFAULT_USERNAME
     address: str = ""
+    relay_url: str = ""
 
     @classmethod
     def from_record(cls, record: dict) -> V380Config:
@@ -143,15 +188,20 @@ class V380Config:
         port = record.get("port", DEFAULT_PORT)
         username = record.get("username", DEFAULT_USERNAME)
         address = record.get("address", "")
+        relay_url = record.get("relay_url", "")
         if (not isinstance(did, int) or not 0 < did <= 0xFFFFFFFF
                 or not isinstance(port, int) or not 1 <= port <= 65535
                 or not isinstance(username, str) or not 1 <= len(username.encode()) <= 32
-                or not isinstance(address, str) or (address and not _is_local_address(address))):
+                or not isinstance(address, str) or (address and not _is_local_address(address))
+                or not isinstance(relay_url, str) or (relay_url and not valid_relay_url(relay_url))):
             raise OSError("Invalid V380 connection configuration.")
-        return cls(did, port, username, address)
+        return cls(did, port, username, address, relay_url)
 
     def record(self) -> dict:
-        return {"did": self.did, "port": self.port, "username": self.username, "address": self.address}
+        record = {"did": self.did, "port": self.port, "username": self.username, "address": self.address}
+        if self.relay_url:
+            record["relay_url"] = self.relay_url
+        return record
 
 
 def _read_records() -> dict:
@@ -398,6 +448,38 @@ class NativeBridge:
         self.server, self.server_thread, self.url = start_media_server(self)
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+        self.relay_thread: threading.Thread | None = None
+        if config.relay_url:
+            self.relay_thread = threading.Thread(target=self._relay, daemon=True)
+            self.relay_thread.start()
+
+    def _relay(self) -> None:
+        delay = RELAY_START_DELAY_SECONDS
+        while not self.stopped.wait(delay):
+            try:
+                process = subprocess.Popen(
+                    relay_command(self.url, self.config.relay_url), stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except OSError as ex:
+                LOG.warning("V380 relay could not start: %s", ex)
+                delay = min(delay * 2, RELAY_MAX_RETRY_SECONDS)
+                continue
+            started = time.monotonic()
+            LOG.info("V380 relay started to %s", self.config.relay_url)
+            while process.poll() is None and not self.stopped.wait(1):
+                pass
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+                return
+            ran_long = time.monotonic() - started >= RELAY_STABLE_SECONDS
+            delay = RELAY_START_DELAY_SECONDS if ran_long else min(delay * 2, RELAY_MAX_RETRY_SECONDS)
+            LOG.info("V380 relay stopped with exit code %s; retrying in %s s", process.returncode, delay)
 
     def register_continuous_lens(self, lens: int) -> None:
         with self.continuous_lens_lock:
@@ -484,6 +566,8 @@ class NativeBridge:
             for start_type, buffer in session.frames():
                 if self.stopped.is_set():
                     break
+                if time.monotonic() - last_video > VIDEO_STALL_SECONDS:
+                    raise OSError("The V380 native stream stopped producing video.")
                 while not self.control_requests.empty():
                     session.send_control(self.control_requests.get_nowait())
                 payload = buffer[MEDIA_HEADER_SIZE:]
@@ -498,8 +582,6 @@ class NativeBridge:
                     first_keyframe = True
                 self.video_queue.put(payload, timeout=1)
                 last_video = time.monotonic()
-                if time.monotonic() - last_video > VIDEO_STALL_SECONDS:
-                    raise OSError("The V380 native stream stopped producing video.")
         except (OSError, ValueError, queue.Full) as ex:
             if not self.stopped.is_set():
                 self.error = str(ex) if isinstance(ex, OSError) else "The V380 native stream disconnected."
@@ -528,6 +610,8 @@ class NativeBridge:
     def close(self) -> None:
         self.stopped.set()
         self.thread.join(timeout=15)
+        if self.relay_thread is not None:
+            self.relay_thread.join(timeout=10)
         self.server_thread.join(timeout=2)
 
 
