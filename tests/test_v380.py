@@ -145,25 +145,33 @@ class V380StallTest(unittest.TestCase):
 
 
 class V380ContinuousLensTest(unittest.TestCase):
-    def _bridge(self) -> v380.NativeBridge:
-        bridge = object.__new__(v380.NativeBridge)
-        bridge.continuous_lens_lock = threading.Lock()
-        bridge.continuous_lenses = set()
-        return bridge
+    def setUp(self) -> None:
+        self.uid = "rtsp:v380-test"
+        self.addCleanup(v380._CONTINUOUS_LENSES.pop, self.uid, None)
 
     def test_continuous_host_is_the_lowest_registered_lens(self) -> None:
-        bridge = self._bridge()
-        self.assertIsNone(bridge.continuous_host_lens())
-        bridge.register_continuous_lens(1)
-        bridge.register_continuous_lens(2)
-        self.assertEqual(bridge.continuous_host_lens(), 1)
-        bridge.register_continuous_lens(0)
-        self.assertEqual(bridge.continuous_host_lens(), 0)
-        bridge.unregister_continuous_lens(0)
-        self.assertEqual(bridge.continuous_host_lens(), 1)
-        bridge.unregister_continuous_lens(1)
-        bridge.unregister_continuous_lens(2)
-        self.assertIsNone(bridge.continuous_host_lens())
+        self.assertIsNone(v380.continuous_host_lens(self.uid))
+        v380.register_continuous_lens(self.uid, 1)
+        v380.register_continuous_lens(self.uid, 2)
+        self.assertEqual(v380.continuous_host_lens(self.uid), 1)
+        v380.register_continuous_lens(self.uid, 0)
+        self.assertEqual(v380.continuous_host_lens(self.uid), 0)
+
+    def test_a_restarting_lens_keeps_the_host_during_the_grace_period(self) -> None:
+        now = [100.0]
+        with patch.object(v380.time, "monotonic", lambda: now[0]):
+            v380.register_continuous_lens(self.uid, 1)
+            v380.register_continuous_lens(self.uid, 2)
+            v380.unregister_continuous_lens(self.uid, 1)
+            now[0] += v380.CONTINUOUS_HOST_GRACE_SECONDS - 1
+            self.assertEqual(v380.continuous_host_lens(self.uid), 1)
+            v380.register_continuous_lens(self.uid, 1)
+            v380.unregister_continuous_lens(self.uid, 1)
+            now[0] += v380.CONTINUOUS_HOST_GRACE_SECONDS
+            self.assertEqual(v380.continuous_host_lens(self.uid), 2)
+            v380.unregister_continuous_lens(self.uid, 2)
+            now[0] += v380.CONTINUOUS_HOST_GRACE_SECONDS
+            self.assertIsNone(v380.continuous_host_lens(self.uid))
 
 
 if __name__ == "__main__":

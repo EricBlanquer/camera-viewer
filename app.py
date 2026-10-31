@@ -4704,7 +4704,7 @@ class RtspStreamWorker(QThread):
                 self.v380_bridge = v380.peek_bridge(self.camera.device_uid)
                 if self.v380_bridge is None:
                     raise OSError("The V380 camera is not connected.")
-                self.v380_bridge.register_continuous_lens(self.camera.lens)
+                v380.register_continuous_lens(self.camera.device_uid, self.camera.lens)
             else:
                 self.native_bridge = get_bridge(self.camera.uid)
                 self._select_native_stream()
@@ -4885,7 +4885,7 @@ class RtspStreamWorker(QThread):
                 speed = catch_up.speed(buffered if buffer_ready else None, time.monotonic())
                 if speed != playback_speed and mpv_request(self.socket_path, ["set_property", "speed", speed])[0]:
                     playback_speed = speed
-                if self.camera.provider != V380_PROVIDER or self.camera.lens == self.v380_bridge.continuous_host_lens():
+                if self.camera.provider != V380_PROVIDER or self.camera.lens == v380.continuous_host_lens(self.camera.device_uid):
                     self._update_continuous(time.monotonic())
                     update_local_detector(self, self.camera, self._local_detection_source)
                 elif self.camera.provider == V380_PROVIDER:
@@ -4933,7 +4933,7 @@ class RtspStreamWorker(QThread):
                 self.local_detector.close()
                 self.local_detector = None
             if self.v380_bridge is not None:
-                self.v380_bridge.unregister_continuous_lens(self.camera.lens)
+                v380.unregister_continuous_lens(self.camera.device_uid, self.camera.lens)
             close_bridge(self.camera.uid)
 
 

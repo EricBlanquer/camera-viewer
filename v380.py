@@ -98,8 +98,10 @@ RELAY_BITRATE = "700k"
 RELAY_MAXRATE = "900k"
 RELAY_BUFFER = "1200k"
 RELAY_START_DELAY_SECONDS = 10
+RELAY_RETRY_SECONDS = 5
 RELAY_MAX_RETRY_SECONDS = 300
-RELAY_STABLE_SECONDS = 60
+RELAY_STABLE_SECONDS = 20
+CONTINUOUS_HOST_GRACE_SECONDS = 30
 RELAY_PATH_PATTERN = re.compile(r"/[A-Za-z0-9_/-]{1,64}")
 
 LOG = logging.getLogger("okam-linux.v380")
@@ -439,8 +441,6 @@ class NativeBridge:
         self.ptz_supported = True
         self.subscribers: set[queue.Queue] = set()
         self.subscriber_lock = threading.Lock()
-        self.continuous_lens_lock = threading.Lock()
-        self.continuous_lenses: set[int] = set()
         self.control_requests: queue.Queue[bytes] = queue.Queue(maxsize=16)
         self.video_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=128)
         self.audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=512)
@@ -455,6 +455,7 @@ class NativeBridge:
 
     def _relay(self) -> None:
         delay = RELAY_START_DELAY_SECONDS
+        quick_failures = 0
         while not self.stopped.wait(delay):
             try:
                 process = subprocess.Popen(
@@ -463,7 +464,8 @@ class NativeBridge:
                 )
             except OSError as ex:
                 LOG.warning("V380 relay could not start: %s", ex)
-                delay = min(delay * 2, RELAY_MAX_RETRY_SECONDS)
+                quick_failures += 1
+                delay = min(RELAY_RETRY_SECONDS * 2 ** quick_failures, RELAY_MAX_RETRY_SECONDS)
                 continue
             started = time.monotonic()
             LOG.info("V380 relay started to %s", self.config.relay_url)
@@ -477,21 +479,9 @@ class NativeBridge:
                     process.kill()
                     process.wait(timeout=3)
                 return
-            ran_long = time.monotonic() - started >= RELAY_STABLE_SECONDS
-            delay = RELAY_START_DELAY_SECONDS if ran_long else min(delay * 2, RELAY_MAX_RETRY_SECONDS)
+            quick_failures = 0 if time.monotonic() - started >= RELAY_STABLE_SECONDS else quick_failures + 1
+            delay = min(RELAY_RETRY_SECONDS * 2 ** quick_failures, RELAY_MAX_RETRY_SECONDS)
             LOG.info("V380 relay stopped with exit code %s; retrying in %s s", process.returncode, delay)
-
-    def register_continuous_lens(self, lens: int) -> None:
-        with self.continuous_lens_lock:
-            self.continuous_lenses.add(lens)
-
-    def unregister_continuous_lens(self, lens: int) -> None:
-        with self.continuous_lens_lock:
-            self.continuous_lenses.discard(lens)
-
-    def continuous_host_lens(self) -> int | None:
-        with self.continuous_lens_lock:
-            return min(self.continuous_lenses) if self.continuous_lenses else None
 
     def control(self, payload: bytes) -> bool:
         try:
@@ -623,6 +613,31 @@ def _has_parameter_set(payload: bytes) -> bool:
             return True
         index = payload.find(b"\x00\x00\x01", index + 3)
     return False
+
+
+_CONTINUOUS_LENSES: dict[str, dict[int, float | None]] = {}
+_CONTINUOUS_LOCK = threading.Lock()
+
+
+def register_continuous_lens(uid: str, lens: int) -> None:
+    with _CONTINUOUS_LOCK:
+        _CONTINUOUS_LENSES.setdefault(uid, {})[lens] = None
+
+
+def unregister_continuous_lens(uid: str, lens: int) -> None:
+    with _CONTINUOUS_LOCK:
+        lenses = _CONTINUOUS_LENSES.get(uid)
+        if lenses is not None and lens in lenses:
+            lenses[lens] = time.monotonic() + CONTINUOUS_HOST_GRACE_SECONDS
+
+
+def continuous_host_lens(uid: str) -> int | None:
+    with _CONTINUOUS_LOCK:
+        lenses = _CONTINUOUS_LENSES.get(uid, {})
+        now = time.monotonic()
+        for lens in [lens for lens, expiry in lenses.items() if expiry is not None and expiry <= now]:
+            del lenses[lens]
+        return min(lenses) if lenses else None
 
 
 _BRIDGES: dict[str, NativeBridge] = {}
