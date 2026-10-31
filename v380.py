@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -86,9 +87,18 @@ AAC_SAMPLE_RATE = 8000
 AAC_FRAME_SAMPLES = 1024
 MUXER_STOPPED_MESSAGE = "The V380 media muxer stopped."
 LENS_COUNT = 3
+MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 LOG = logging.getLogger("okam-linux.v380")
 _CONFIG_LOCK = threading.Lock()
+
+
+def _is_local_address(address: str) -> bool:
+    try:
+        host = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return host.is_private and not (host.is_loopback or host.is_multicast or host.is_unspecified)
 
 
 def _ecb_encrypt(key: bytes, data: bytes) -> bytes:
@@ -136,7 +146,7 @@ class V380Config:
         if (not isinstance(did, int) or not 0 < did <= 0xFFFFFFFF
                 or not isinstance(port, int) or not 1 <= port <= 65535
                 or not isinstance(username, str) or not 1 <= len(username.encode()) <= 32
-                or not isinstance(address, str) or len(address) > 253):
+                or not isinstance(address, str) or (address and not _is_local_address(address))):
             raise OSError("Invalid V380 connection configuration.")
         return cls(did, port, username, address)
 
@@ -219,11 +229,13 @@ def discover(timeout: float = 1.5) -> list[DiscoveredCamera]:
         while time.monotonic() < deadline:
             sock.settimeout(max(0.05, deadline - time.monotonic()))
             try:
-                data, _ = sock.recvfrom(2048)
+                data, source = sock.recvfrom(2048)
             except socket.timeout:
                 break
             fields = data.decode("ascii", errors="replace").split("^")
             if len(fields) < 13 or fields[0] != DISCOVERY_RESULT:
+                continue
+            if fields[3] != source[0] or not _is_local_address(fields[3]):
                 continue
             mac = fields[2]
             try:
@@ -343,7 +355,7 @@ class V380Session:
                 start_type = frame_type
                 expected = 1
                 assembling = True
-            elif assembling and current == expected:
+            elif assembling and current == expected and len(buffer) + length <= MAX_FRAME_BYTES:
                 buffer.extend(payload)
                 expected += 1
             else:

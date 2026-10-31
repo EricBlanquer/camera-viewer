@@ -38,6 +38,18 @@ class V380ConfigTest(unittest.TestCase):
         with self.assertRaises(OSError):
             v380.V380Config.from_record({"did": "not-a-number"})
 
+    def test_non_local_address_rejected(self) -> None:
+        with self.assertRaises(OSError):
+            v380.V380Config.from_record({"did": 1, "address": "8.8.8.8", "username": "admin"})
+        with self.assertRaises(OSError):
+            v380.V380Config.from_record({"did": 1, "address": "127.0.0.1", "username": "admin"})
+
+    def test_local_address_check(self) -> None:
+        self.assertTrue(v380._is_local_address("192.168.1.200"))
+        self.assertFalse(v380._is_local_address("8.8.8.8"))
+        self.assertFalse(v380._is_local_address("127.0.0.1"))
+        self.assertFalse(v380._is_local_address("not-an-ip"))
+
     def test_ptz_and_light_commands_defined(self) -> None:
         self.assertEqual(set(v380.PTZ_COMMANDS), {"Up", "Down", "Left", "Right"})
         self.assertEqual(set(v380.LIGHT_COMMANDS), {"on", "off", "auto"})
