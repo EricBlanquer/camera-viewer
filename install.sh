@@ -13,6 +13,7 @@ python3 -m venv --system-site-packages "$app_dir/.venv"
 "$app_dir/.venv/bin/python" -m pip install --no-deps -e "$app_dir/vendor/okam-ha-native"
 "$app_dir/.venv/bin/python" -m pip install "cs2pppp==0.2.11"
 "$app_dir/.venv/bin/python" -m pip install 'websocket-client>=1.9,<2'
+"$app_dir/.venv/bin/python" -m pip install 'cryptography>=41'
 "$app_dir/.venv/bin/python" -m pip install 'opencv-python-headless==5.0.0.93' 'numpy>=2,<3'
 "$app_dir/.venv/bin/python" "$app_dir/local_detection.py" --install-model
 mkdir -p "$data_dir" "$desktop_dir"

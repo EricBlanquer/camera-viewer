@@ -108,6 +108,7 @@ from icam365 import (
     close_bridge, get_bridge, load_config as load_icam365_config,
 )
 from dahua import DahuaClient, DahuaError, set_forced_night_vision
+import v380
 from imou import (
     IMOU_ACCOUNT_URL, IMOU_PRIVACY_MESSAGE, IMOU_REGIONS, IMOU_SECRET_MISSING_MESSAGE, IMOU_TRAFFIC_MESSAGE,
     ImouAccount, ImouClient, ImouDevice, ImouError, ImouRecording,
@@ -136,6 +137,8 @@ RTSP_SOUND_SETTING = "audio/rtsp_sound"
 PATROL_SETTING = "movement/patrol"
 IMOU_PROVIDER = "imou"
 IMOU_ACCOUNT_PROVIDER = "imou_account"
+V380_PROVIDER = "v380"
+V380_SECRET_LABEL = "Camera Viewer V380 device password"
 IMOU_ACCOUNTS_SETTING = "accounts/imou"
 IMOU_CAMERAS_SETTING = "cameras/imou"
 IMOU_LOCAL_CONNECTIONS_SETTING = "cameras/imou_local_connections"
@@ -169,7 +172,7 @@ SHOW_WINDOW_REQUEST = b"show"
 ACCOUNT_REJECTED_MESSAGE = "O-KAM account login was rejected."
 ACCOUNT_INPUT_MESSAGE = "Enter your O-KAM account and password."
 ACCOUNT_LOADING_MESSAGE = "An account is already loading."
-CAMERA_SOURCE_LABELS = ("O-KAM account", "RTSP camera", "Imou Life camera (local)", "Imou Life account")
+CAMERA_SOURCE_LABELS = ("O-KAM account", "RTSP camera", "Imou Life camera (local)", "Imou Life account", "V380 camera")
 CAMERA_LAYOUTS = (("horizontal", "Side by side"), ("vertical", "Stacked"), ("grid", "Grid 2 × 2"))
 CAMERA_LAYOUT_VALUES = tuple(value for value, label in CAMERA_LAYOUTS)
 CAMERA_GRID_COLUMNS = 2
@@ -858,11 +861,40 @@ def mpv_rtsp_command(
         if playlist_fd is None:
             raise ValueError("A private Imou stream playlist is required.")
         command[-1] = f"--playlist=/proc/self/fd/{playlist_fd}"
+    elif camera.provider == V380_PROVIDER:
+        bridge = v380.peek_bridge(camera.device_uid)
+        if bridge is None:
+            raise CameraCredentialError("The V380 camera is not connected.")
+        command[-1] = bridge.url
+        command.insert(-1, f"--vf=lavfi=[crop=iw:ih/{v380.LENS_COUNT}:0:ih/{v380.LENS_COUNT}*{camera.lens}]")
     else:
         bridge = get_bridge(camera.uid)
         command[-1] = bridge.url if bridge is not None else camera.url
     command.insert(-1, f"--rtsp-transport={camera.transport}")
     return command
+
+
+def v380_password(camera: RtspCamera) -> str:
+    password = stored_secret(V380_PROVIDER, camera.device_uid)
+    if not password:
+        raise CameraCredentialError("The V380 camera password is unavailable in the desktop keyring.")
+    return password
+
+
+def v380_bridge(camera: RtspCamera, main_stream: bool) -> v380.NativeBridge:
+    bridge = v380.get_bridge(camera.device_uid, v380_password(camera), main_stream)
+    if bridge is None:
+        raise CameraCredentialError("The V380 camera is not configured.")
+    return bridge
+
+
+def v380_credentials_valid(camera: v380.DiscoveredCamera, username: str, password: str) -> bool:
+    session = v380.V380Session(v380.V380Config(did=camera.did, address=camera.address, username=username), password)
+    try:
+        session.authenticate()
+        return True
+    except OSError:
+        return False
 
 
 def stop_mpv_player(player: subprocess.Popen[bytes] | None) -> None:
@@ -904,6 +936,26 @@ class RtspCamera:
     imou_account: ImouAccount | None = None
     imou_device: ImouDevice | None = None
     local_connection: LocalRtspConnection | None = None
+    device_uid: str = ""
+    lens: int = 0
+
+
+def v380_device_uid(did: int) -> str:
+    return f"rtsp:v380-{did}"
+
+
+def v380_lens_uid(did: int, lens: int) -> str:
+    return f"rtsp:v380-{did}-{lens}"
+
+
+def v380_cameras(did: int, base_name: str, username: str) -> list[RtspCamera]:
+    device_uid = v380_device_uid(did)
+    names = [f"{base_name} {lens + 1}" for lens in range(v380.LENS_COUNT)]
+    return [
+        RtspCamera(v380_lens_uid(did, lens), names[lens], "", "tcp", V380_PROVIDER, username,
+                   device_uid=device_uid, lens=lens)
+        for lens in range(v380.LENS_COUNT)
+    ]
 
 
 def imou_account_camera(account: ImouAccount, device: ImouDevice, settings: QSettings | None = None) -> RtspCamera:
@@ -1027,6 +1079,8 @@ def camera_continuous_allowed(camera: AccountDevice | RtspCamera) -> bool:
 
 
 def vendor_connection_available(camera: AccountDevice | RtspCamera) -> bool:
+    if isinstance(camera, RtspCamera) and camera.provider == V380_PROVIDER:
+        return False
     if not isinstance(camera, RtspCamera) or camera.provider == IMOU_ACCOUNT_PROVIDER:
         return True
     try:
@@ -1220,6 +1274,7 @@ def load_rtsp_cameras(settings: QSettings) -> list[RtspCamera]:
             RtspCamera(
                 record["uid"], record["name"], record["url"], record.get("transport", "tcp"),
                 record.get("provider", "rtsp"), record.get("username", ""),
+                device_uid=record.get("device_uid", ""), lens=record.get("lens", 0),
             )
             for record in records
             if isinstance(record, dict)
@@ -1228,11 +1283,14 @@ def load_rtsp_cameras(settings: QSettings) -> list[RtspCamera]:
             and isinstance(record.get("name"), str)
             and record["name"].strip()
             and isinstance(record.get("url"), str)
-            and valid_rtsp_url(record["url"])
+            and (valid_rtsp_url(record["url"]) or record.get("provider") == V380_PROVIDER)
             and record.get("transport", "tcp") in ("udp", "tcp")
-            and record.get("provider", "rtsp") in ("rtsp", IMOU_PROVIDER)
+            and record.get("provider", "rtsp") in ("rtsp", IMOU_PROVIDER, V380_PROVIDER)
             and isinstance(record.get("username", ""), str)
             and (record.get("provider", "rtsp") != IMOU_PROVIDER or bool(record.get("username", "").strip()))
+            and (record.get("provider", "rtsp") != V380_PROVIDER
+                 or (isinstance(record.get("device_uid"), str) and record["device_uid"].startswith("rtsp:v380-")
+                     and isinstance(record.get("lens"), int) and 0 <= record["lens"] < v380.LENS_COUNT))
         ]
     except (ValueError, TypeError):
         return []
@@ -4251,6 +4309,7 @@ class RtspStreamWorker(QThread):
         self.ptz_lock = threading.Lock()
         self.ptz_request: str | None = None
         self.native_bridge = None
+        self.v380_bridge: v380.NativeBridge | None = None
         self.imou_stream_url = ""
         self.imou_tunnel: RtspWebSocketTunnel | LocalRtspMediaBridge | None = None
         self.recording_tunnels: dict[subprocess.Popen[bytes], RtspWebSocketTunnel] = {}
@@ -4287,7 +4346,10 @@ class RtspStreamWorker(QThread):
             self.light_request = mode
 
     def set_ptz(self, direction: str) -> bool:
-        if self.native_bridge is not None or self.imou_client is not None:
+        if self.v380_bridge is not None:
+            if direction not in v380.PTZ_COMMANDS:
+                return False
+        elif self.native_bridge is not None or self.imou_client is not None:
             pan, presets = self.movement_options()
             if direction not in ICAM365_TILT_ACTIONS and not (pan and direction in ("Left", "Right")) and direction not in presets:
                 return False
@@ -4300,6 +4362,8 @@ class RtspStreamWorker(QThread):
         return True
 
     def movement_options(self) -> tuple[bool, dict[str, str]]:
+        if self.v380_bridge is not None:
+            return True, {}
         if self.imou_client is not None and self.camera.imou_device is not None:
             return self.camera.imou_device.supports("PT", "PTZ"), self.imou_collections
         if self.native_bridge is None:
@@ -4310,6 +4374,8 @@ class RtspStreamWorker(QThread):
         self.stop_requested.set()
 
     def _local_detection_source(self) -> tuple[list[str], int | None, bool]:
+        if self.v380_bridge is not None:
+            return ["-analyzeduration", "10000000", "-probesize", "50000000", "-i", self.v380_bridge.url], None, False
         if self.native_bridge is not None:
             return ["-i", self.native_bridge.url], None, False
         if self.camera.local_connection is not None:
@@ -4425,6 +4491,8 @@ class RtspStreamWorker(QThread):
                 "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe,rtsp,tcp,udp,rtp",
                 "-i", f"/proc/self/fd/{playlist_fd}",
             ]
+        elif self.camera.provider == V380_PROVIDER:
+            command += ["-analyzeduration", "10000000", "-probesize", "50000000", "-i", self.v380_bridge.url]
         else:
             bridge = get_bridge(self.camera.uid)
             command += (["-i", bridge.url] if bridge is not None else ["-rtsp_transport", self.camera.transport, "-i", self.camera.url])
@@ -4476,6 +4544,8 @@ class RtspStreamWorker(QThread):
         if self.camera.provider == IMOU_PROVIDER or (
                 self.camera.provider == IMOU_ACCOUNT_PROVIDER and self.camera.local_connection is None):
             return None
+        if self.v380_bridge is not None:
+            return self.v380_bridge.url
         return self.imou_stream_url or (self.native_bridge.url if self.native_bridge is not None else self.camera.url)
 
     def _reload_player(self, buffered: object) -> bool:
@@ -4545,15 +4615,21 @@ class RtspStreamWorker(QThread):
         try:
             if self.camera.provider == IMOU_ACCOUNT_PROVIDER:
                 self._load_imou_stream()
+            elif self.camera.provider == V380_PROVIDER:
+                self.v380_bridge = v380.peek_bridge(self.camera.device_uid)
+                if self.v380_bridge is None:
+                    raise OSError("The V380 camera is not connected.")
             else:
                 self.native_bridge = get_bridge(self.camera.uid)
                 self._select_native_stream()
-            deadline = time.monotonic() + (60 if self.native_bridge is not None else 30)
+            deadline = time.monotonic() + (60 if self.native_bridge is not None or self.v380_bridge is not None else 30)
             while not self.stop_requested.is_set():
                 if self.imou_tunnel is not None and self.imou_tunnel.error:
                     raise OSError(self.imou_tunnel.error)
                 if self.native_bridge is not None and self.native_bridge.error:
                     raise OSError(self.native_bridge.error)
+                if self.v380_bridge is not None and self.v380_bridge.error:
+                    raise OSError(self.v380_bridge.error)
                 if self.player.poll() is not None:
                     raise OSError("The camera video player stopped.")
                 ready, configured = mpv_request(self.socket_path, ["get_property", "vo-configured"])
@@ -4574,12 +4650,19 @@ class RtspStreamWorker(QThread):
                 isinstance(track, dict) and track.get("type") == "audio" for track in tracks
             ):
                 self.audio_available.emit()
-            light_supported = self.native_bridge.light_supported if self.native_bridge is not None else icam365_light_request(self.camera)
+            if self.v380_bridge is not None:
+                light_supported = True
+            elif self.native_bridge is not None:
+                light_supported = self.native_bridge.light_supported
+            else:
+                light_supported = icam365_light_request(self.camera)
             if light_supported:
                 self.light_available.emit()
             if self.native_bridge is not None and self.native_bridge.light_mode is not None:
                 self.light_changed.emit(self.native_bridge.light_mode)
-            if self.imou_client is not None and self.camera.imou_device is not None:
+            if self.v380_bridge is not None:
+                ptz_supported = True
+            elif self.imou_client is not None and self.camera.imou_device is not None:
                 ptz_supported = self.camera.imou_device.supports("PT", "PTZ")
                 try:
                     self.imou_collections = self.imou_client.collections(self.camera.imou_device)
@@ -4599,11 +4682,14 @@ class RtspStreamWorker(QThread):
             player_reloaded = False
             pending_light = None
             pending_ptz = None
+            v380_stop_at = None
             while not self.stop_requested.is_set():
                 if self.imou_tunnel is not None and self.imou_tunnel.error:
                     raise OSError(self.imou_tunnel.error)
                 if self.native_bridge is not None and self.native_bridge.error:
                     raise OSError(self.native_bridge.error)
+                if self.v380_bridge is not None and self.v380_bridge.error:
+                    raise OSError(self.v380_bridge.error)
                 if self.player.poll() is not None:
                     raise OSError("The camera video player stopped.")
                 try:
@@ -4631,7 +4717,13 @@ class RtspStreamWorker(QThread):
                     light_mode = self.light_request
                     self.light_request = None
                 if light_mode is not None:
-                    if self.native_bridge is not None:
+                    if self.v380_bridge is not None:
+                        mode = {ICAM365_LIGHT_ON: "on", ICAM365_LIGHT_AUTO: "auto"}.get(light_mode, "off")
+                        if self.v380_bridge.set_light(mode):
+                            self.light_changed.emit(light_mode)
+                        else:
+                            self.light_failed.emit()
+                    elif self.native_bridge is not None:
                         if self.native_bridge.control(0x8014, struct.pack("<III", 0, 1 if light_mode == ICAM365_LIGHT_ON else 2, 0)):
                             pending_light = (light_mode, time.monotonic() + 8)
                         else:
@@ -4644,7 +4736,13 @@ class RtspStreamWorker(QThread):
                     direction = self.ptz_request
                     self.ptz_request = None
                 if direction is not None:
-                    if self.imou_client is not None and self.camera.imou_device is not None:
+                    if self.v380_bridge is not None:
+                        if self.v380_bridge.move_camera(direction):
+                            v380_stop_at = time.monotonic() + v380.PTZ_PULSE_SECONDS
+                            self.control_completed.emit(direction)
+                        else:
+                            self.control_failed.emit("Camera movement failed.")
+                    elif self.imou_client is not None and self.camera.imou_device is not None:
                         try:
                             self.imou_client.move(self.camera.imou_device, direction, self.imou_collections)
                             self.control_completed.emit(direction)
@@ -4680,6 +4778,9 @@ class RtspStreamWorker(QThread):
                     if pending_ptz is not None and time.monotonic() > pending_ptz[1]:
                         self.control_failed.emit("Camera movement failed.")
                         pending_ptz = None
+                if v380_stop_at is not None and time.monotonic() >= v380_stop_at:
+                    self.v380_bridge.stop_movement()
+                    v380_stop_at = None
                 position_ready, position = mpv_request(self.socket_path, ["get_property", "time-pos"])
                 buffer_ready, buffered = mpv_request(self.socket_path, ["get_property", "demuxer-cache-duration"])
                 delay = latency_guard.observe(position if position_ready else None, time.monotonic())
@@ -4698,8 +4799,9 @@ class RtspStreamWorker(QThread):
                 speed = catch_up.speed(buffered if buffer_ready else None, time.monotonic())
                 if speed != playback_speed and mpv_request(self.socket_path, ["set_property", "speed", speed])[0]:
                     playback_speed = speed
-                self._update_continuous(time.monotonic())
-                update_local_detector(self, self.camera, self._local_detection_source)
+                if self.camera.provider != V380_PROVIDER or self.camera.lens == 0:
+                    self._update_continuous(time.monotonic())
+                    update_local_detector(self, self.camera, self._local_detection_source)
                 if self.recording_request != self.recording_path:
                     self._stop_recording()
                     if self.recording_request is not None:
@@ -4770,6 +4872,7 @@ class CameraPreview(QWidget):
         self.player: subprocess.Popen[bytes] | None = None
         self.mpv_directory: tempfile.TemporaryDirectory[str] | None = None
         self.worker: StreamWorker | RtspStreamWorker | None = None
+        self.v380_bridge_held = False
         self.closing = False
         self.retry_enabled = True
         self.retry_seconds = 2
@@ -4964,6 +5067,9 @@ class CameraPreview(QWidget):
         try:
             if rtsp_camera is not None and rtsp_camera.provider == IMOU_PROVIDER:
                 playlist_fd = imou_mpv_playlist(rtsp_camera)
+            if rtsp_camera is not None and rtsp_camera.provider == V380_PROVIDER:
+                v380_bridge(rtsp_camera, self.main_stream)
+                self.v380_bridge_held = True
             command = (
                 mpv_rtsp_command(socket_path, int(self.video.winId()), True, rtsp_camera, self.sound_enabled, playlist_fd)
                 if rtsp_camera else mpv_stream_command(socket_path, int(self.video.winId()), True)
@@ -5319,6 +5425,9 @@ class CameraPreview(QWidget):
         if self.mpv_directory is not None:
             self.mpv_directory.cleanup()
             self.mpv_directory = None
+        if getattr(self, "v380_bridge_held", False):
+            self.v380_bridge_held = False
+            v380.release_bridge(self.camera.device_uid)
 
     def set_display(self, enabled: bool) -> None:
         if not enabled:
@@ -6928,6 +7037,8 @@ class MainWindow(QMainWindow):
             username = self.device_accounts[device.uid]
             if isinstance(device, RtspCamera):
                 source = "Imou Life (local)" if device.provider == IMOU_PROVIDER else "RTSP (local)"
+                if device.provider == V380_PROVIDER:
+                    source = "V380"
                 if device.provider == IMOU_ACCOUNT_PROVIDER:
                     source = f"Imou Life (local · {device.username})" if device.local_connection is not None else f"Imou Life ({device.username})"
                 if device.provider == "rtsp":
@@ -6969,8 +7080,11 @@ class MainWindow(QMainWindow):
             )
         if (isinstance(getattr(self, "selected_device", None), RtspCamera)
                 and self.selected_device.provider != IMOU_ACCOUNT_PROVIDER):
-            source = "Imou Life" if self.selected_device.provider == IMOU_PROVIDER else "RTSP"
-            self.cameras_menu.addAction(f"Remove selected {source} camera").triggered.connect(self.remove_selected_rtsp_camera)
+            if self.selected_device.provider == V380_PROVIDER:
+                self.cameras_menu.addAction("Remove selected V380 camera").triggered.connect(self.remove_selected_v380_camera)
+            else:
+                source = "Imou Life" if self.selected_device.provider == IMOU_PROVIDER else "RTSP"
+                self.cameras_menu.addAction(f"Remove selected {source} camera").triggered.connect(self.remove_selected_rtsp_camera)
 
     def detection_days(self) -> list[str]:
         now = datetime.now()
@@ -7129,7 +7243,7 @@ class MainWindow(QMainWindow):
         return self.settings.value(CONTINUOUS_SETTING, True, bool)
 
     def camera_local_detection_enabled(self, uid: str) -> bool:
-        return self.settings.value(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{uid}", True, bool)
+        return self.settings.value(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{uid}", not uid.startswith("rtsp:v380-"), bool)
 
     def local_detection_enabled(self, uid: str | None = None) -> bool:
         return self.settings.value(LOCAL_DETECTION_SETTING, True, bool) and (
@@ -7473,7 +7587,8 @@ class MainWindow(QMainWindow):
     def save_rtsp_cameras(self) -> None:
         records = [
             {"uid": camera.uid, "name": camera.name, "url": camera.url, "transport": camera.transport,
-             "provider": camera.provider, "username": camera.username}
+             "provider": camera.provider, "username": camera.username,
+             "device_uid": camera.device_uid, "lens": camera.lens}
             for camera in self.rtsp_cameras
         ]
         self.settings.setValue(RTSP_CAMERAS_SETTING, json.dumps(records))
@@ -7977,8 +8092,118 @@ class MainWindow(QMainWindow):
             self.sync_previews()
             self.set_status(NO_VISIBLE_CAMERAS_MESSAGE if self.devices else "No cameras available.")
 
+    def remove_selected_v380_camera(self) -> None:
+        camera = getattr(self, "selected_device", None)
+        if not isinstance(camera, RtspCamera) or camera.provider != V380_PROVIDER:
+            return
+        device_uid = camera.device_uid
+        if stored_secret(V380_PROVIDER, device_uid) is not None and not clear_device_secret(V380_PROVIDER, device_uid):
+            self.show_notice("Unable to remove the V380 password from the desktop keyring.")
+            return
+        lenses = [value for value in self.rtsp_cameras if value.device_uid == device_uid]
+        for value in lenses:
+            self.rtsp_cameras.remove(value)
+            self.devices.remove(value)
+            self.device_accounts.pop(value.uid, None)
+            self.settings.remove(f"{RTSP_SOUND_SETTING}/{value.uid}")
+            self.settings.remove(f"{CAMERA_VISIBLE_SETTING}/{value.uid}")
+            self.settings.remove(f"{LOCAL_DETECTION_CAMERAS_SETTING}/{value.uid}")
+            self.settings.remove(f"{LOCAL_MOTION_AREA_SETTING}/{value.uid}")
+        try:
+            v380.remove_config(device_uid)
+        except OSError:
+            pass
+        self.save_rtsp_cameras()
+        self.settings.remove("camera/selected_uid")
+        self.settings.remove("camera/selected_account")
+        self.settings.sync()
+        remaining = self.visible_devices()
+        if remaining:
+            replacement = remaining[0]
+            self.select_camera(self.device_accounts[replacement.uid], replacement.uid)
+        else:
+            self.stop_stream()
+            if self.devices:
+                self.selected_device = self.devices[0]
+            else:
+                del self.selected_device
+            self.sync_previews()
+            self.set_status(NO_VISIBLE_CAMERAS_MESSAGE if self.devices else "No cameras available.")
+
     def camera_source_actions(self) -> tuple[Callable[[], None], ...]:
-        return self.change_account, self.add_rtsp_camera, self.add_imou_camera, self.add_imou_account
+        return (self.change_account, self.add_rtsp_camera, self.add_imou_camera,
+                self.add_imou_account, self.add_v380_camera)
+
+    def add_v380_camera(self) -> None:
+        self.show_window_without_stream()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add V380 camera")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        name = QLineEdit()
+        name.setPlaceholderText("Maison")
+        cameras = QComboBox()
+        found = v380.discover()
+        for camera in found:
+            cameras.addItem(f"{camera.did} · {camera.address}", camera)
+        cameras.setEditable(False)
+        username = QLineEdit("admin")
+        password = QLineEdit()
+        password.setEchoMode(QLineEdit.EchoMode.Password)
+        password.setPlaceholderText("Device password")
+        form.addRow("Name", name)
+        form.addRow("Camera", cameras if found else QLabel("No V380 camera found on the network."))
+        form.addRow("Camera username", username)
+        form.addRow("Device password", password)
+        layout.addLayout(form)
+        error = QLabel()
+        error.setWordWrap(True)
+        error.setStyleSheet("color: #bd4242;")
+        layout.addWidget(error)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def accept_camera() -> None:
+            if not name.text().strip():
+                error.setText("Enter a camera name.")
+                name.setFocus()
+                return
+            if not found:
+                error.setText("No V380 camera was found on the network.")
+                return
+            if not username.text().strip() or not password.text():
+                error.setText("Enter the camera username and device password.")
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(accept_camera)
+        if self.exec_camera_dialog(dialog) != QDialog.DialogCode.Accepted:
+            dialog.deleteLater()
+            return
+        discovered = cameras.currentData()
+        device_uid = v380_device_uid(discovered.did)
+        try:
+            if not v380_credentials_valid(discovered, username.text().strip(), password.text()):
+                self.show_notice("The V380 camera rejected these credentials.")
+                dialog.deleteLater()
+                return
+            v380.store_config(device_uid, v380.V380Config(
+                did=discovered.did, address=discovered.address, username=username.text().strip()))
+            if not save_device_secret(V380_PROVIDER, device_uid, password.text(), V380_SECRET_LABEL):
+                raise OSError("Unable to save the device password in the desktop keyring.")
+        except OSError as ex:
+            self.show_notice(str(ex))
+            dialog.deleteLater()
+            return
+        dialog.deleteLater()
+        lenses = v380_cameras(discovered.did, name.text().strip(), username.text().strip())
+        for camera in lenses:
+            self.rtsp_cameras.append(camera)
+            self.devices.append(camera)
+            self.device_accounts[camera.uid] = RTSP_ACCOUNT
+        self.save_rtsp_cameras()
+        self.select_camera(RTSP_ACCOUNT, lenses[0].uid)
 
     def save_imou_accounts(self) -> None:
         self.settings.setValue(IMOU_ACCOUNTS_SETTING, json.dumps([asdict(account) for account in self.imou_accounts]))
@@ -8602,6 +8827,10 @@ class MainWindow(QMainWindow):
         try:
             if rtsp_camera is not None and rtsp_camera.provider == IMOU_PROVIDER:
                 playlist_fd = imou_mpv_playlist(rtsp_camera)
+            if rtsp_camera is not None and rtsp_camera.provider == V380_PROVIDER:
+                v380_bridge(rtsp_camera, self.main_stream_enabled(rtsp_camera.uid))
+                self.primary_v380_bridge_held = True
+                self.primary_v380_device_uid = rtsp_camera.device_uid
             self.player = subprocess.Popen(
                 mpv_rtsp_command(self.mpv_socket, int(self.video.winId()), True, rtsp_camera, self.sound_enabled, playlist_fd)
                 if rtsp_camera else mpv_stream_command(self.mpv_socket, int(self.video.winId()), True),
@@ -8614,6 +8843,7 @@ class MainWindow(QMainWindow):
         except OSError as ex:
             if rtsp_camera is not None:
                 close_bridge(rtsp_camera.uid)
+            self._release_primary_v380_bridge()
             self.mpv_socket = None
             self.mpv_directory.cleanup()
             self.mpv_directory = None
@@ -8624,11 +8854,19 @@ class MainWindow(QMainWindow):
                 os.close(playlist_fd)
         return True
 
+    def _release_primary_v380_bridge(self) -> None:
+        if getattr(self, "primary_v380_bridge_held", False):
+            self.primary_v380_bridge_held = False
+            device_uid = getattr(self, "primary_v380_device_uid", "")
+            if device_uid:
+                v380.release_bridge(device_uid)
+
     def stop_player(self, preserve_frame: bool = False) -> None:
         if not preserve_frame:
             self.video.clear_retained_frame()
         stop_mpv_player(self.player)
         self.player = None
+        self._release_primary_v380_bridge()
         if self.mpv_directory is not None:
             self.mpv_directory.cleanup()
             self.mpv_directory = None

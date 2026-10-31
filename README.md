@@ -1,7 +1,7 @@
 # Camera Viewer
 
 Camera Viewer is a native Linux desktop viewer for security cameras.
-O-KAM Pro and Imou Life account cameras, local RTSP cameras, Imou cameras with local RTSP access, and configured iCam365 native connections are supported.
+O-KAM Pro and Imou Life account cameras, local RTSP cameras, Imou cameras with local RTSP access, configured iCam365 native connections, and V380 cameras over their local protocol are supported.
 It uses Qt for the interface, mpv for H.264 and H.265 playback, and the MIT-licensed [O-KAM Native Bridge](https://github.com/oleandor/okam-ha-native) for O-KAM camera discovery, wake-up, and encrypted P2P transport.
 It does not require Home Assistant, Wine, Waydroid, or the phone while viewing.
 
@@ -206,6 +206,15 @@ Use the camera's device password or safety code, which may differ from the Imou 
 Local Imou cameras have the RTSP live-view and local recording controls described above.
 This local connection uses local recording playback; the Imou Life account connection provides camera microSD playback and supported remote movement.
 Talkback is unavailable in the viewer.
+For access away from the camera's network, the computer needs a route to its local IP address, such as a VPN.
+
+Use **Add camera > V380 camera...** to add a V380 camera over its local protocol on TCP port 8800, without the phone.
+The form discovers the V380 cameras on the local network and asks for the camera name, username, and device password set in the V380 Pro app.
+The viewer authenticates with the AES-based V380 handshake, decrypts the camera's HEVC video and G.711 audio, and feeds the existing player and recording through a loopback-only MPEG-TS stream, so the phone and the vendor cloud are not needed.
+A multi-lens V380 camera that stacks its lenses into one tall frame is shown as one 16:9 pane per lens, named with a trailing number, all sharing a single camera connection; one continuous recording of the full frame covers every lens.
+The white light and short directional pan and tilt use the shared controls, and a vertical or horizontal mouse drag moves the camera.
+Local people and animal detection is available but off by default for V380 cameras, because the stacked frame makes it costly and imprecise.
+The V380 camera's own microSD recordings are not played in the viewer; its local 24-hour recordings use the continuous recording on this computer.
 For access away from the camera's network, the computer needs a route to its local IP address, such as a VPN.
 
 Each camera keeps its 16:9 ratio in single-camera and multi-camera views, including when the window is resized.
