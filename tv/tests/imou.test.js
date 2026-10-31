@@ -479,6 +479,11 @@ const localCamera = {
     certificate_sha256: "a".repeat(64),
   },
 };
+const streamCamera = {
+  type: "stream",
+  name: "Maison 1",
+  url: "rtsp://192.168.1.251:8554/maison1",
+};
 function reply(sequence, status, headers = "", body = "") {
   return bytes(
     "RTSP/1.0 " + status + " Status\r\nCSeq: " + sequence + "\r\n" + headers +
@@ -643,6 +648,72 @@ test("local video connects without account requests and authenticates DESCRIBE, 
   );
   f.event(reply(5, 200));
   assert.equal(f.session.state, "closed");
+  assert.deepEqual(f.errors, []);
+});
+test("stream configuration accepts a private RTSP URL and rejects others", () => {
+  imou.validate(streamCamera);
+  for (
+    const url of [
+      "rtsp://8.8.8.8:8554/maison1",
+      "rtsp://192.168.1.251:8554/maison\r\n",
+      "http://192.168.1.251:8554/maison1",
+      "rtsp://192.168.1.251:70000/maison1",
+      "rtsp://192.168.1.251:8554/maison1#x",
+      "",
+    ]
+  ) {
+    assert.throws(() => imou.validate({ ...streamCamera, url }));
+  }
+  assert.throws(
+    () => imou.validate({ ...streamCamera, name: "" }),
+    /Invalid stream/,
+  );
+});
+test("a stream camera connects over plain RTSP without authentication", async (t) => {
+  const original = global.XMLHttpRequest;
+  global.XMLHttpRequest = class {
+    constructor() {
+      assert.fail("Stream video requested cloud access");
+    }
+  };
+  t.after(() => {
+    global.XMLHttpRequest = original;
+  });
+  const f = fixture(streamCamera);
+  t.after(() => f.session.finishClose());
+  await f.session.open();
+  assert.equal(f.messages[0].command, "tcp-open");
+  assert.equal(f.messages[0].host, "192.168.1.251");
+  assert.equal(f.messages[0].port, 8554);
+  assert.equal("certificate_sha256" in f.messages[0], false);
+  f.session.event({ type: "tcp-ready", id: f.session.id });
+  const describe = text(new Uint8Array(f.messages.at(-1).data));
+  assert.ok(describe.startsWith("DESCRIBE rtsp://192.168.1.251:8554/maison1 "));
+  assert.ok(!/Authorization:/.test(describe));
+  f.event(
+    reply(
+      1,
+      200,
+      "Content-Base: rtsp://192.168.1.251:8554/maison1/\r\n",
+      "m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:trackID=0\r\n" +
+        "m=audio 0 RTP/AVP 97\r\na=rtpmap:97 MPEG4-GENERIC/48000/1\r\n" +
+        "a=control:trackID=1\r\n",
+    ),
+  );
+  await settle();
+  const setup = text(new Uint8Array(f.messages.at(-1).data));
+  assert.ok(setup.startsWith("SETUP rtsp://192.168.1.251:8554/maison1/trackID=0 "));
+  assert.ok(!/Authorization:/.test(setup));
+  f.event(
+    reply(
+      2,
+      200,
+      "Session: s1;timeout=60\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n",
+    ),
+  );
+  await settle();
+  f.event(reply(3, 200));
+  assert.equal(f.session.state, "playing");
   assert.deepEqual(f.errors, []);
 });
 test("local authentication stops after rejected credentials without cloud fallback", async (t) => {

@@ -346,6 +346,27 @@ test("an Imou pane plays independently and retains only its own camera image", a
   assert.equal(app.context.window.cameraViewer.state()[2].state, "playing");
   assert.equal(app.pane(3).statusElement.textContent, "");
 });
+test("a stream camera is accepted and reconnects only for the same URL", async () => {
+  const app = viewer();
+  const maison = {
+    type: "stream",
+    name: "Maison 1",
+    url: "rtsp://192.168.1.251:8554/maison1",
+  };
+  const count = app.context.window.cameraViewer.configure([maison]);
+  assert.equal(count, 1);
+  assert.equal(app.stored()[0].url, maison.url);
+  app.emit({ type: "transport-ready" });
+  await Promise.resolve();
+  const pane = app.pane(0);
+  assert.equal(pane.session.config.type, "stream");
+  app.render(0);
+  const image = pane.canvas.image;
+  await pane.connect({ ...maison });
+  assert.equal(pane.canvas.image, image);
+  await pane.connect({ ...maison, url: "rtsp://192.168.1.251:8554/maison2" });
+  assert.equal(pane.canvas.image, null);
+});
 test("stalled rendering closes only the affected connection", async () => {
   const app = viewer();
   app.context.window.cameraViewer.configure([app.camera, {

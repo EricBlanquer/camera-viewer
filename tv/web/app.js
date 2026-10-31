@@ -62,7 +62,7 @@ function validateConfiguration(configuration) {
   ) throw new Error("Configure between one and four cameras");
   configuration.forEach((camera) => {
     if (
-      !camera || !["icam365", "okam", "imou"].includes(camera.type) ||
+      !camera || !["icam365", "okam", "imou", "stream"].includes(camera.type) ||
       typeof camera.name !== "string" || !camera.name ||
       camera.name.length > 128
     ) throw new Error("Invalid camera configuration");
@@ -73,7 +73,7 @@ function validateConfiguration(configuration) {
   });
 }
 function createSession(camera, callbacks) {
-  const Session = camera.type === "imou"
+  const Session = camera.type === "imou" || camera.type === "stream"
     ? ImouVideo.Session
     : CameraProtocol.NativeSession;
   return new Session(camera, transport, callbacks);
@@ -263,6 +263,7 @@ class CameraPane {
     if (!camera || !this.camera || camera.type !== this.camera.type) {
       return false;
     }
+    if (camera.type === "stream") return camera.url === this.camera.url;
     if (camera.type === "imou") {
       if (camera.local || this.camera.local) {
         return Boolean(
@@ -348,7 +349,7 @@ class CameraPane {
       generation: this.generation,
       codec,
       key: CameraProtocol.isKeyframe(payload, codec),
-      burst: this.camera.type === "imou",
+      burst: this.camera.type === "imou" || this.camera.type === "stream",
       max_width: area.width,
       max_height: area.height,
       data: payload.buffer.slice(

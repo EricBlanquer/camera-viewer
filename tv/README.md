@@ -6,7 +6,8 @@ Imou Life cameras with local configuration connect directly to their private LAN
 Encrypted cameras use TLS 1.2 with a pinned SHA-256 certificate fingerprint; a changed certificate stops the connection before camera authentication.
 Local Imou video and reconnection require no Imou account API and consume no Imou cloud video allowance.
 Account-based Imou configurations remain supported through Open Platform, with automatic token renewal and fresh cloud stream addresses on reconnection.
-Camera video never passes through a PC.
+A generic stream camera plays an H.264 or HEVC RTSP feed from a private LAN host, for a camera reached through a local re-streamer instead of a vendor protocol.
+Vendor-protocol camera video never passes through a PC; a generic stream camera reaches the TV from the host that publishes its RTSP feed.
 The TV launcher uses a 128 × 128 PNG generated from the desktop application's camera icon.
 
 Four equal cells remain visible in a 2 × 2 grid, including when only one or two cameras are configured.
@@ -105,6 +106,11 @@ Cloud viewing consumes the Imou account's cloud traffic allowance.
 Account tokens and expiring stream URLs remain in memory and are excluded from saved configuration.
 The Linux viewer's account discovery and desktop keyring can supply these values during setup.
 Passwords, application secrets, and provisioned iCam365 account tokens belong only in that private file, never in the widget or repository.
+
+A generic stream entry contains `type: "stream"`, `name`, and `url`, an `rtsp://` address on a private LAN host that serves H.264 or HEVC over RTSP.
+The TV connects to that address directly over TCP without authentication or a vendor account, decodes its video, and ignores any audio track.
+It suits a camera reached through a local RTSP gateway rather than a vendor protocol, for example a multi-lens V380 camera re-streamed as one H.264 feed per lens by a host on the LAN.
+The stream plays at the publisher's resolution, so `always_hd` and full-screen quality switching do not apply.
 
 ```sh
 chmod 600 /private/path/cameras.json

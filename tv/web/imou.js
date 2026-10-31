@@ -76,6 +76,14 @@
     );
   }
   function validate(camera) {
+    if (camera && camera.type === "stream") {
+      if (
+        typeof camera.name !== "string" || !camera.name ||
+        camera.name.length > 128
+      ) throw new Error("Invalid stream camera configuration");
+      streamUrl(camera.url, true);
+      return;
+    }
     if (camera.local !== undefined) {
       const local = camera.local;
       if (
@@ -651,7 +659,9 @@
       if (this.state !== "closed") return;
       this.state = "account";
       this.started = performance.now();
-      this.callbacks.status("Connecting to Imou Life");
+      this.callbacks.status(
+        this.config.type === "stream" ? "Connecting" : "Connecting to Imou Life",
+      );
       this.timer = setInterval(() => {
         try {
           this.tick();
@@ -661,7 +671,9 @@
       }, 1000);
       try {
         const hd = Boolean(this.config.hd);
-        if (this.config.local) this.url = localUrl(this.config, hd);
+        if (this.config.type === "stream") {
+          this.url = streamUrl(this.config.url, true);
+        } else if (this.config.local) this.url = localUrl(this.config, hd);
         else {
           const value = await accountFor(this.config.account).stream(
             this.config,
@@ -815,7 +827,10 @@
         if (this.config.local && status === 403) {
           throw new Error(ACCESS_REFUSED);
         }
-        throw new Error("Imou stream rejected (RTSP " + status + ")");
+        throw new Error(
+          (this.config.type === "stream" ? "Stream" : "Imou stream") +
+            " rejected (RTSP " + status + ")",
+        );
       }
       if (pending.method === "DESCRIBE") {
         const base = headers["content-base"]
@@ -860,7 +875,11 @@
         this.peer = true;
         this.lastKeepalive = performance.now();
         this.lastVideo = this.lastKeepalive;
-        this.callbacks.status("Imou Life video connected");
+        this.callbacks.status(
+          this.config.type === "stream"
+            ? "Stream connected"
+            : "Imou Life video connected",
+        );
       }
     }
     event(event) {
