@@ -6,10 +6,10 @@ from unittest.mock import patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PyQt6.QtCore import QSettings
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QRect, QSettings
+from PyQt6.QtWidgets import QApplication, QWidget
 
-from app import CameraPreview, MainWindow, RtspCamera, compute_mosaic, docked_span, mosaic_grid
+from app import AspectVideoFrame, CameraPreview, MainWindow, RtspCamera, compute_mosaic, docked_span, mosaic_grid
 
 
 class DockedSpanTest(unittest.TestCase):
@@ -36,6 +36,33 @@ class MosaicAspectFallbackTest(unittest.TestCase):
     def test_a_distant_aspect_keeps_the_uniform_grid(self) -> None:
         compute_mosaic(6, 1000, 1000, tolerant=True)
         self.assertIsNone(mosaic_grid(6, 1000, 1000, tolerant=True))
+
+
+class AspectVideoFrameFillTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.frame = AspectVideoFrame(QWidget())
+        self.frame.show()
+
+    def tearDown(self) -> None:
+        self.frame.close()
+        self.frame.deleteLater()
+
+    def test_a_near_widescreen_frame_is_filled_only_in_fill_mode(self) -> None:
+        self.frame.resize(640, 337)
+        self.assertEqual(self.frame.video.geometry(), QRect(20, 0, 599, 337))
+        self.frame.set_fill(True)
+        self.assertEqual(self.frame.video.geometry(), QRect(0, 0, 640, 337))
+        self.frame.set_fill(False)
+        self.assertEqual(self.frame.video.geometry(), QRect(20, 0, 599, 337))
+
+    def test_a_distant_shape_keeps_its_bars_in_fill_mode(self) -> None:
+        self.frame.set_fill(True)
+        self.frame.resize(640, 690)
+        self.assertEqual(self.frame.video.geometry(), QRect(0, 165, 640, 360))
 
 
 class DockedWindowTest(unittest.TestCase):
@@ -107,6 +134,20 @@ class DockedWindowTest(unittest.TestCase):
         self.assertEqual(self.order(), windowed)
         self.dock()
         self.assertEqual(self.order(), docked)
+
+    def fills(self) -> list[bool]:
+        return [frame.fill for frame in self.window.findChildren(AspectVideoFrame)]
+
+    def test_only_a_docked_window_fills_its_panes(self) -> None:
+        self.assertFalse(any(self.fills()))
+        self.dock()
+        self.assertGreaterEqual(len(self.fills()), len(self.cameras))
+        self.assertTrue(all(self.fills()))
+        self.window.showNormal()
+        self.window.setGeometry(100, 100, 300, 200)
+        self.settle()
+        self.window.update_fullscreen_mosaic()
+        self.assertFalse(any(self.fills()))
 
     def test_a_docked_window_keeps_its_size(self) -> None:
         self.dock()

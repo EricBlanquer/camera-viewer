@@ -242,6 +242,7 @@ LIVE_SPEED_STEP = 0.05
 MPV_AUDIO_TRACK_ON = "auto"
 MPV_AUDIO_TRACK_OFF = "no"
 MPV_SOFTWARE_DECODE_OPTION = "--hwdec=auto-safe"
+MPV_FILL_OPTION = "--panscan=1.0"
 MPV_VAAPI_DECODE_OPTION = "--hwdec=vaapi"
 MPV_COMMON_OPTIONS = (
     "--no-config",
@@ -845,7 +846,7 @@ def mpv_stream_command(socket_path: Path, window_id: int, fill: bool) -> list[st
         f"--wid={window_id}",
     ]
     if fill:
-        command.append("--panscan=1.0")
+        command.append(MPV_FILL_OPTION)
     return command + ["-"]
 
 
@@ -1184,13 +1185,21 @@ def mosaic_key(count: int, width: int, height: int) -> tuple[int, float]:
     return count, round(width / height, 2)
 
 
+def aspect_distance(aspect: float, target: float) -> float:
+    return abs(math.log(aspect / target))
+
+
+def aspect_close(aspect: float, target: float) -> bool:
+    return aspect_distance(aspect, target) <= math.log1p(MOSAIC_ASPECT_TOLERANCE)
+
+
 def mosaic_aspects(width: int, height: int, tolerant: bool = False) -> list[float]:
     aspect = round(width / height, 2)
     if not tolerant:
         return [aspect]
     nearby = sorted((candidate for candidate in MOSAIC_ASPECTS
-                     if candidate != aspect and abs(math.log(candidate / aspect)) <= math.log1p(MOSAIC_ASPECT_TOLERANCE)),
-                    key=lambda candidate: abs(math.log(candidate / aspect)))
+                     if candidate != aspect and aspect_close(candidate, aspect)),
+                    key=lambda candidate: aspect_distance(candidate, aspect))
     return [aspect, *nearby]
 
 
@@ -3909,12 +3918,28 @@ class AspectVideoFrame(QWidget):
         self.setMinimumSize(320, 180)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.setStyleSheet("background-color: #171717;")
+        self.fill = False
 
-    def resizeEvent(self, event: QResizeEvent) -> None:
-        super().resizeEvent(event)
+    def set_fill(self, fill: bool) -> None:
+        if fill != self.fill:
+            self.fill = fill
+            self.place_video()
+
+    def fills_frame(self) -> bool:
+        return (self.fill and self.height() > 0
+                and aspect_close(self.width() / self.height(), VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT))
+
+    def place_video(self) -> None:
+        if self.fills_frame():
+            self.video.setGeometry(self.rect())
+            return
         width = min(self.width(), round(self.height() * VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT))
         height = min(self.height(), round(width * VIDEO_ASPECT_HEIGHT / VIDEO_ASPECT_WIDTH))
         self.video.setGeometry((self.width() - width) // 2, (self.height() - height) // 2, width, height)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self.place_video()
 
 
 class TimelineWidget(QWidget):
@@ -6218,7 +6243,7 @@ class LocalReplayPane(QWidget):
             self.mpv_directory = tempfile.TemporaryDirectory(prefix="okam-linux-replay-")
             self.socket_path = Path(self.mpv_directory.name) / "control.sock"
             command = [
-                "mpv", *MPV_COMMON_OPTIONS, "--keep-open=yes",
+                "mpv", *MPV_COMMON_OPTIONS, "--keep-open=yes", MPV_FILL_OPTION,
                 f"--input-ipc-server={self.socket_path}", f"--wid={int(self.video.winId())}",
             ]
             if isinstance(self.camera, RtspCamera):
@@ -7115,6 +7140,11 @@ class MainWindow(QMainWindow):
             return self.centralWidget().size()
         return None
 
+    def apply_video_fill(self) -> None:
+        docked = self.window_docked()
+        for frame in self.findChildren(AspectVideoFrame):
+            frame.set_fill(docked)
+
     def set_status(self, text: str) -> None:
         self.base_status = text
         if not self.notice_timer.isActive():
@@ -7743,6 +7773,7 @@ class MainWindow(QMainWindow):
             preview.hide_overlay()
         stack.addWidget(replay)
         stack.setCurrentWidget(replay)
+        self.apply_video_fill()
         if isinstance(worker, StreamWorker):
             worker.set_display(False)
         replay.show()
@@ -8152,6 +8183,7 @@ class MainWindow(QMainWindow):
             preview.video.reorder_enabled = self.video.reorder_enabled
             preview.corner_overlay.set_view(len(visible) > 1, camera.uid == self.solo_uid)
         self.preview_layout = layout
+        self.apply_video_fill()
         self.camera_mask_timer.start(0)
         if len(cameras) == 1 and layout == "horizontal" and self.width() < 1120:
             self.resize(1120, self.height())
@@ -9363,6 +9395,7 @@ class MainWindow(QMainWindow):
         if desired != self.fullscreen_mosaic or order != self.placed_order:
             self.fullscreen_mosaic = desired
             self.sync_previews()
+        self.apply_video_fill()
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
