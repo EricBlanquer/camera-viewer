@@ -9374,12 +9374,15 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
+        self.refresh_window_shape()
+        if getattr(self, "camera_mask_timer", None) is not None:
+            self.camera_mask_timer.start(0)
+
+    def refresh_window_shape(self) -> None:
         if getattr(self, "previews", None) is not None:
             self.update_fullscreen_mosaic()
         if getattr(self, "previews", None) and self.effective_camera_layout() != self.preview_layout:
             self.layout_refresh_timer.start(0)
-        if getattr(self, "camera_mask_timer", None) is not None:
-            self.camera_mask_timer.start(0)
 
     def update_fullscreen_mosaic(self) -> None:
         area = self.mosaic_area()
@@ -9414,6 +9417,7 @@ class MainWindow(QMainWindow):
     def moveEvent(self, event: QMoveEvent) -> None:
         super().moveEvent(event)
         self.place_video_overlays()
+        self.refresh_window_shape()
 
     def place_video_overlays(self) -> None:
         self.video.place_overlay()

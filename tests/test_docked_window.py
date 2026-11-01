@@ -149,6 +149,19 @@ class DockedWindowTest(unittest.TestCase):
         self.window.update_fullscreen_mosaic()
         self.assertFalse(any(self.fills()))
 
+    def test_a_window_moved_into_its_dock_after_resizing_is_docked(self) -> None:
+        area = self.window.screen().availableGeometry()
+        frame = self.window.frameGeometry().size() - self.window.size()
+        self.window.setGeometry(area.left() + 50, area.top() + 50,
+                                area.width() - frame.width(), area.height() - frame.height())
+        self.settle()
+        self.assertFalse(self.window.window_docked())
+        self.assertFalse(any(self.fills()))
+        self.window.move(area.topLeft())
+        self.settle()
+        self.assertTrue(self.window.window_docked())
+        self.assertTrue(all(self.fills()))
+
     def test_a_docked_window_keeps_its_size(self) -> None:
         self.dock()
         size = self.window.size()
