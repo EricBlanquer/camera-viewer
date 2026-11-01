@@ -21,11 +21,12 @@ from app import (
     LOCAL_DETECTION_CAMERAS_SETTING, LOCAL_MOTION_AREA_SETTING, LocalReplayPane, MainWindow, RtspCamera,
     local_motion_area, measured_video_rate, update_local_detector,
 )
+import local_detection
 from local_detection import (
     COVER_NAME, EVENT_MARGIN_SECONDS, MOTION_AREA_THRESHOLD, MOTION_CANDIDATE_SCORE, MOTION_PIXEL_THRESHOLD,
     SAMPLE_BYTES, SAMPLE_HEIGHT, SAMPLE_WIDTH, SCORE_THRESHOLD, DetectionEngine, DetectionEvent, DetectionHit,
     DetectionPipeline, EventTracker, MotionGate, YoloXDetector, add_missing_covers, detection_video_filter,
-    encode_cover, export_event, install_model, load_events, organize_events, save_event,
+    encode_cover, excerpt_command, export_event, install_model, load_events, organize_events, save_event,
 )
 
 
@@ -326,6 +327,69 @@ class ModelInstallationTest(unittest.TestCase):
                     patch("local_detection.urllib.request.urlopen", return_value=io.BytesIO(b"good")):
                 self.assertEqual(install_model(destination), destination)
             self.assertEqual(destination.read_bytes(), b"good")
+
+
+class ExcerptEncoderTest(unittest.TestCase):
+    def test_software_excerpt_keeps_the_portable_libx264_settings(self):
+        command = excerpt_command(Path("/recordings/Garden.mkv"), Path("/tmp/part-000.mkv"), 3.5, 12.0)
+        self.assertNotIn("-vaapi_device", command)
+        self.assertEqual(command[command.index("-vf") + 1], "scale=1280:-2")
+        self.assertEqual(command[command.index("-c:v") + 1], "libx264")
+        self.assertEqual(command[command.index("-crf") + 1], "25")
+        self.assertEqual(command[command.index("-ss") + 1], "3.5")
+        self.assertEqual(command[command.index("-t") + 1], "12.0")
+        self.assertEqual(command[-1], "/tmp/part-000.mkv")
+
+    def test_hardware_excerpt_encodes_on_the_render_node_at_the_same_quality(self):
+        command = excerpt_command(Path("/recordings/Garden.mkv"), Path("/tmp/part-000.mkv"), 3.5, 12.0,
+                                  device="/dev/dri/renderD128")
+        self.assertEqual(command[command.index("-vaapi_device") + 1], "/dev/dri/renderD128")
+        self.assertEqual(command[command.index("-vf") + 1], "scale=1280:-2,format=nv12,hwupload")
+        self.assertEqual(command[command.index("-c:v") + 1], "h264_vaapi")
+        self.assertEqual(command[command.index("-rc_mode") + 1], "CQP")
+        self.assertEqual(command[command.index("-qp") + 1], "25")
+        self.assertNotIn("libx264", command)
+        self.assertNotIn("-crf", command)
+        self.assertNotIn("-threads", command)
+
+    def test_raw_segment_excerpt_declares_its_measured_input_rate_before_seeking(self):
+        for device in (None, "/dev/dri/renderD128"):
+            command = excerpt_command(Path("/recordings/Garden.mkv.h264"), Path("/tmp/part-001.mkv"), 1.0, 4.0,
+                                      framerate=8.0, device=device)
+            self.assertEqual(command[command.index("-framerate") + 1], "8.0")
+            self.assertEqual(command[command.index("-f") + 1], "h264")
+            self.assertLess(command.index("-i"), command.index("-ss"))
+
+    def test_excerpt_falls_back_to_software_when_the_render_node_cannot_encode(self):
+        with tempfile.TemporaryDirectory(prefix="intraswitch_camera_detection_test_") as directory:
+            root = Path(directory)
+            recordings = root / "Continuous"
+            recordings.mkdir()
+            start = datetime.now().replace(microsecond=0) - timedelta(minutes=1)
+            make_test_video(recordings / f"Garden_{start:%Y%m%d_%H%M%S}.mkv", 2 * EVENT_MARGIN_SECONDS + 4)
+            event = DetectionEvent("camera", "Garden", start + timedelta(seconds=EVENT_MARGIN_SECONDS),
+                                   start + timedelta(seconds=EVENT_MARGIN_SECONDS + 2), ("person",), .9)
+            attempted = []
+            real_run = local_detection._run
+
+            def run(command, timeout=60, cancel=None):
+                attempted.append(command)
+                if "h264_vaapi" in command:
+                    raise subprocess.CalledProcessError(1, command, "", "no usable encoding entrypoint")
+                return real_run(command, timeout=timeout, cancel=cancel)
+
+            with patch("local_detection.event_directory", return_value=root / "Detections"), \
+                    patch("local_detection.hardware_encode_device", return_value="/dev/dri/renderD128"), \
+                    patch("local_detection._run", run):
+                finished = export_event(event, recordings, "Garden")
+            self.assertTrue(any("h264_vaapi" in command for command in attempted))
+            self.assertTrue(any("libx264" in command for command in attempted))
+            self.assertTrue(finished.clip.is_file())
+            packets = subprocess.run([
+                "ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0",
+                "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(finished.clip),
+            ], check=True, capture_output=True, text=True, timeout=10)
+            self.assertGreater(int(packets.stdout.strip()), 0)
 
 
 class RecordingExcerptTest(unittest.TestCase):

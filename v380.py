@@ -19,6 +19,7 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+from hardware import disable_hardware_encode, hardware_encode_device
 from icam365 import broadcast_media, start_media_server, write_media
 
 
@@ -103,68 +104,9 @@ RELAY_MAX_RETRY_SECONDS = 300
 RELAY_STABLE_SECONDS = 20
 CONTINUOUS_HOST_GRACE_SECONDS = 30
 RELAY_PATH_PATTERN = re.compile(r"/[A-Za-z0-9_/-]{1,64}")
-RELAY_PROBE_TIMEOUT_SECONDS = 20
 
 LOG = logging.getLogger("okam-linux.v380")
 _CONFIG_LOCK = threading.Lock()
-_HARDWARE_LOCK = threading.Lock()
-_HARDWARE_DEVICE: str | None | object = None
-
-
-def _candidate_render_nodes() -> list[str]:
-    override = os.environ.get("CAMERA_VIEWER_VAAPI_DEVICE", "").strip()
-    if override:
-        return [] if override.lower() in {"0", "off", "none", "false"} else [override]
-    try:
-        return sorted(str(node) for node in Path("/dev/dri").glob("renderD*"))
-    except OSError:
-        return []
-
-
-def _probe_render_node(device: str) -> bool:
-    """Encode a couple of frames on the iGPU to prove VAAPI really works here."""
-    command = [
-        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-        "-vaapi_device", device,
-        "-f", "lavfi", "-i", f"testsrc=size={RELAY_WIDTH}x{RELAY_HEIGHT}:rate={RELAY_FPS}",
-        "-frames:v", "2", "-vf", "format=nv12,hwupload",
-        "-c:v", "h264_vaapi", "-f", "null", "-",
-    ]
-    try:
-        result = subprocess.run(
-            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, timeout=RELAY_PROBE_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
-
-
-def hardware_encode_device() -> str | None:
-    """Render node usable for H.264 encoding, or None to stay on libx264.
-
-    Encoding three lenses in software costs about two cores permanently, which
-    is what pushes this laptop into thermal throttling. The probe runs once.
-    """
-    global _HARDWARE_DEVICE
-    with _HARDWARE_LOCK:
-        if _HARDWARE_DEVICE is not None:
-            return _HARDWARE_DEVICE if isinstance(_HARDWARE_DEVICE, str) else None
-        for device in _candidate_render_nodes():
-            if os.access(device, os.R_OK | os.W_OK) and _probe_render_node(device):
-                LOG.info("V380 relay will encode on %s (VAAPI)", device)
-                _HARDWARE_DEVICE = device
-                return device
-        LOG.info("V380 relay falls back to libx264 (no usable VAAPI encoder)")
-        _HARDWARE_DEVICE = False
-        return None
-
-
-def disable_hardware_encode() -> None:
-    """Stop using the iGPU after the hardware relay failed to stay up."""
-    global _HARDWARE_DEVICE
-    with _HARDWARE_LOCK:
-        _HARDWARE_DEVICE = False
 
 
 def _is_local_address(address: str) -> bool:

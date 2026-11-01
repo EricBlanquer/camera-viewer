@@ -19,6 +19,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
+from hardware import hardware_encode_device
+
 
 LOG = logging.getLogger("okam-linux.local_detection")
 MODEL_URL = "https://huggingface.co/opencv/opencv_zoo/resolve/main/models/object_detection_yolox/object_detection_yolox_2022nov.onnx"
@@ -38,6 +40,11 @@ MOTION_AREA_THRESHOLD = 0.002
 MOTION_CANDIDATE_SCORE = 0.25
 EVENT_MARGIN_SECONDS = 10
 MIN_EXCERPT_SECONDS = 1
+EXCERPT_WIDTH = 1280
+EXCERPT_FPS = "15"
+EXCERPT_QUALITY = "25"
+EXCERPT_TIMEOUT_SECONDS = 90
+EXCERPT_TIMEOUT_FACTOR = 2.5
 EVENT_GAP_SECONDS = 3
 EVENT_CONFIRM_SECONDS = 2
 EVENT_MAX_SECONDS = 120
@@ -630,6 +637,70 @@ def _source_segments(
     return sorted(segments, key=lambda item: item[1])
 
 
+def excerpt_command(
+    source: Path, output: Path, skip: float, duration: float,
+    framerate: float | None = None, device: str | None = None,
+) -> list[str]:
+    """Cut one excerpt part, on the iGPU through VAAPI when a device is given.
+
+    VAAPI has no constant rate factor, so the quality setting becomes the
+    equivalent constant quantiser; the frames must be uploaded to the GPU after
+    the scaler, which still runs on the processor.
+    """
+    command = ["ffmpeg", "-nostdin", "-v", "error", "-y"]
+    if device:
+        command += ["-vaapi_device", device]
+    if framerate is not None:
+        command += ["-framerate", str(framerate), "-f", "h264", "-i", str(source), "-ss", str(skip)]
+    else:
+        command += ["-ss", str(skip), "-i", str(source)]
+    scale = f"scale={EXCERPT_WIDTH}:-2" + (",format=nv12,hwupload" if device else "")
+    command += ["-t", str(duration), "-an", "-vf", scale, "-r", EXCERPT_FPS]
+    if device:
+        command += ["-c:v", "h264_vaapi", "-rc_mode", "CQP", "-qp", EXCERPT_QUALITY]
+    else:
+        command += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", EXCERPT_QUALITY, "-threads", "2"]
+    return command + [str(output)]
+
+
+class _MissingCoverage(OSError):
+    """The recordings do not cover the event, which re-encoding cannot fix."""
+
+
+def _excerpt_parts(
+    segments: list[tuple[Path, datetime, float]], temporary: Path, first: datetime, last: datetime,
+    event_last: datetime, device: str | None, cancel: threading.Event | None = None,
+) -> tuple[list[Path], datetime]:
+    parts: list[Path] = []
+    clip_start: datetime | None = None
+    available_end = max(first, segments[0][1])
+    for path, start, duration in segments:
+        left = max(first, start, available_end)
+        right = min(last, start + timedelta(seconds=duration))
+        if right <= left:
+            continue
+        part = temporary / f"part-{len(parts):03}.mkv"
+        framerate = None
+        if path.name.endswith(".mkv.h264"):
+            framerate = max(1.0, min(60.0, _frame_count(path, cancel) / max(duration, 1)))
+        length = (right - left).total_seconds()
+        # The graphics encoder spares the processor but runs close to real time,
+        # so a long excerpt needs a budget that follows its own length.
+        _run(excerpt_command(path, part, (left - start).total_seconds(), length, framerate, device),
+             timeout=max(EXCERPT_TIMEOUT_SECONDS, int(EXCERPT_TIMEOUT_FACTOR * length)), cancel=cancel)
+        if not _has_video_packets(part, cancel):
+            if right - left < timedelta(seconds=MIN_EXCERPT_SECONDS):
+                continue
+            raise OSError("The local detection excerpt is empty.")
+        if clip_start is None:
+            clip_start = left
+        parts.append(part)
+        available_end = right
+    if clip_start is None or available_end < event_last:
+        raise _MissingCoverage("The continuous recording does not contain the detected event.")
+    return parts, clip_start
+
+
 def export_event(
     event: DetectionEvent, recordings: Path, prefix: str,
     cancel: threading.Event | None = None,
@@ -641,38 +712,18 @@ def export_event(
         raise OSError("No continuous recording covers the local detection.")
     category = _event_type(event.classes)
     with tempfile.TemporaryDirectory(prefix="intraswitch_camera_event_") as temporary:
-        parts = []
-        clip_start: datetime | None = None
-        available_end = max(first, segments[0][1])
-        for path, start, duration in segments:
-            left = max(first, start, available_end)
-            right = min(last, start + timedelta(seconds=duration))
-            if right <= left:
-                continue
-            part = Path(temporary) / f"part-{len(parts):03}.mkv"
-            command = ["ffmpeg", "-nostdin", "-v", "error", "-y"]
-            if path.name.endswith(".mkv.h264"):
-                fps = max(1.0, min(60.0, _frame_count(path, cancel) / max(duration, 1)))
-                command += ["-framerate", str(fps), "-f", "h264", "-i", str(path),
-                            "-ss", str((left - start).total_seconds())]
-            else:
-                command += ["-ss", str((left - start).total_seconds()), "-i", str(path)]
-            command += [
-                "-t", str((right - left).total_seconds()), "-an", "-vf", "scale=1280:-2",
-                "-r", "15", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "25",
-                "-threads", "2", str(part),
-            ]
-            _run(command, timeout=90, cancel=cancel)
-            if not _has_video_packets(part, cancel):
-                if right - left < timedelta(seconds=MIN_EXCERPT_SECONDS):
-                    continue
-                raise OSError("The local detection excerpt is empty.")
-            if clip_start is None:
-                clip_start = left
-            parts.append(part)
-            available_end = right
-        if clip_start is None or available_end < event.last:
-            raise OSError("The continuous recording does not contain the detected event.")
+        device = hardware_encode_device()
+        try:
+            parts, clip_start = _excerpt_parts(segments, Path(temporary), first, last, event.last, device, cancel)
+        except _MissingCoverage:
+            raise
+        except (OSError, ValueError, subprocess.SubprocessError):
+            if not device or (cancel is not None and cancel.is_set()):
+                raise
+            # Every part has to carry the same encoder settings to be joined
+            # without re-encoding, so the whole excerpt is cut again in software.
+            LOG.warning("Cutting the detection excerpt on %s failed; using libx264 instead", device)
+            parts, clip_start = _excerpt_parts(segments, Path(temporary), first, last, event.last, None, cancel)
         folder = _clip_folder(event_directory(), event.first, category, event.camera)
         clip = folder / f"{category}_{prefix}_{clip_start:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.mkv"
         target = Path(temporary) / "event.mkv"

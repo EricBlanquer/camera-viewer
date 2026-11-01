@@ -273,6 +273,7 @@ The minimum area is 0.2 % of the frame; `detections/motion_area_percent/<camera 
 A person shape confirms an event only after its position or size changes, so motionless scenery that resembles a person is ignored.
 Cats, dogs, and birds recognized by the model are reported as animals without naming the species, because dark animals in infrared images are often confused.
 Event excerpts include up to ten seconds before and after the detected passage and are stored without audio in `Videos/O-KAM Linux/Detections`, using the system's configured Videos folder.
+Excerpts are cut to 1280 pixels wide at 15 frames per second and are encoded on the computer's Intel graphics through VAAPI when a render node passes the same encoding test as the V380 relay, which halves the processor time an export costs; an export that the graphics cannot encode is cut again in software, so it never fails for that reason, and `CAMERA_VIEWER_VAAPI_DEVICE` set to `off` keeps every export on the processor.
 Each excerpt embeds, as its `cover_land.jpg` Matroska cover, the analyzed frame with the highest detection score, with the detected people or animals outlined.
 File managers that use embedded covers, such as Dolphin, show this image as the excerpt's thumbnail instead of the first frame.
 When the analyzed frame is unavailable, such as for a detection recovered after an interruption, the cover comes from the excerpt at the middle of the detected passage.
