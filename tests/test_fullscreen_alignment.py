@@ -135,6 +135,26 @@ class FullscreenAlignmentTest(unittest.TestCase):
         self.assertEqual(self.video_top(0), self.area.top() + self.slack // 2)
         self.assertEqual(self.settings.value("view/fullscreen_alignment", "", str), "[]")
 
+    def test_fullscreen_keeps_its_own_camera_order(self) -> None:
+        windowed = [camera.uid for camera in self.cameras]
+        fullscreen = [windowed[1], windowed[0], windowed[2]]
+        self.window.swap_cameras(windowed[0], windowed[1])
+        self.settle()
+        self.assertEqual([camera.uid for camera in self.window.ordered_devices()], fullscreen)
+        self.assertIs(self.window.video_grid.itemAtPosition(0, 0).widget(), self.window.previews[windowed[1]])
+        with patch.object(self.window, "fit_video_aspect"):
+            self.window.toggle_fullscreen()
+            self.settle()
+        self.assertFalse(self.window.isFullScreen())
+        self.assertEqual([camera.uid for camera in self.window.ordered_devices()], windowed)
+        self.assertIs(self.window.video_grid.itemAtPosition(0, 0).widget(), self.window.primary_pane)
+        with patch.object(self.window, "fit_video_aspect"):
+            self.window.toggle_fullscreen()
+            self.settle()
+        self.assertTrue(self.window.isFullScreen())
+        self.assertEqual([camera.uid for camera in self.window.ordered_devices()], fullscreen)
+        self.assertIs(self.window.video_grid.itemAtPosition(0, 0).widget(), self.window.previews[windowed[1]])
+
     def test_small_vertical_drag_keeps_the_current_position(self) -> None:
         self.drag(self.video(0), QPoint(0, -self.slack // 4 + 10))
         self.assertEqual(self.window.fullscreen_alignment(), "center")
@@ -187,6 +207,9 @@ class FullscreenAlignmentTest(unittest.TestCase):
     def test_cursor_hides_after_two_idle_seconds_in_fullscreen_and_returns_on_movement(self) -> None:
         self.assertTrue(self.window.cursor_timer.isActive())
         self.assertEqual(self.window.cursor_timer.interval(), CURSOR_POLL_MS)
+        self.window.cursor_timer.stop()
+        self.window.cursor_idle_ms = 0
+        self.window.show_cursor()
         idle_ticks = CURSOR_HIDE_DELAY_MS // CURSOR_POLL_MS
         with patch("app.QCursor.pos", return_value=self.window.cursor_position):
             for _ in range(idle_ticks - 1):

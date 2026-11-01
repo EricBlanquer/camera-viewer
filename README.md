@@ -105,6 +105,8 @@ This configuration service is not encrypted, even on cameras with TLS video: the
 Camera videos appear without names, title bars, borders, or gaps between their panes.
 Embedded video players synchronize with their pane size after mapping and resizing, while preserving the selected zoom and pan.
 With multiple cameras displayed, drag one video onto another with the left mouse button to exchange their positions; the order is remembered without restarting either stream.
+Full screen keeps its own order, starting from the windowed one: exchanging videos in full screen leaves the windowed arrangement unchanged, and each mode shows its own arrangement when the window enters or leaves full screen.
+A camera profile applied in full screen sets the full-screen order.
 The same gesture works during playback.
 Use the right mouse button to drag the zoomed image or move a supported camera while multiple cameras are displayed.
 The camera panes share the available space equally in a side-by-side layout.

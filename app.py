@@ -151,6 +151,7 @@ CAMERA_VISIBLE_SETTING = "view/camera_visible"
 NO_VISIBLE_CAMERAS_MESSAGE = "No cameras selected."
 MULTIVIEW_LAYOUT_SETTING = "view/camera_layout"
 CAMERA_ORDER_SETTING = "view/camera_order"
+CAMERA_FULLSCREEN_ORDER_SETTING = "view/camera_order_fullscreen"
 CAMERA_PROFILES_SETTING = "view/camera_profiles"
 CAMERA_PROFILE_NAME_LIMIT = 60
 CAMERA_PROFILE_NAME_MESSAGE = "Enter a profile name."
@@ -6862,6 +6863,7 @@ class MainWindow(QMainWindow):
         self.solo_uid: str | None = None
         self.solo_fullscreen = False
         self.fullscreen_mosaic = False
+        self.placed_order: tuple[str, ...] = ()
         self.video_grid = QGridLayout()
         self.video_grid.setContentsMargins(0, 0, 0, 0)
         self.video_grid.setSpacing(0)
@@ -7138,7 +7140,7 @@ class MainWindow(QMainWindow):
     def apply_camera_profile(self, profile: CameraProfile) -> None:
         cameras, layout = self.camera_profile_view(profile)
         order = [*cameras, *(camera.uid for camera in self.ordered_devices() if camera.uid not in cameras)]
-        self.settings.setValue(CAMERA_ORDER_SETTING, json.dumps(order))
+        self.settings.setValue(self.camera_order_setting(), json.dumps(order))
         self.settings.setValue(MULTIVIEW_LAYOUT_SETTING, layout)
         self.apply_camera_visibility({camera.uid: camera.uid in cameras for camera in self.devices})
 
@@ -7854,9 +7856,15 @@ class MainWindow(QMainWindow):
         if region != self.mask():
             self.setMask(region)
 
+    def camera_order_setting(self) -> str:
+        return CAMERA_FULLSCREEN_ORDER_SETTING if self.isFullScreen() else CAMERA_ORDER_SETTING
+
     def ordered_devices(self) -> list[AccountDevice | RtspCamera]:
+        key = self.camera_order_setting()
+        if not self.settings.contains(key):
+            key = CAMERA_ORDER_SETTING
         try:
-            saved = json.loads(self.settings.value(CAMERA_ORDER_SETTING, "[]", str))
+            saved = json.loads(self.settings.value(key, "[]", str))
         except (ValueError, TypeError):
             saved = []
         order = {uid: index for index, uid in enumerate(saved) if isinstance(uid, str)} if isinstance(saved, list) else {}
@@ -7869,7 +7877,7 @@ class MainWindow(QMainWindow):
         source_index = order.index(source_uid)
         target_index = order.index(target_uid)
         order[source_index], order[target_index] = order[target_index], order[source_index]
-        self.settings.setValue(CAMERA_ORDER_SETTING, json.dumps(order))
+        self.settings.setValue(self.camera_order_setting(), json.dumps(order))
         self.settings.sync()
         self.sync_previews()
 
@@ -7968,6 +7976,7 @@ class MainWindow(QMainWindow):
         self.corner_overlay.set_view(len(visible) > 1, selected is not None and selected.uid == self.solo_uid)
         for replay in self.local_replays.values():
             replay.video.reorder_enabled = self.video.reorder_enabled
+        self.placed_order = tuple(camera.uid for camera in visible)
         cameras = [camera for camera in visible if selected is None or camera.uid != selected.uid]
         layout = self.effective_camera_layout()
         changed = len(cameras) != len(self.previews) or layout != self.preview_layout
@@ -9232,7 +9241,8 @@ class MainWindow(QMainWindow):
                    and self.effective_camera_layout() == "grid"
                    and len(self.displayed_devices()) == len(self.visible_devices())
                    and mosaic_grid(len(self.visible_devices()), geometry.width(), geometry.height()) is not None)
-        if desired != self.fullscreen_mosaic:
+        order = tuple(camera.uid for camera in self.visible_devices())
+        if desired != self.fullscreen_mosaic or order != self.placed_order:
             self.fullscreen_mosaic = desired
             self.sync_previews()
 
