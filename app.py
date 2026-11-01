@@ -318,6 +318,9 @@ VIDEO_ASPECT_WIDTH = 16
 VIDEO_ASPECT_HEIGHT = 9
 NET_FRAME_EXTENTS_ATOM = "_NET_FRAME_EXTENTS"
 NET_WM_STATE_ATOM = "_NET_WM_STATE"
+NET_CURRENT_DESKTOP_ATOM = "_NET_CURRENT_DESKTOP"
+GTK_WORKAREAS_ATOM_PREFIX = "_GTK_WORKAREAS_D"
+POINTER_BUTTON_MASK = X11.Button1Mask | X11.Button2Mask | X11.Button3Mask
 NET_WM_STATE_MAXIMIZED_VERT_ATOM = "_NET_WM_STATE_MAXIMIZED_VERT"
 NET_WM_STATE_MAXIMIZED_HORZ_ATOM = "_NET_WM_STATE_MAXIMIZED_HORZ"
 NET_MOVERESIZE_WINDOW_ATOM = "_NET_MOVERESIZE_WINDOW"
@@ -535,6 +538,9 @@ class X11WindowHints:
         self.window = self.x_display.create_resource_object("window", int(window.winId()))
         self.normal_hints_atom = self.x_display.intern_atom("WM_NORMAL_HINTS")
         self.frame_extents_atom = self.x_display.intern_atom(NET_FRAME_EXTENTS_ATOM)
+        self.state_atom = self.x_display.intern_atom(NET_WM_STATE_ATOM)
+        self.maximized_atoms = {self.x_display.intern_atom(NET_WM_STATE_MAXIMIZED_VERT_ATOM),
+                                self.x_display.intern_atom(NET_WM_STATE_MAXIMIZED_HORZ_ATOM)}
         self.window.change_attributes(event_mask=X11.StructureNotifyMask | X11.PropertyChangeMask)
         self.notifier = QSocketNotifier(self.x_display.fileno(), QSocketNotifier.Type.Read, window)
         self.notifier.activated.connect(self.process_events)
@@ -543,10 +549,31 @@ class X11WindowHints:
     def process_events(self) -> None:
         while self.x_display.pending_events():
             event = self.x_display.next_event()
-            if event.type == X11.PropertyNotify and event.atom == self.normal_hints_atom:
+            if event.type != X11.PropertyNotify:
+                continue
+            if event.atom in (self.normal_hints_atom, self.state_atom):
                 self.apply_aspect_ratio()
-            elif event.type == X11.PropertyNotify and event.atom == self.frame_extents_atom:
+            if event.atom in (self.frame_extents_atom, self.state_atom):
                 self.frame_changed()
+
+    def pointer_pressed(self) -> bool:
+        return bool(self.x_display.screen().root.query_pointer().mask & POINTER_BUTTON_MASK)
+
+    def sized_by_window_manager(self) -> bool:
+        state = self.window.get_full_property(self.state_atom, Xatom.ATOM)
+        return state is not None and not self.maximized_atoms.isdisjoint(state.value)
+
+    def work_areas(self) -> list[QRect]:
+        root = self.x_display.screen().root
+        desktop = root.get_full_property(self.x_display.intern_atom(NET_CURRENT_DESKTOP_ATOM), Xatom.CARDINAL)
+        if desktop is None or not len(desktop.value):
+            return []
+        areas = root.get_full_property(self.x_display.intern_atom(f"{GTK_WORKAREAS_ATOM_PREFIX}{desktop.value[0]}"),
+                                       Xatom.CARDINAL)
+        if areas is None:
+            return []
+        values = list(areas.value)
+        return [QRect(*values[index:index + 4]) for index in range(0, len(values) - 3, 4)]
 
     def frame_margins(self) -> QMargins | None:
         extents = self.window.get_full_property(self.frame_extents_atom, Xatom.CARDINAL)
@@ -575,19 +602,19 @@ class X11WindowHints:
     def apply_aspect_ratio(self) -> None:
         hints = self.window.get_wm_normal_hints()
         aspect = {"num": self.aspect_width, "denum": self.aspect_height}
-        if hints is None:
-            fields = {"flags": 0}
+        constrained = not self.sized_by_window_manager()
+        has_aspect = hints is not None and bool(hints.flags & Xutil.PAspect)
+        if not constrained and not has_aspect:
+            return
+        if constrained and has_aspect and hints.min_aspect == aspect and hints.max_aspect == aspect:
+            return
+        fields = {"flags": 0} if hints is None else {field: getattr(hints, field) for field in WM_NORMAL_HINTS_FIELDS}
+        if constrained:
+            fields["flags"] |= Xutil.PAspect
+            fields["min_aspect"] = aspect
+            fields["max_aspect"] = aspect
         else:
-            fields = {field: getattr(hints, field) for field in WM_NORMAL_HINTS_FIELDS}
-            if (
-                hints.flags & Xutil.PAspect
-                and hints.min_aspect == aspect
-                and hints.max_aspect == aspect
-            ):
-                return
-        fields["flags"] |= Xutil.PAspect
-        fields["min_aspect"] = aspect
-        fields["max_aspect"] = aspect
+            fields["flags"] &= ~Xutil.PAspect
         self.window.set_wm_normal_hints(fields)
         self.x_display.flush()
 
@@ -7175,20 +7202,36 @@ class MainWindow(QMainWindow):
         margins = self.window_hints.frame_margins() if self.window_hints is not None else None
         return self.frameGeometry() if margins is None else self.geometry().marginsAdded(margins)
 
+    def available_area(self) -> QRect:
+        frame = self.window_frame()
+        areas = self.window_hints.work_areas() if self.window_hints is not None else []
+        overlaps = [(overlap.width() * overlap.height(), area) for area in areas
+                    if not (overlap := area.intersected(frame)).isEmpty()]
+        if overlaps:
+            return max(overlaps, key=lambda item: item[0])[1]
+        return (self.screen() or QApplication.primaryScreen()).availableGeometry()
+
     def window_docked(self) -> bool:
         if self.isFullScreen() or self.isMinimized() or not self.isVisible():
             return False
         if self.isMaximized():
             return True
-        available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        available = self.available_area()
         frame = self.window_frame()
         if self.dock_fit is not None and rects_close(frame, self.dock_fit):
             return True
         return (docked_span(frame.left(), frame.width(), available.left(), available.width())
                 and docked_span(frame.top(), frame.height(), available.top(), available.height()))
 
+    def window_being_arranged(self) -> bool:
+        return (QApplication.queryKeyboardModifiers() != Qt.KeyboardModifier.NoModifier
+                or (self.window_hints is not None and self.window_hints.pointer_pressed()))
+
     def fit_docked_window(self) -> None:
         if not self.window_docked() or self.isMaximized() or not self.visible_devices():
+            return
+        if self.window_being_arranged():
+            self.dock_fit_timer.start()
             return
         columns, rows = self.camera_grid_dimensions()
         area = self.centralWidget().size()
@@ -7203,7 +7246,7 @@ class MainWindow(QMainWindow):
         margins = QMargins(client.left() - frame.left(), client.top() - frame.top(),
                            frame.right() - client.right(), frame.bottom() - client.bottom())
         fitted = QRect(frame.topLeft(), size.grownBy(margins))
-        available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        available = self.available_area()
         if abs(frame.left() - available.left()) > DOCK_TOLERANCE_PX:
             fitted.moveRight(frame.right())
         if abs(frame.top() - available.top()) > DOCK_TOLERANCE_PX:
@@ -7227,9 +7270,8 @@ class MainWindow(QMainWindow):
         docked = self.window_docked()
         if docked != self.docked_logged:
             self.docked_logged = docked
-            LOG.info("Window %s: frame %s, screen %s %s.", "docked" if docked else "undocked",
-                     self.window_frame().getRect(), (self.screen() or QApplication.primaryScreen()).name(),
-                     (self.screen() or QApplication.primaryScreen()).availableGeometry().getRect())
+            LOG.info("Window %s: frame %s, work area %s.", "docked" if docked else "undocked",
+                     self.window_frame().getRect(), self.available_area().getRect())
         for frame in self.findChildren(AspectVideoFrame):
             frame.set_fill(docked)
 
@@ -8021,8 +8063,7 @@ class MainWindow(QMainWindow):
         preferred = self.camera_layout()
         if preferred == "grid" or not self.isVisible() or len(self.visible_devices()) < 2:
             return preferred
-        screen = self.screen() or QApplication.primaryScreen()
-        available = screen.availableGeometry()
+        available = self.available_area()
         if self.width() >= available.width() * 0.85 and self.width() > self.height() * 1.5:
             return "horizontal"
         if self.height() >= available.height() * 0.85 and self.height() > self.width() * 0.8:

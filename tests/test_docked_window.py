@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PyQt6.QtCore import QMargins, QRect, QSettings
+from PyQt6.QtCore import QMargins, QRect, QSettings, Qt
 from PyQt6.QtWidgets import QApplication, QWidget
 
 from app import AspectVideoFrame, CameraPreview, MainWindow, RtspCamera, compute_mosaic, docked_span, mosaic_grid
@@ -166,7 +166,7 @@ class DockedWindowTest(unittest.TestCase):
     def test_the_window_manager_frame_decides_the_docked_state(self) -> None:
         area = self.window.screen().availableGeometry()
         margins = QMargins(0, 32, 0, 0)
-        self.window.window_hints = SimpleNamespace(frame_margins=lambda: margins, close=lambda: None)
+        self.window.window_hints = SimpleNamespace(frame_margins=lambda: margins, work_areas=lambda: [], close=lambda: None)
         self.window.setGeometry(area.marginsRemoved(margins))
         self.settle()
         self.window.refresh_window_shape()
@@ -177,6 +177,19 @@ class DockedWindowTest(unittest.TestCase):
         self.assertFalse(self.window.window_docked())
         self.assertFalse(any(self.fills()))
 
+    def test_the_work_area_of_the_window_monitor_decides_the_docked_state(self) -> None:
+        screen = self.window.screen().availableGeometry()
+        work = screen.adjusted(0, 0, 0, -28)
+        self.window.window_hints = SimpleNamespace(frame_margins=lambda: None, work_areas=lambda: [work],
+                                                   close=lambda: None)
+        frame = self.window.frameGeometry().size() - self.window.size()
+        self.window.setGeometry(work.left(), work.top(), work.width() - frame.width(), work.height() - frame.height())
+        self.settle()
+        self.assertTrue(self.window.window_docked())
+        self.window.window_hints = SimpleNamespace(frame_margins=lambda: None, work_areas=lambda: [],
+                                                   close=lambda: None)
+        self.assertFalse(self.window.window_docked())
+
     def test_a_dock_without_a_filled_layout_shrinks_to_its_videos_and_stays_docked(self) -> None:
         area = self.window.screen().availableGeometry()
         frame = self.window.frameGeometry().size() - self.window.size()
@@ -184,6 +197,12 @@ class DockedWindowTest(unittest.TestCase):
         self.settle()
         docked = self.order()
         with patch.object(self.window, "current_mosaic", return_value=None):
+            tiled = self.window.size()
+            with patch("app.QApplication.queryKeyboardModifiers", return_value=Qt.KeyboardModifier.MetaModifier):
+                self.window.fit_docked_window()
+                self.settle()
+            self.assertEqual(self.window.size(), tiled)
+            self.assertTrue(self.window.dock_fit_timer.isActive())
             self.window.fit_docked_window()
             self.settle()
             columns, rows = self.window.camera_grid_dimensions()
