@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
-from icam365 import NativeBridge
+from icam365 import NativeBridge, StreamHead
 
 
 FRAME_COUNT = 48
@@ -35,6 +35,7 @@ class NativeMuxerClockTest(unittest.TestCase):
             bridge.video_queue = queue.Queue(maxsize=128)
             bridge.audio_queue = queue.Queue(maxsize=512)
             bridge.subscriber_lock = threading.Lock()
+            bridge.stream_head = StreamHead()
             output = queue.Queue()
             bridge.subscribers = {output}
             threads = bridge._start_muxer()

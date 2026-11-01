@@ -119,7 +119,7 @@ class V380RelayTest(unittest.TestCase):
 
 
 class V380StallTest(unittest.TestCase):
-    def test_audio_without_video_is_reported_as_a_stall(self) -> None:
+    def run_bridge(self, start_type: int) -> str | None:
         class Session:
             width = height = ticket = 0
             version = v380.ENCRYPTED_VERSION
@@ -135,7 +135,7 @@ class V380StallTest(unittest.TestCase):
 
             def frames(self):
                 for _ in range(40):
-                    yield v380.AUDIO_TYPES[0], bytes(v380.MEDIA_HEADER_SIZE + 8)
+                    yield start_type, bytes(v380.MEDIA_HEADER_SIZE + 8)
 
             def close(self) -> None:
                 pass
@@ -155,7 +155,13 @@ class V380StallTest(unittest.TestCase):
         with patch.object(v380, "V380Session", Session), patch.object(bridge, "_start_muxer", return_value=[]), \
                 patch.object(v380.time, "monotonic", lambda: next(clock)):
             bridge._run()
-        self.assertEqual(bridge.error, "The V380 native stream stopped producing video.")
+        return bridge.error
+
+    def test_audio_without_video_is_reported_as_a_stall(self) -> None:
+        self.assertEqual(self.run_bridge(v380.AUDIO_TYPES[0]), "The V380 native stream stopped producing video.")
+
+    def test_video_before_the_first_keyframe_keeps_the_stream_alive(self) -> None:
+        self.assertIsNone(self.run_bridge(0x29))
 
 
 class V380ContinuousLensTest(unittest.TestCase):

@@ -606,12 +606,12 @@ class NativeBridge:
                 if start_type in AUDIO_TYPES:
                     self.audio_queue.put(payload, timeout=1)
                     continue
+                last_video = time.monotonic()
                 if not first_keyframe:
                     if not _has_parameter_set(payload):
                         continue
                     first_keyframe = True
                 self.video_queue.put(payload, timeout=1)
-                last_video = time.monotonic()
         except (OSError, ValueError, queue.Full) as ex:
             if not self.stopped.is_set():
                 self.error = str(ex) if isinstance(ex, OSError) else "The V380 native stream disconnected."
