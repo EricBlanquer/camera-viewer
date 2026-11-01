@@ -6891,6 +6891,7 @@ class MainWindow(QMainWindow):
         self.camera_mask_timer.setSingleShot(True)
         self.camera_mask_timer.timeout.connect(self.update_camera_mask)
         self.dock_fit: QRect | None = None
+        self.docked_logged = False
         self.dock_fit_timer = QTimer(self)
         self.dock_fit_timer.setSingleShot(True)
         self.dock_fit_timer.setInterval(DOCK_FIT_DELAY_MS)
@@ -7224,6 +7225,11 @@ class MainWindow(QMainWindow):
 
     def apply_video_fill(self) -> None:
         docked = self.window_docked()
+        if docked != self.docked_logged:
+            self.docked_logged = docked
+            LOG.info("Window %s: frame %s, screen %s %s.", "docked" if docked else "undocked",
+                     self.window_frame().getRect(), (self.screen() or QApplication.primaryScreen()).name(),
+                     (self.screen() or QApplication.primaryScreen()).availableGeometry().getRect())
         for frame in self.findChildren(AspectVideoFrame):
             frame.set_fill(docked)
 
