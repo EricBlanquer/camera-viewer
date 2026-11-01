@@ -1864,8 +1864,17 @@ class ControlsOverlay(QWidget):
         active = QApplication.activeWindow()
         active_tool = (active is not None and active.parentWidget() is not None
                        and active.windowType() == Qt.WindowType.Tool and active.parentWidget().window() is owner)
-        super().setVisible(self.requested_visible and self.parentWidget().isVisible() and owner.isVisible()
-                           and (owner.isActiveWindow() or active_tool) and not owner.isMinimized())
+        visible = (self.requested_visible and self.parentWidget().isVisible() and owner.isVisible()
+                   and (owner.isActiveWindow() or active_tool) and not owner.isMinimized())
+        if visible:
+            self.follow_owner_window(owner)
+        super().setVisible(visible)
+
+    def follow_owner_window(self, owner: QWidget) -> None:
+        handle = self.windowHandle()
+        owner_handle = owner.windowHandle()
+        if handle is not None and owner_handle is not None and handle.transientParent() is not owner_handle:
+            handle.setTransientParent(owner_handle)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is self.owner_window or watched is self.parentWidget():

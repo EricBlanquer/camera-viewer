@@ -257,7 +257,8 @@ For O-KAM cameras, **Preset 1** through **Preset 5** recall its saved positions.
 For O-KAM cameras, the correction button recalibrates the camera position and returns to the last recalled saved position.
 For compatible iCam365 cameras, **PTZ** offers the movements available through the connected transport: Up and Down over the local HTTP endpoint, or pan-and-tilt and saved positions over the native connection.
 
-The title bar provides the desktop's minimize, maximize, and close buttons, and the window remains available from the taskbar.
+The title bar provides the desktop's minimize, maximize, and close buttons, and the window remains available from the taskbar, whose button minimizes the active window and restores it.
+Video controls are attached to the main window, so minimizing it while they are shown hands the keyboard focus to another application.
 The application and desktop launcher share the `camera-viewer` identity so the taskbar uses the Camera Viewer icon.
 When the desktop provides a notification area, Camera Viewer also shows an icon there.
 Click the icon to show or hide the window, or open its menu for camera selection, layout, stream choice, standby, camera setup, recording, and local detection settings.
