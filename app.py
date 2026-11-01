@@ -153,6 +153,7 @@ NO_VISIBLE_CAMERAS_MESSAGE = "No cameras selected."
 MULTIVIEW_LAYOUT_SETTING = "view/camera_layout"
 CAMERA_ORDER_SETTING = "view/camera_order"
 CAMERA_FULLSCREEN_ORDER_SETTING = "view/camera_order_fullscreen"
+CAMERA_DOCKED_ORDER_SETTING = "view/camera_order_docked"
 CAMERA_PROFILES_SETTING = "view/camera_profiles"
 CAMERA_PROFILE_NAME_LIMIT = 60
 CAMERA_PROFILE_NAME_MESSAGE = "Enter a profile name."
@@ -1103,6 +1104,9 @@ MOSAIC_TILE_ASPECT = VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT
 MOSAIC_MAX_CAMERAS = 12
 MOSAIC_MAX_CELLS = 12
 MOSAIC_MIN_COVERAGE = 0.9
+DOCK_TOLERANCE_PX = 8
+MOSAIC_ASPECT_TOLERANCE = 0.15
+DOCK_FRACTIONS = (0.5, 1.0)
 
 
 @functools.lru_cache(maxsize=None)
@@ -1161,24 +1165,64 @@ _MOSAIC_CACHE: dict[tuple[int, float], tuple[int, list[tuple[int, int, int, int]
 _MOSAIC_LOCK = threading.Lock()
 
 
-def mosaic_grid(count: int, width: int, height: int) -> tuple[int, list[tuple[int, int, int, int]]] | None:
+def docked_span(start: int, length: int, area_start: int, area_length: int) -> bool:
+    touches = (abs(start - area_start) <= DOCK_TOLERANCE_PX
+               or abs(start + length - area_start - area_length) <= DOCK_TOLERANCE_PX)
+    return touches and any(abs(length - area_length * fraction) <= DOCK_TOLERANCE_PX for fraction in DOCK_FRACTIONS)
+
+
+MOSAIC_ASPECTS = tuple(sorted({round(MOSAIC_TILE_ASPECT * wide / tall, 2) for wide in range(1, 4) for tall in range(1, 4)}))
+
+
+def mosaic_key(count: int, width: int, height: int) -> tuple[int, float]:
+    return count, round(width / height, 2)
+
+
+def mosaic_aspects(width: int, height: int, tolerant: bool = False) -> list[float]:
+    aspect = round(width / height, 2)
+    if not tolerant:
+        return [aspect]
+    nearby = sorted((candidate for candidate in MOSAIC_ASPECTS
+                     if candidate != aspect and abs(math.log(candidate / aspect)) <= math.log1p(MOSAIC_ASPECT_TOLERANCE)),
+                    key=lambda candidate: abs(math.log(candidate / aspect)))
+    return [aspect, *nearby]
+
+
+def mosaic_computed(count: int, width: int, height: int, tolerant: bool = False) -> bool:
+    if width <= 0 or height <= 0:
+        return True
+    with _MOSAIC_LOCK:
+        return all((count, aspect) in _MOSAIC_CACHE for aspect in mosaic_aspects(width, height, tolerant))
+
+
+def compute_mosaic(count: int, width: int, height: int, tolerant: bool = False) -> None:
+    if width <= 0 or height <= 0:
+        return
+    for aspect in mosaic_aspects(width, height, tolerant):
+        with _MOSAIC_LOCK:
+            if (count, aspect) in _MOSAIC_CACHE:
+                continue
+        result = _compute_mosaic_grid(count, aspect)
+        with _MOSAIC_LOCK:
+            _MOSAIC_CACHE[(count, aspect)] = result
+
+
+def mosaic_grid(
+    count: int, width: int, height: int, tolerant: bool = False,
+) -> tuple[int, list[tuple[int, int, int, int]]] | None:
     """A square cell grid and one (row, col, rowspan, colspan) span per tile that fills the screen
     with varied 16:9 sizes, read from the cache that precompute_mosaics fills in the background;
     returns None (uniform grid) when the layout is not yet computed or has no clean fill."""
     if width <= 0 or height <= 0:
         return None
     with _MOSAIC_LOCK:
-        return _MOSAIC_CACHE.get((count, round(width / height, 2)))
+        return next((grid for aspect in mosaic_aspects(width, height, tolerant)
+                     if (grid := _MOSAIC_CACHE.get((count, aspect))) is not None), None)
 
 
 def precompute_mosaics(width: int, height: int, counts: range = range(2, 10)) -> None:
-    if width <= 0 or height <= 0:
-        return
-    aspect = round(width / height, 2)
     for count in counts:
-        result = _compute_mosaic_grid(count, aspect)
-        with _MOSAIC_LOCK:
-            _MOSAIC_CACHE[(count, aspect)] = result
+        compute_mosaic(count, width, height)
 
 
 def camera_continuous_allowed(camera: AccountDevice | RtspCamera) -> bool:
@@ -6881,6 +6925,7 @@ class MainWindow(QMainWindow):
         self.solo_fullscreen = False
         self.fullscreen_mosaic = False
         self.placed_order: tuple[str, ...] = ()
+        self.mosaic_requests: set[tuple[int, float, bool]] = set()
         self.video_grid = QGridLayout()
         self.video_grid.setContentsMargins(0, 0, 0, 0)
         self.video_grid.setSpacing(0)
@@ -7025,6 +7070,35 @@ class MainWindow(QMainWindow):
     def _precompute_mosaics(self, width: int, height: int) -> None:
         precompute_mosaics(width, height)
         self.mosaics_ready.emit()
+
+    def _compute_requested_mosaic(self, count: int, width: int, height: int, tolerant: bool) -> None:
+        compute_mosaic(count, width, height, tolerant)
+        self.mosaics_ready.emit()
+
+    def request_mosaic(self, count: int, width: int, height: int, tolerant: bool) -> None:
+        key = (*mosaic_key(count, width, height), tolerant)
+        if key in self.mosaic_requests or mosaic_computed(count, width, height, tolerant):
+            return
+        self.mosaic_requests.add(key)
+        threading.Thread(target=self._compute_requested_mosaic, args=(count, width, height, tolerant),
+                         daemon=True).start()
+
+    def window_docked(self) -> bool:
+        if self.isFullScreen() or self.isMinimized() or not self.isVisible():
+            return False
+        if self.isMaximized():
+            return True
+        available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        frame = self.frameGeometry()
+        return (docked_span(frame.left(), frame.width(), available.left(), available.width())
+                and docked_span(frame.top(), frame.height(), available.top(), available.height()))
+
+    def mosaic_area(self) -> QSize | None:
+        if self.isFullScreen():
+            return (self.screen() or QApplication.primaryScreen()).geometry().size()
+        if self.window_docked():
+            return self.centralWidget().size()
+        return None
 
     def set_status(self, text: str) -> None:
         self.base_status = text
@@ -7830,10 +7904,10 @@ class MainWindow(QMainWindow):
                 or self.effective_camera_layout() != "grid"):
             return None
         displayed = self.displayed_devices()
-        if len(displayed) != len(self.visible_devices()):
+        area = self.mosaic_area()
+        if len(displayed) != len(self.visible_devices()) or area is None:
             return None
-        geometry = (self.screen() or QApplication.primaryScreen()).geometry()
-        return mosaic_grid(len(displayed), geometry.width(), geometry.height())
+        return mosaic_grid(len(displayed), area.width(), area.height(), not self.isFullScreen())
 
     def camera_grid_dimensions(self) -> tuple[int, int]:
         count = len(self.visible_devices())
@@ -7874,12 +7948,17 @@ class MainWindow(QMainWindow):
             self.setMask(region)
 
     def camera_order_setting(self) -> str:
-        return CAMERA_FULLSCREEN_ORDER_SETTING if self.isFullScreen() else CAMERA_ORDER_SETTING
+        if self.isFullScreen():
+            return CAMERA_FULLSCREEN_ORDER_SETTING
+        return CAMERA_DOCKED_ORDER_SETTING if self.window_docked() else CAMERA_ORDER_SETTING
 
     def ordered_devices(self) -> list[AccountDevice | RtspCamera]:
-        key = self.camera_order_setting()
-        if not self.settings.contains(key):
-            key = CAMERA_ORDER_SETTING
+        candidates = {
+            CAMERA_FULLSCREEN_ORDER_SETTING: (CAMERA_FULLSCREEN_ORDER_SETTING,),
+            CAMERA_DOCKED_ORDER_SETTING: (CAMERA_DOCKED_ORDER_SETTING, CAMERA_FULLSCREEN_ORDER_SETTING),
+            CAMERA_ORDER_SETTING: (),
+        }[self.camera_order_setting()]
+        key = next((key for key in candidates if self.settings.contains(key)), CAMERA_ORDER_SETTING)
         try:
             saved = json.loads(self.settings.value(key, "[]", str))
         except (ValueError, TypeError):
@@ -9226,7 +9305,7 @@ class MainWindow(QMainWindow):
             self.unsetCursor()
 
     def fit_video_aspect(self) -> None:
-        if self.isFullScreen():
+        if self.isFullScreen() or self.window_docked():
             return
         count = len(self.visible_devices())
         if not count:
@@ -9253,11 +9332,15 @@ class MainWindow(QMainWindow):
             self.camera_mask_timer.start(0)
 
     def update_fullscreen_mosaic(self) -> None:
-        geometry = (self.screen() or QApplication.primaryScreen()).geometry()
-        desired = (self.isFullScreen() and not self.isMinimized() and self.solo_uid is None
+        area = self.mosaic_area()
+        count = len(self.visible_devices())
+        tolerant = not self.isFullScreen()
+        if area is not None:
+            self.request_mosaic(count, area.width(), area.height(), tolerant)
+        desired = (area is not None and not self.isMinimized() and self.solo_uid is None
                    and self.effective_camera_layout() == "grid"
-                   and len(self.displayed_devices()) == len(self.visible_devices())
-                   and mosaic_grid(len(self.visible_devices()), geometry.width(), geometry.height()) is not None)
+                   and len(self.displayed_devices()) == count
+                   and mosaic_grid(count, area.width(), area.height(), tolerant) is not None)
         order = tuple(camera.uid for camera in self.visible_devices())
         if desired != self.fullscreen_mosaic or order != self.placed_order:
             self.fullscreen_mosaic = desired

@@ -82,6 +82,7 @@ With three cameras, the fourth cell stays empty; additional cameras extend the g
 Adjacent empty cells form one transparent area without separators.
 Full-screen view displays empty cells on a black background; leaving full screen restores their transparency.
 In full screen, the grid view arranges the cameras as a mosaic of different 16:9 sizes that fills a landscape screen with almost no black border; the first cameras in the order take the larger tiles, and camera counts without a clean fill keep the uniform grid.
+A window docked to the screen edges (half or quarter tile) or maximized uses the same mosaic, computed for its own video area; when that shape has no clean fill, the nearest standard shape within 15 % is used, and Camera Viewer no longer resizes the docked window.
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 Use **Camera profiles > Save current view...** to name the checked cameras, their order, and the camera layout.
 Choosing a saved profile restores that selection, order, and layout; the profile matching the current view is checked.
@@ -106,6 +107,7 @@ Camera videos appear without names, title bars, borders, or gaps between their p
 Embedded video players synchronize with their pane size after mapping and resizing, while preserving the selected zoom and pan.
 With multiple cameras displayed, drag one video onto another with the left mouse button to exchange their positions; the order is remembered without restarting either stream.
 Full screen keeps its own order, starting from the windowed one: exchanging videos in full screen leaves the windowed arrangement unchanged, and each mode shows its own arrangement when the window enters or leaves full screen.
+A docked window also keeps its own order, starting from the full-screen one.
 A camera profile applied in full screen sets the full-screen order.
 The same gesture works during playback.
 Use the right mouse button to drag the zoomed image or move a supported camera while multiple cameras are displayed.
