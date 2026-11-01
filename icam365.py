@@ -44,8 +44,13 @@ RECEIVE_POLL_SECONDS = 0.05
 STOP_ACK_TIMEOUT_SECONDS = 5
 CLOSE_NOTIFICATION_RETRIES = 2
 LIVE_AUDIO_CLOCK_FILTER = "aresample=async=1000"
+# These cameras send their parameter sets once, when the session opens, so a
+# player that connects later decodes slices it has no parameter sets for and
+# fails on every frame. dump_extra writes them in front of every keyframe,
+# which is what lets a reconnecting player decode at all, in hardware.
 LIVE_MEDIA_OUTPUT_OPTIONS = (
     "-max_interleave_delta", "100000", "-muxdelay", "0", "-muxpreload", "0",
+    "-bsf:v", "dump_extra=freq=keyframe",
     "-mpegts_flags", "resend_headers", "-flush_packets", "1", "-f", "mpegts", "pipe:1",
 )
 AAC_SAMPLE_RATE = 8000
@@ -110,6 +115,8 @@ AUDIO_LAG_SECONDS = 0.5
 AUDIO_PLACEMENT_SAMPLES = AAC_SAMPLE_RATE // 5
 AUDIO_PADDING_SAMPLES = 320
 TS_SYNC_BYTE = 0x47
+TS_PACKET_SIZE = 188
+TS_UNIT_START_FLAG = 0x40
 TS_PAYLOAD_SIZE = 184
 TS_PAT_PID = 0
 TS_PMT_PID = 0x1000
@@ -119,6 +126,10 @@ TS_HEVC_STREAM_TYPE = 0x24
 TS_VIDEO_STREAM_ID = 0xE0
 TS_CLOCK_RATE = 90000
 TS_START_SECONDS = 1
+TS_READ_PACKETS = 32
+# Two seconds of the largest stream these cameras send; a group of pictures is
+# one second, so a table always arrives well inside this.
+STREAM_HEAD_MAX_BYTES = 2 << 20
 MAX_PLAYBACK_BUFFER = 64 * 1024 * 1024
 MUXER_STOP_TIMEOUT = 3
 RECORDINGS_UNAVAILABLE_MESSAGE = "Unable to connect to the iCam365 camera recordings."
@@ -537,7 +548,12 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         subscriber: queue.Queue[bytes | None] = queue.Queue(maxsize=256)
+        head = getattr(bridge, "stream_head", None)
         with bridge.subscriber_lock:
+            # Snapshot and subscribe together: the broadcaster holds this same
+            # lock while it extends the head and feeds the queues, so the two
+            # halves of this client's stream join without a gap.
+            prologue = head.snapshot() if head is not None else b""
             bridge.subscribers.add(subscriber)
         try:
             self.connection.settimeout(3)
@@ -545,6 +561,9 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "video/mp2t")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
+            if prologue:
+                self.wfile.write(prologue)
+                self.wfile.flush()
             while not bridge.stopped.is_set() or not subscriber.empty():
                 try:
                     data = subscriber.get(timeout=1)
@@ -566,6 +585,7 @@ class StreamHandler(BaseHTTPRequestHandler):
 
 def start_media_server(owner):
     owner.stream_path = "/" + secrets.token_urlsafe(24)
+    owner.stream_head = StreamHead()
     server = ThreadingHTTPServer(("127.0.0.1", 0), StreamHandler)
     server.daemon_threads = True
     server.bridge = owner
@@ -634,13 +654,81 @@ def camera_features(payload: bytes) -> dict:
     return features
 
 
-def broadcast_media(process, stopped, subscribers, subscriber_lock) -> None:
+class StreamHead:
+    """Transport-stream bytes since the last program table.
+
+    A player that joins in the middle of a group of pictures receives slices
+    whose parameter sets it never saw. Its decoder then fails on every frame
+    until the next keyframe, and a hardware decoder that fails this way gives
+    up for the whole stream and drops the player back to software decoding.
+    Priming each new subscriber with the bytes since the last program table
+    starts every connection on a keyframe that carries its own parameter sets.
+
+    The buffer only ever grows from a table packet, so a snapshot taken while
+    holding the broadcaster's lock ends exactly where that subscriber's queue
+    begins, and the two join without a gap or a repeated byte.
+    """
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.aligned = False
+        self.primed = False
+        self.scanned = 0
+
+    def _discard(self) -> None:
+        self.data.clear()
+        self.aligned = False
+        self.primed = False
+        self.scanned = 0
+
+    def _align(self) -> None:
+        """Find a packet boundary, confirmed by the sync byte of the next one."""
+        for index in range(len(self.data) - TS_PACKET_SIZE):
+            if self.data[index] == TS_SYNC_BYTE and self.data[index + TS_PACKET_SIZE] == TS_SYNC_BYTE:
+                del self.data[:index]
+                self.aligned = True
+                self.scanned = 0
+                return
+        # Keep only what can still carry a boundary and its confirmation.
+        del self.data[:max(0, len(self.data) - 2 * TS_PACKET_SIZE)]
+
+    def feed(self, data: bytes) -> None:
+        self.data += data
+        if not self.aligned:
+            self._align()
+            if not self.aligned:
+                return
+        while self.scanned + TS_PACKET_SIZE <= len(self.data):
+            packet = self.scanned
+            if self.data[packet] != TS_SYNC_BYTE:
+                self._discard()
+                return
+            unit_start = self.data[packet + 1] & TS_UNIT_START_FLAG
+            pid = ((self.data[packet + 1] & 0x1F) << 8) | self.data[packet + 2]
+            if pid == TS_PAT_PID and unit_start:
+                del self.data[:packet]
+                self.primed = True
+                self.scanned = TS_PACKET_SIZE
+                continue
+            self.scanned = packet + TS_PACKET_SIZE
+        if len(self.data) > STREAM_HEAD_MAX_BYTES:
+            # No table in this much video means priming would feed a decoder
+            # the same orphaned slices it cannot decode, so offer nothing.
+            self._discard()
+
+    def snapshot(self) -> bytes:
+        return bytes(self.data) if self.aligned and self.primed else b""
+
+
+def broadcast_media(process, stopped, subscribers, subscriber_lock, head=None) -> None:
     try:
         while not stopped.is_set():
-            data = process.stdout.read(188 * 32)
+            data = process.stdout.read(TS_PACKET_SIZE * TS_READ_PACKETS)
             if not data:
                 break
             with subscriber_lock:
+                if head is not None:
+                    head.feed(data)
                 for subscriber in list(subscribers):
                     try:
                         subscriber.put_nowait(data)
@@ -705,7 +793,7 @@ class NativeBridge:
             self.stopped.set()
 
     def _broadcast(self) -> None:
-        broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock)
+        broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock, self.stream_head)
         self._muxer_failed()
 
     def _start_muxer(self) -> list[threading.Thread]:
@@ -1128,7 +1216,7 @@ class PlaybackStream:
 
     def _watch_muxer(self) -> None:
         if self.server is not None:
-            broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock)
+            broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock, self.stream_head)
         self.returncode = self.process.wait()
         if not self.input_ended:
             self._muxer_failed()

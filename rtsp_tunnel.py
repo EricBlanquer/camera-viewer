@@ -229,7 +229,7 @@ class LocalRtspMediaBridge:
         return self.tunnel.error or self.failure
 
     def _broadcast(self) -> None:
-        broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock)
+        broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock, self.stream_head)
         if not self.stopped.is_set():
             self.failure = "The local camera media stream stopped. Check the camera network or VPN."
             self.stopped.set()

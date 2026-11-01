@@ -82,8 +82,12 @@ LIGHT_COMMANDS = {
 LIVE_VIDEO_INPUT = ("-probesize", "500000", "-analyzeduration", "2000000", "-use_wallclock_as_timestamps", "1", "-f", "hevc")
 LIVE_AUDIO_INPUT = ("-use_wallclock_as_timestamps", "1", "-f", "alaw", "-ar", "8000", "-ac", "1")
 LIVE_AUDIO_CLOCK_FILTER = "aresample=async=1000"
+# Same reason as the iCam365 bridge: a player that joins after the parameter
+# sets went by cannot decode a single frame, so write them before every
+# keyframe instead of once per session.
 LIVE_MEDIA_OUTPUT_OPTIONS = (
     "-max_interleave_delta", "100000", "-muxdelay", "0", "-muxpreload", "0",
+    "-bsf:v", "dump_extra=freq=keyframe",
     "-mpegts_flags", "resend_headers", "-flush_packets", "1", "-f", "mpegts", "pipe:1",
 )
 AAC_SAMPLE_RATE = 8000
@@ -543,7 +547,7 @@ class NativeBridge:
             self.stopped.set()
 
     def _broadcast(self) -> None:
-        broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock)
+        broadcast_media(self.process, self.stopped, self.subscribers, self.subscriber_lock, self.stream_head)
         self._muxer_failed()
 
     def _start_muxer(self) -> list[threading.Thread]:
