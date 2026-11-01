@@ -70,6 +70,7 @@ Use the account's submenu under **Cameras** to edit its region or recording choi
 Privacy mode is preserved: a masked camera displays its state and does not open a video connection.
 Use **Refresh camera list** after changing privacy mode in Imou Life or adding a camera.
 The **Cameras** submenu lists O-KAM cameras by account and RTSP, Imou, or configured native iCam365 cameras by name and source.
+The camera menus list cameras alphabetically, ignoring accents and case and ordering numbers naturally; the video arrangement keeps its own order.
 Each checkbox independently shows or hides its camera, and the choice is remembered across application restarts.
 Checked cameras appear together in a grid; all cameras are checked by default.
 Unchecking a camera stops its live connection, local recording, and local detection, while the other checked feeds continue.

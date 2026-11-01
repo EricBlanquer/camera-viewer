@@ -13,6 +13,7 @@ import math
 import os
 import queue
 import re
+import unicodedata
 import select
 import shutil
 import signal
@@ -1163,6 +1164,11 @@ def _compute_mosaic_grid(count: int, aspect: float) -> tuple[int, list[tuple[int
 
 _MOSAIC_CACHE: dict[tuple[int, float], tuple[int, list[tuple[int, int, int, int]]] | None] = {}
 _MOSAIC_LOCK = threading.Lock()
+
+
+def camera_sort_key(camera: AccountDevice | RtspCamera) -> tuple[tuple[str | int, ...], str]:
+    name = unicodedata.normalize("NFKD", camera.name).encode("ascii", "ignore").decode().casefold()
+    return tuple(int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)), camera.uid
 
 
 def docked_span(start: int, length: int, area_start: int, area_length: int) -> bool:
@@ -7235,9 +7241,12 @@ class MainWindow(QMainWindow):
         self.settings.setValue(MULTIVIEW_LAYOUT_SETTING, layout)
         self.apply_camera_visibility({camera.uid: camera.uid in cameras for camera in self.devices})
 
+    def menu_devices(self) -> list[AccountDevice | RtspCamera]:
+        return sorted(self.devices, key=camera_sort_key)
+
     def update_cameras_menu(self) -> None:
         self.cameras_menu.clear()
-        for device in self.ordered_devices():
+        for device in self.menu_devices():
             username = self.device_accounts[device.uid]
             if isinstance(device, RtspCamera):
                 source = "Imou Life (local)" if device.provider == IMOU_PROVIDER else "RTSP (local)"
@@ -7465,7 +7474,7 @@ class MainWindow(QMainWindow):
 
     def update_secondary_stream_menu(self) -> None:
         self.secondary_stream_menu.clear()
-        cameras = [camera for camera in self.ordered_devices() if vendor_connection_available(camera)]
+        cameras = [camera for camera in self.menu_devices() if vendor_connection_available(camera)]
         for camera in cameras:
             action = self.secondary_stream_menu.addAction(camera.name)
             action.setCheckable(True)
@@ -7488,7 +7497,7 @@ class MainWindow(QMainWindow):
 
     def update_night_vision_menu(self) -> None:
         self.night_vision_menu.clear()
-        cameras = [camera for camera in self.ordered_devices() if night_vision_target(camera) is not None]
+        cameras = [camera for camera in self.menu_devices() if night_vision_target(camera) is not None]
         for camera in cameras:
             schedule = night_vision_schedule(self.settings, camera.uid)
             label = camera.name if schedule is None else f"{camera.name} · {night_vision_label(schedule)}"
@@ -7647,7 +7656,7 @@ class MainWindow(QMainWindow):
 
     def update_local_detection_menu(self) -> None:
         self.local_detection_menu.clear()
-        for camera in self.ordered_devices():
+        for camera in self.menu_devices():
             action = self.local_detection_menu.addAction(camera.name)
             action.setCheckable(True)
             action.setChecked(self.camera_local_detection_enabled(camera.uid))

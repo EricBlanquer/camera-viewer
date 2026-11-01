@@ -43,7 +43,8 @@ class CameraVisibilityTest(unittest.TestCase):
 
     def camera_actions(self):
         self.window.update_cameras_menu()
-        return self.window.cameras_menu.actions()[:2]
+        actions = {action.text().split(" · ")[0]: action for action in self.window.cameras_menu.actions()}
+        return [actions[self.first.name], actions[self.second.name]]
 
     def test_checking_second_camera_keeps_first_checked_and_running(self) -> None:
         self.settings.setValue("view/show_all_cameras", False)

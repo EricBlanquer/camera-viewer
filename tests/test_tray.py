@@ -126,16 +126,16 @@ class TrayTest(unittest.TestCase):
         self.window.update_cameras_menu()
         actions = self.window.cameras_menu.actions()
         self.assertEqual([action.text() for action in actions[:2]], [
-            "Jardin · O-KAM (first@example.com)",
             "Entrée · O-KAM (second@example.com)",
+            "Jardin · O-KAM (first@example.com)",
         ])
         self.assertTrue(actions[0].isChecked())
         self.assertTrue(actions[1].isChecked())
         chosen: list[tuple[str, bool]] = []
         self.window.set_camera_visible = lambda uid, enabled: chosen.append((uid, enabled))
-        actions[1].trigger()
+        actions[0].trigger()
         self.assertEqual(chosen, [("entrance", False)])
-        self.assertTrue(actions[0].isChecked())
+        self.assertTrue(actions[1].isChecked())
 
     def test_selected_camera_survives_account_refresh(self) -> None:
         with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:
@@ -167,11 +167,11 @@ class TrayTest(unittest.TestCase):
             self.window.selected_device = garden
             self.window.update_cameras_menu()
             actions = self.window.cameras_menu.actions()
-            self.assertEqual(actions[0].text(), "Jardin · O-KAM (first@example.com)")
-            self.assertEqual(actions[1].text(), "Entrée · RTSP (local)")
+            self.assertEqual(actions[0].text(), "Entrée · RTSP (local)")
+            self.assertEqual(actions[1].text(), "Jardin · O-KAM (first@example.com)")
             chosen: list[tuple[str, bool]] = []
             self.window.set_camera_visible = lambda uid, enabled: chosen.append((uid, enabled))
-            actions[1].trigger()
+            actions[0].trigger()
             self.assertEqual(chosen, [(camera.uid, False)])
             self.window.accounts = []
             with patch.object(self.window, "watch_live"):
@@ -852,7 +852,7 @@ class TrayTest(unittest.TestCase):
         with patch("app.load_icam365_config", side_effect=lambda uid: object() if uid == entrance.uid else None):
             self.window.update_secondary_stream_menu()
         actions = {action.text(): action for action in self.window.secondary_stream_menu.actions()}
-        self.assertEqual(list(actions), ["Jardin", "Entrée", "Cuisine"])
+        self.assertEqual(list(actions), ["Cuisine", "Entrée", "Jardin"])
         self.assertFalse(actions["Entrée"].isChecked())
         self.assertTrue(self.window.previews[entrance.uid].main_stream)
         actions["Entrée"].setChecked(True)
