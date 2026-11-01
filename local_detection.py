@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from hardware import hardware_encode_device
+from hardware import hardware_decode_device, hardware_encode_device
 
 
 LOG = logging.getLogger("okam-linux.local_detection")
@@ -34,6 +34,9 @@ SCORE_THRESHOLD = 0.55
 SAMPLE_WIDTH = 640
 SAMPLE_HEIGHT = 360
 SAMPLE_BYTES = SAMPLE_WIDTH * SAMPLE_HEIGHT * 3
+SAMPLE_FILTER = f"scale={SAMPLE_WIDTH}:{SAMPLE_HEIGHT}:flags=fast_bilinear"
+DECODE_DOWNLOAD_FILTER = "hwdownload,format=nv12"
+STACKED_DECODE_DOWNLOAD_FILTER = f"{DECODE_DOWNLOAD_FILTER},format=yuv420p"
 MOTION_BLUR_SIZE = 5
 MOTION_PIXEL_THRESHOLD = 15
 MOTION_AREA_THRESHOLD = 0.002
@@ -985,10 +988,35 @@ def _grid_offset(cells: int, size: str) -> str:
     return "+".join([size] * cells) or "0"
 
 
-def detection_video_filter(stacked_lenses: int) -> str:
-    scale = f"scale={SAMPLE_WIDTH}:{SAMPLE_HEIGHT}:flags=fast_bilinear"
+def hardware_decode_input_args(device: str | None) -> list[str]:
+    """Input options that decode the detection feed on the iGPU, or nothing.
+
+    The frames have to stay on the graphics card until fps=1 has thrown away
+    the ones nobody looks at, so the output format is pinned to vaapi instead
+    of being left to the automatic download, which would copy the whole stream
+    back to system memory at full rate.
+    """
+    if not device:
+        return []
+    return ["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi"]
+
+
+def detection_video_filter(stacked_lenses: int, device: str | None = None) -> str:
+    """Sample one frame a second for the detector, from iGPU surfaces when given a device.
+
+    Only the decoding moves; the crop, the stack and the scaler stay on the
+    processor because they now run once a second instead of once per decoded
+    frame. scale_vaapi would take the scaler to the graphics card too, but its
+    kernel smooths the picture far more than fast_bilinear does, which would
+    quietly change what the model and the motion gate see.
+
+    A stacked feed needs the downloaded frame converted back to yuv420p: xstack
+    and pad handle nv12 chroma differently, which shifts every tile.
+    """
     if stacked_lenses <= 1:
-        return f"fps=1,{scale}"
+        download = f"{DECODE_DOWNLOAD_FILTER}," if device else ""
+        return f"fps=1,{download}{SAMPLE_FILTER}"
+    download = f"{STACKED_DECODE_DOWNLOAD_FILTER}," if device else ""
     side = detection_grid_side(stacked_lenses)
     columns = min(stacked_lenses, side)
     rows = math.ceil(stacked_lenses / side)
@@ -1002,9 +1030,9 @@ def detection_video_filter(stacked_lenses: int) -> str:
         f"{_grid_offset(lens % side, 'w0')}_{_grid_offset(lens // side, 'h0')}" for lens in range(stacked_lenses)
     )
     return (
-        f"fps=1,split={stacked_lenses}{outputs};{crops};"
+        f"fps=1,{download}split={stacked_lenses}{outputs};{crops};"
         f"{tiles}xstack=inputs={stacked_lenses}:layout={layout}:fill=black,"
-        f"pad=iw*{side}/{columns}:ih*{side}/{rows}:0:0:black,{scale}"
+        f"pad=iw*{side}/{columns}:ih*{side}/{rows}:0:0:black,{SAMPLE_FILTER}"
     )
 
 
@@ -1027,10 +1055,13 @@ class DetectionPipeline:
         self.latest_frame: tuple[bytes, float] | None = None
         self.pending: queue.Queue[bytes | None] | None = queue.Queue(maxsize=16) if raw_input else None
         self.needs_keyframe = raw_input
+        self.decode_device = hardware_decode_device()
         command = [
             "ffmpeg", "-nostdin", "-v", "error", "-threads", "2", "-probesize", "65536",
-            "-analyzeduration", "1000000", *input_args, "-an", "-sn", "-vf",
-            detection_video_filter(stacked_lenses), "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1",
+            "-analyzeduration", "1000000", *hardware_decode_input_args(self.decode_device),
+            *input_args, "-an", "-sn", "-vf",
+            detection_video_filter(stacked_lenses, self.decode_device),
+            "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1",
         ]
         try:
             self.process = subprocess.Popen(

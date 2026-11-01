@@ -925,11 +925,14 @@ class StackedLensDetectionTest(unittest.TestCase):
             recover=lambda pipeline: None, remove=lambda pipeline: None,
             submit=lambda pipeline, frame, when: frames.append(frame),
         )
-        pipeline = DetectionPipeline(
-            engine, "camera", "House", "House",
-            ["-f", "lavfi", "-i", f"{sources};{stack}vstack=inputs={lenses}[out0]"],
-            lambda event: None, lambda error: self.fail(error), stacked_lenses=lenses,
-        )
+        # A lavfi source has no decoder, so there is nothing for VAAPI to take over here;
+        # tests/test_detection_decode.py covers the hardware path on a real encoded clip.
+        with patch("local_detection.hardware_decode_device", return_value=None):
+            pipeline = DetectionPipeline(
+                engine, "camera", "House", "House",
+                ["-f", "lavfi", "-i", f"{sources};{stack}vstack=inputs={lenses}[out0]"],
+                lambda event: None, lambda error: self.fail(error), stacked_lenses=lenses,
+            )
         self.addCleanup(pipeline.close)
         deadline = time.monotonic() + 10
         while not frames and time.monotonic() < deadline:
