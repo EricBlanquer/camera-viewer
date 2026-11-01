@@ -118,6 +118,7 @@ from rtsp_tunnel import (
     ImouReplayTunnel, LocalRtspConnection, LocalRtspMediaBridge, LocalRtspTunnel,
     RtspWebSocketTunnel, rtsp_certificate_sha256,
 )
+from hardware import hardware_decode_device
 from local_detection import (
     MOTION_AREA_THRESHOLD, DetectionEngine, DetectionEvent, DetectionPipeline, add_missing_covers, load_events,
     model_path, organize_events,
@@ -238,12 +239,14 @@ LIVE_MAX_BOOST = 0.5
 LIVE_SPEED_STEP = 0.05
 MPV_AUDIO_TRACK_ON = "auto"
 MPV_AUDIO_TRACK_OFF = "no"
+MPV_SOFTWARE_DECODE_OPTION = "--hwdec=auto-safe"
+MPV_VAAPI_DECODE_OPTION = "--hwdec=vaapi"
 MPV_COMMON_OPTIONS = (
     "--no-config",
     "--no-terminal",
     "--really-quiet",
     "--vo=gpu,x11",
-    "--hwdec=auto-safe",
+    MPV_SOFTWARE_DECODE_OPTION,
     "--osc=no",
     "--input-cursor=no",
     "--input-default-bindings=no",
@@ -273,6 +276,10 @@ ICAM365_TILT_ACTIONS = {"Up": 1, "Down": 3}
 ICAM365_PTZ_STOP = 0
 ICAM365_TILT_PULSE_SECONDS = 0.12
 RTSP_DENOISE_FILTER = "--vf=lavfi=[hqdn3d=4:3:6:4.5]"
+# denoise_vaapi takes 0-64; 48 is the step whose smoothing looks closest to
+# hqdn3d=4:3:6:4.5 on these sensors at night while still keeping edges.
+RTSP_VAAPI_DENOISE_LEVEL = 48
+RTSP_VAAPI_DENOISE_FILTER = f"--vf=lavfi=[denoise_vaapi=denoise={RTSP_VAAPI_DENOISE_LEVEL}]"
 ICAM365_SERVER = "TAS-Tech IPCam"
 TOOLTIP_STYLE = (
     "QToolTip { color: white; background-color: rgb(32, 32, 32);"
@@ -853,7 +860,13 @@ def mpv_rtsp_command(
     command.insert(-1, f"--demuxer-readahead-secs={LIVE_READAHEAD_SECONDS}")
     command.insert(-1, f"--audio-buffer={LIVE_AUDIO_BUFFER_SECONDS}")
     command.insert(-1, RTSP_AUDIO_FILTER)
-    command.insert(-1, RTSP_DENOISE_FILTER)
+    # Denoising seven live windows with hqdn3d costs about four cores and drags
+    # every frame back from the decoder; the iGPU does the same job for free.
+    if hardware_decode_device() is None:
+        command.insert(-1, RTSP_DENOISE_FILTER)
+    else:
+        command[command.index(MPV_SOFTWARE_DECODE_OPTION)] = MPV_VAAPI_DECODE_OPTION
+        command.insert(-1, RTSP_VAAPI_DENOISE_FILTER)
     if camera.provider == IMOU_ACCOUNT_PROVIDER:
         command[-1] = "--idle=yes"
         command.insert(-1, "--demuxer-lavf-probesize=32768")
@@ -868,6 +881,10 @@ def mpv_rtsp_command(
         if bridge is None:
             raise CameraCredentialError("The V380 camera is not connected.")
         command[-1] = bridge.url
+        # This later --vf replaces the denoise chain, as it already did in
+        # software: the lens crop needs the stream size, which only a filter
+        # expression knows, so these windows keep paying for a copy back to
+        # system memory but no longer for a software denoise.
         command.insert(-1, f"--vf=lavfi=[crop=iw:ih/{v380.LENS_COUNT}:0:ih/{v380.LENS_COUNT}*{camera.lens}]")
     else:
         bridge = get_bridge(camera.uid)

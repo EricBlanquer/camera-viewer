@@ -184,7 +184,8 @@ class TrayTest(unittest.TestCase):
         self.assertFalse(valid_rtsp_url("rtsp://192.0.2.10:bad/0"))
         self.assertEqual(RtspCamera("rtsp:test", "Other", "rtsp://192.0.2.10:554/stream").transport, "tcp")
         camera = RtspCamera("rtsp:test", "Other", "rtsp://192.0.2.10:554/stream", "tcp")
-        command = mpv_rtsp_command(Path("/tmp/control.sock"), 1, True, camera)
+        with patch("app.hardware_decode_device", return_value=None):
+            command = mpv_rtsp_command(Path("/tmp/control.sock"), 1, True, camera)
         self.assertIn("--rtsp-transport=tcp", command)
         self.assertIn("--mute=yes", command)
         self.assertIn("--aid=no", command)
