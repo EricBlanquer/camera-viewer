@@ -177,6 +177,27 @@ class DockedWindowTest(unittest.TestCase):
         self.assertFalse(self.window.window_docked())
         self.assertFalse(any(self.fills()))
 
+    def test_a_dock_without_a_filled_layout_shrinks_to_its_videos_and_stays_docked(self) -> None:
+        area = self.window.screen().availableGeometry()
+        frame = self.window.frameGeometry().size() - self.window.size()
+        self.window.setGeometry(area.left(), area.top(), area.width() - frame.width(), area.height() - frame.height())
+        self.settle()
+        docked = self.order()
+        with patch.object(self.window, "current_mosaic", return_value=None):
+            self.window.fit_docked_window()
+            self.settle()
+            columns, rows = self.window.camera_grid_dimensions()
+            video = self.window.centralWidget().size()
+            self.assertAlmostEqual(video.width() * rows / (video.height() * columns), 16 / 9, delta=0.02)
+            self.assertEqual(self.window.frameGeometry().topLeft(), area.topLeft())
+            self.assertLess(self.window.frameGeometry().height(), area.height())
+            self.assertTrue(self.window.window_docked())
+            self.assertEqual(self.order(), docked)
+            size = self.window.size()
+            self.window.fit_docked_window()
+            self.settle()
+            self.assertEqual(self.window.size(), size)
+
     def test_a_docked_window_keeps_its_size(self) -> None:
         self.dock()
         size = self.window.size()

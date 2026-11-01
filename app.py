@@ -317,6 +317,14 @@ OVERLAY_MAX_WIDTH = 640
 VIDEO_ASPECT_WIDTH = 16
 VIDEO_ASPECT_HEIGHT = 9
 NET_FRAME_EXTENTS_ATOM = "_NET_FRAME_EXTENTS"
+NET_WM_STATE_ATOM = "_NET_WM_STATE"
+NET_WM_STATE_MAXIMIZED_VERT_ATOM = "_NET_WM_STATE_MAXIMIZED_VERT"
+NET_WM_STATE_MAXIMIZED_HORZ_ATOM = "_NET_WM_STATE_MAXIMIZED_HORZ"
+NET_MOVERESIZE_WINDOW_ATOM = "_NET_MOVERESIZE_WINDOW"
+NET_WM_STATE_REMOVE = 0
+NET_WM_SOURCE_APPLICATION = 1
+NET_MOVERESIZE_GEOMETRY_FLAGS = 0xF00
+NET_MOVERESIZE_SOURCE_SHIFT = 12
 WM_NORMAL_HINTS_FIELDS = (
     "flags",
     "min_width",
@@ -546,6 +554,23 @@ class X11WindowHints:
             return None
         left, right, top, bottom = extents.value
         return QMargins(left, top, right, bottom)
+
+    def place_untiled(self, client: QRect) -> None:
+        self.send_root_message(NET_WM_STATE_ATOM, [
+            NET_WM_STATE_REMOVE, self.x_display.intern_atom(NET_WM_STATE_MAXIMIZED_VERT_ATOM),
+            self.x_display.intern_atom(NET_WM_STATE_MAXIMIZED_HORZ_ATOM), NET_WM_SOURCE_APPLICATION, 0,
+        ])
+        self.send_root_message(NET_MOVERESIZE_WINDOW_ATOM, [
+            X11.StaticGravity | NET_MOVERESIZE_GEOMETRY_FLAGS | NET_WM_SOURCE_APPLICATION << NET_MOVERESIZE_SOURCE_SHIFT,
+            client.x(), client.y(), client.width(), client.height(),
+        ])
+        self.x_display.flush()
+
+    def send_root_message(self, atom: str, data: list[int]) -> None:
+        message = xevent.ClientMessage(window=self.window, client_type=self.x_display.intern_atom(atom), data=(32, data))
+        self.x_display.screen().root.send_event(
+            message, event_mask=X11.SubstructureRedirectMask | X11.SubstructureNotifyMask,
+        )
 
     def apply_aspect_ratio(self) -> None:
         hints = self.window.get_wm_normal_hints()
@@ -1121,6 +1146,7 @@ MOSAIC_MIN_COVERAGE = 0.9
 DOCK_TOLERANCE_PX = 8
 MOSAIC_ASPECT_TOLERANCE = 0.15
 DOCK_FRACTIONS = (0.5, 1.0)
+DOCK_FIT_DELAY_MS = 1000
 
 
 @functools.lru_cache(maxsize=None)
@@ -1188,6 +1214,10 @@ def docked_span(start: int, length: int, area_start: int, area_length: int) -> b
     touches = (abs(start - area_start) <= DOCK_TOLERANCE_PX
                or abs(start + length - area_start - area_length) <= DOCK_TOLERANCE_PX)
     return touches and any(abs(length - area_length * fraction) <= DOCK_TOLERANCE_PX for fraction in DOCK_FRACTIONS)
+
+
+def rects_close(first: QRect, second: QRect) -> bool:
+    return all(abs(a - b) <= DOCK_TOLERANCE_PX for a, b in zip(first.getCoords(), second.getCoords()))
 
 
 MOSAIC_ASPECTS = tuple(sorted({round(MOSAIC_TILE_ASPECT * wide / tall, 2) for wide in range(1, 4) for tall in range(1, 4)}))
@@ -6860,6 +6890,11 @@ class MainWindow(QMainWindow):
         self.camera_mask_timer = QTimer(self)
         self.camera_mask_timer.setSingleShot(True)
         self.camera_mask_timer.timeout.connect(self.update_camera_mask)
+        self.dock_fit: QRect | None = None
+        self.dock_fit_timer = QTimer(self)
+        self.dock_fit_timer.setSingleShot(True)
+        self.dock_fit_timer.setInterval(DOCK_FIT_DELAY_MS)
+        self.dock_fit_timer.timeout.connect(self.fit_docked_window)
         self.cursor_timer = QTimer(self)
         self.cursor_timer.setInterval(CURSOR_POLL_MS)
         self.cursor_timer.timeout.connect(self.check_cursor_activity)
@@ -7146,8 +7181,39 @@ class MainWindow(QMainWindow):
             return True
         available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
         frame = self.window_frame()
+        if self.dock_fit is not None and rects_close(frame, self.dock_fit):
+            return True
         return (docked_span(frame.left(), frame.width(), available.left(), available.width())
                 and docked_span(frame.top(), frame.height(), available.top(), available.height()))
+
+    def fit_docked_window(self) -> None:
+        if not self.window_docked() or self.isMaximized() or not self.visible_devices():
+            return
+        columns, rows = self.camera_grid_dimensions()
+        area = self.centralWidget().size()
+        if area.isEmpty() or self.current_mosaic() is not None or aspect_close(
+                area.width() * rows / (area.height() * columns), VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT):
+            return
+        scale = min(area.width() / (columns * VIDEO_ASPECT_WIDTH), area.height() / (rows * VIDEO_ASPECT_HEIGHT))
+        client = self.geometry()
+        size = QSize(client.width() - area.width() + round(columns * VIDEO_ASPECT_WIDTH * scale),
+                     client.height() - area.height() + round(rows * VIDEO_ASPECT_HEIGHT * scale))
+        frame = self.window_frame()
+        margins = QMargins(client.left() - frame.left(), client.top() - frame.top(),
+                           frame.right() - client.right(), frame.bottom() - client.bottom())
+        fitted = QRect(frame.topLeft(), size.grownBy(margins))
+        available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        if abs(frame.left() - available.left()) > DOCK_TOLERANCE_PX:
+            fitted.moveRight(frame.right())
+        if abs(frame.top() - available.top()) > DOCK_TOLERANCE_PX:
+            fitted.moveBottom(frame.bottom())
+        self.dock_fit = fitted
+        placed = fitted.marginsRemoved(margins)
+        if self.window_hints is None:
+            self.setGeometry(placed)
+            return
+        self.window_hints.set_aspect_ratio(placed.width(), placed.height())
+        self.window_hints.place_untiled(placed)
 
     def mosaic_area(self) -> QSize | None:
         if self.isFullScreen():
@@ -9395,6 +9461,8 @@ class MainWindow(QMainWindow):
             self.camera_mask_timer.start(0)
 
     def refresh_window_shape(self) -> None:
+        if getattr(self, "dock_fit_timer", None) is not None:
+            self.dock_fit_timer.start()
         if getattr(self, "previews", None) is not None:
             self.update_fullscreen_mosaic()
         if getattr(self, "previews", None) and self.effective_camera_layout() != self.preview_layout:
