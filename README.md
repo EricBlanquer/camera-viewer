@@ -220,6 +220,7 @@ Local people and animal detection is available and enabled by default for V380 c
 The V380 camera's own microSD recordings are not played in the viewer; its local 24-hour recordings use the continuous recording on this computer.
 A V380 camera accepts a single stream client: a second simultaneous login makes the camera drop both connections.
 With a `relay_url` (an `rtsp://` address on the local network, such as a mediamtx server) in the camera's entry of `~/.config/camera-viewer/v380.json`, the viewer that holds the camera connection also publishes each lens as 640 × 360 H.264 at 12 fps to `<relay_url>1`, `<relay_url>2` and `<relay_url>3`, so other screens can watch the camera without logging in to it.
+The three relayed lenses are encoded on the computer's Intel graphics through VAAPI when a render node in `/dev/dri` passes a short encoding test at startup, which keeps the processor free; the viewer returns to software encoding by itself when the hardware relay cannot stay up, and `CAMERA_VIEWER_VAAPI_DEVICE` selects another render node or, set to `off`, keeps everything in software.
 For access away from the camera's network, the computer needs a route to its local IP address, such as a VPN.
 
 Each camera keeps its 16:9 ratio in single-camera and multi-camera views, including when the window is resized.

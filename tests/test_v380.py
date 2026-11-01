@@ -79,6 +79,18 @@ class V380RelayTest(unittest.TestCase):
         graph = command[command.index("-filter_complex") + 1]
         self.assertIn("split=3", graph)
         self.assertIn("[s2]crop=iw:ih/3:0:2*ih/3,scale=640:360[l2]", graph)
+        self.assertIn("libx264", command)
+
+    def test_relay_encodes_on_the_gpu_when_a_render_node_is_given(self) -> None:
+        command = v380.relay_command("http://127.0.0.1:1/source", "rtsp://192.168.1.251:8554/maison",
+                                     device="/dev/dri/renderD128")
+        self.assertEqual(command[command.index("-vaapi_device") + 1], "/dev/dri/renderD128")
+        self.assertNotIn("libx264", command)
+        self.assertEqual(command.count("h264_vaapi"), 3)
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertIn("[s2]crop=iw:ih/3:0:2*ih/3,scale=640:360,format=nv12,hwupload[l2]", graph)
+        self.assertEqual([part for part in command if part.startswith("rtsp://")],
+                         [f"rtsp://192.168.1.251:8554/maison{lens}" for lens in (1, 2, 3)])
 
     def test_relay_runs_until_the_bridge_stops(self) -> None:
         bridge = object.__new__(v380.NativeBridge)
@@ -94,7 +106,9 @@ class V380RelayTest(unittest.TestCase):
             started.set()
             return process
 
-        with patch.object(v380, "RELAY_START_DELAY_SECONDS", 0.01), patch.object(v380.subprocess, "Popen", popen):
+        with patch.object(v380, "RELAY_START_DELAY_SECONDS", 0.01), \
+                patch.object(v380, "hardware_encode_device", lambda: None), \
+                patch.object(v380.subprocess, "Popen", popen):
             thread = threading.Thread(target=bridge._relay)
             thread.start()
             self.assertTrue(started.wait(2))

@@ -103,9 +103,68 @@ RELAY_MAX_RETRY_SECONDS = 300
 RELAY_STABLE_SECONDS = 20
 CONTINUOUS_HOST_GRACE_SECONDS = 30
 RELAY_PATH_PATTERN = re.compile(r"/[A-Za-z0-9_/-]{1,64}")
+RELAY_PROBE_TIMEOUT_SECONDS = 20
 
 LOG = logging.getLogger("okam-linux.v380")
 _CONFIG_LOCK = threading.Lock()
+_HARDWARE_LOCK = threading.Lock()
+_HARDWARE_DEVICE: str | None | object = None
+
+
+def _candidate_render_nodes() -> list[str]:
+    override = os.environ.get("CAMERA_VIEWER_VAAPI_DEVICE", "").strip()
+    if override:
+        return [] if override.lower() in {"0", "off", "none", "false"} else [override]
+    try:
+        return sorted(str(node) for node in Path("/dev/dri").glob("renderD*"))
+    except OSError:
+        return []
+
+
+def _probe_render_node(device: str) -> bool:
+    """Encode a couple of frames on the iGPU to prove VAAPI really works here."""
+    command = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-vaapi_device", device,
+        "-f", "lavfi", "-i", f"testsrc=size={RELAY_WIDTH}x{RELAY_HEIGHT}:rate={RELAY_FPS}",
+        "-frames:v", "2", "-vf", "format=nv12,hwupload",
+        "-c:v", "h264_vaapi", "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=RELAY_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def hardware_encode_device() -> str | None:
+    """Render node usable for H.264 encoding, or None to stay on libx264.
+
+    Encoding three lenses in software costs about two cores permanently, which
+    is what pushes this laptop into thermal throttling. The probe runs once.
+    """
+    global _HARDWARE_DEVICE
+    with _HARDWARE_LOCK:
+        if _HARDWARE_DEVICE is not None:
+            return _HARDWARE_DEVICE if isinstance(_HARDWARE_DEVICE, str) else None
+        for device in _candidate_render_nodes():
+            if os.access(device, os.R_OK | os.W_OK) and _probe_render_node(device):
+                LOG.info("V380 relay will encode on %s (VAAPI)", device)
+                _HARDWARE_DEVICE = device
+                return device
+        LOG.info("V380 relay falls back to libx264 (no usable VAAPI encoder)")
+        _HARDWARE_DEVICE = False
+        return None
+
+
+def disable_hardware_encode() -> None:
+    """Stop using the iGPU after the hardware relay failed to stay up."""
+    global _HARDWARE_DEVICE
+    with _HARDWARE_LOCK:
+        _HARDWARE_DEVICE = False
 
 
 def _is_local_address(address: str) -> bool:
@@ -127,21 +186,36 @@ def valid_relay_url(url: str) -> bool:
             and not parsed.fragment and RELAY_PATH_PATTERN.fullmatch(parsed.path) is not None)
 
 
-def relay_command(source: str, relay_url: str, lenses: int = LENS_COUNT) -> list[str]:
+def relay_command(source: str, relay_url: str, lenses: int = LENS_COUNT,
+                  device: str | None = None) -> list[str]:
     outputs = "".join(f"[s{lens}]" for lens in range(lenses))
+    upload = ",format=nv12,hwupload" if device else ""
     crops = ";".join(
-        f"[s{lens}]crop=iw:ih/{lenses}:0:{lens}*ih/{lenses},scale={RELAY_WIDTH}:{RELAY_HEIGHT}[l{lens}]"
+        f"[s{lens}]crop=iw:ih/{lenses}:0:{lens}*ih/{lenses},"
+        f"scale={RELAY_WIDTH}:{RELAY_HEIGHT}{upload}[l{lens}]"
         for lens in range(lenses)
     )
-    command = [
-        "ffmpeg", "-nostdin", "-nostats", "-loglevel", "error", "-hwaccel", "auto",
+    command = ["ffmpeg", "-nostdin", "-nostats", "-loglevel", "error"]
+    if device:
+        command += ["-vaapi_device", device]
+    command += [
+        "-hwaccel", "auto" if not device else "vaapi",
+    ]
+    if device:
+        command += ["-hwaccel_output_format", "nv12"]
+    command += [
         "-analyzeduration", "10000000", "-probesize", "50000000", "-i", source, "-an",
         "-filter_complex", f"[0:v]fps={RELAY_FPS},split={lenses}{outputs};{crops}",
     ]
     for lens in range(lenses):
+        if device:
+            encoder = ["-c:v", "h264_vaapi"]
+        else:
+            encoder = ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+                       "-pix_fmt", "yuv420p"]
         command += [
-            "-map", f"[l{lens}]", "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-            "-pix_fmt", "yuv420p", "-g", RELAY_GOP, "-b:v", RELAY_BITRATE, "-maxrate", RELAY_MAXRATE,
+            "-map", f"[l{lens}]", *encoder,
+            "-g", RELAY_GOP, "-b:v", RELAY_BITRATE, "-maxrate", RELAY_MAXRATE,
             "-bufsize", RELAY_BUFFER, "-f", "rtsp", "-rtsp_transport", "tcp", f"{relay_url}{lens + 1}",
         ]
     return command
@@ -168,11 +242,25 @@ def media_key(ticket: int) -> bytes:
 
 
 def decrypt_media(key: bytes, payload: bytes) -> bytes:
+    """Decrypt the encrypted CRYPT_BLOCK window of every CRYPT_STRIDE bytes.
+
+    ECB has no chaining, so every 16-byte block is independent: the whole
+    payload is decrypted in a single AES call instead of building one cipher
+    per 64-byte window. The per-window version ran at about 3 MB/s and burned
+    a full core per camera.
+    """
     data = bytearray(payload)
-    offset = 0
-    while offset + CRYPT_BLOCK <= len(data):
-        data[offset:offset + CRYPT_BLOCK] = _ecb_decrypt(key, bytes(data[offset:offset + CRYPT_BLOCK]))
-        offset += CRYPT_STRIDE
+    offsets = range(0, len(data) - CRYPT_BLOCK + 1, CRYPT_STRIDE)
+    if not offsets:
+        return bytes(data)
+
+    gathered = b"".join(bytes(data[offset:offset + CRYPT_BLOCK]) for offset in offsets)
+    decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+    clear = decryptor.update(gathered) + decryptor.finalize()
+
+    for index, offset in enumerate(offsets):
+        start = index * CRYPT_BLOCK
+        data[offset:offset + CRYPT_BLOCK] = clear[start:start + CRYPT_BLOCK]
     return bytes(data)
 
 
@@ -457,9 +545,11 @@ class NativeBridge:
         delay = RELAY_START_DELAY_SECONDS
         quick_failures = 0
         while not self.stopped.wait(delay):
+            device = hardware_encode_device()
             try:
                 process = subprocess.Popen(
-                    relay_command(self.url, self.config.relay_url), stdin=subprocess.DEVNULL,
+                    relay_command(self.url, self.config.relay_url, device=device),
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
             except OSError as ex:
@@ -480,6 +570,10 @@ class NativeBridge:
                     process.wait(timeout=3)
                 return
             quick_failures = 0 if time.monotonic() - started >= RELAY_STABLE_SECONDS else quick_failures + 1
+            if device and quick_failures >= 2:
+                LOG.warning("V380 hardware relay keeps failing; switching back to libx264")
+                disable_hardware_encode()
+                quick_failures = 0
             delay = min(RELAY_RETRY_SECONDS * 2 ** quick_failures, RELAY_MAX_RETRY_SECONDS)
             LOG.info("V380 relay stopped with exit code %s; retrying in %s s", process.returncode, delay)
 
