@@ -127,7 +127,7 @@ from local_detection import (
 from camera_position import (
     MISPLACED, PENDING, SAVED, SUSPECTED, PositionCheck, PositionCorrection, PositionReferences,
 )
-from Xlib import X as X11, Xutil, display as xdisplay
+from Xlib import X as X11, Xatom, Xutil, display as xdisplay
 from Xlib.protocol import event as xevent
 
 
@@ -316,6 +316,7 @@ OVERLAY_MARGIN = 16
 OVERLAY_MAX_WIDTH = 640
 VIDEO_ASPECT_WIDTH = 16
 VIDEO_ASPECT_HEIGHT = 9
+NET_FRAME_EXTENTS_ATOM = "_NET_FRAME_EXTENTS"
 WM_NORMAL_HINTS_FIELDS = (
     "flags",
     "min_width",
@@ -518,12 +519,14 @@ def set_icam365_light_icon(button: QPushButton, mode: str | None) -> None:
 
 
 class X11WindowHints:
-    def __init__(self, window: QWidget) -> None:
+    def __init__(self, window: QWidget, frame_changed: Callable[[], None]) -> None:
         self.aspect_width = VIDEO_ASPECT_WIDTH
         self.aspect_height = VIDEO_ASPECT_HEIGHT
+        self.frame_changed = frame_changed
         self.x_display = xdisplay.Display()
         self.window = self.x_display.create_resource_object("window", int(window.winId()))
         self.normal_hints_atom = self.x_display.intern_atom("WM_NORMAL_HINTS")
+        self.frame_extents_atom = self.x_display.intern_atom(NET_FRAME_EXTENTS_ATOM)
         self.window.change_attributes(event_mask=X11.StructureNotifyMask | X11.PropertyChangeMask)
         self.notifier = QSocketNotifier(self.x_display.fileno(), QSocketNotifier.Type.Read, window)
         self.notifier.activated.connect(self.process_events)
@@ -534,6 +537,15 @@ class X11WindowHints:
             event = self.x_display.next_event()
             if event.type == X11.PropertyNotify and event.atom == self.normal_hints_atom:
                 self.apply_aspect_ratio()
+            elif event.type == X11.PropertyNotify and event.atom == self.frame_extents_atom:
+                self.frame_changed()
+
+    def frame_margins(self) -> QMargins | None:
+        extents = self.window.get_full_property(self.frame_extents_atom, Xatom.CARDINAL)
+        if extents is None or len(extents.value) != 4:
+            return None
+        left, right, top, bottom = extents.value
+        return QMargins(left, top, right, bottom)
 
     def apply_aspect_ratio(self) -> None:
         hints = self.window.get_wm_normal_hints()
@@ -7094,7 +7106,7 @@ class MainWindow(QMainWindow):
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.create_tray()
         if QApplication.platformName() == "xcb":
-            self.window_hints = X11WindowHints(self)
+            self.window_hints = X11WindowHints(self, self.refresh_window_shape)
         self.set_status("Connecting to camera...")
         self.apply_standby_host()
         self.update_hidden_pause()
@@ -7123,13 +7135,17 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._compute_requested_mosaic, args=(count, width, height, tolerant),
                          daemon=True).start()
 
+    def window_frame(self) -> QRect:
+        margins = self.window_hints.frame_margins() if self.window_hints is not None else None
+        return self.frameGeometry() if margins is None else self.geometry().marginsAdded(margins)
+
     def window_docked(self) -> bool:
         if self.isFullScreen() or self.isMinimized() or not self.isVisible():
             return False
         if self.isMaximized():
             return True
         available = (self.screen() or QApplication.primaryScreen()).availableGeometry()
-        frame = self.frameGeometry()
+        frame = self.window_frame()
         return (docked_span(frame.left(), frame.width(), available.left(), available.width())
                 and docked_span(frame.top(), frame.height(), available.top(), available.height()))
 

@@ -2,11 +2,12 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PyQt6.QtCore import QRect, QSettings
+from PyQt6.QtCore import QMargins, QRect, QSettings
 from PyQt6.QtWidgets import QApplication, QWidget
 
 from app import AspectVideoFrame, CameraPreview, MainWindow, RtspCamera, compute_mosaic, docked_span, mosaic_grid
@@ -161,6 +162,20 @@ class DockedWindowTest(unittest.TestCase):
         self.settle()
         self.assertTrue(self.window.window_docked())
         self.assertTrue(all(self.fills()))
+
+    def test_the_window_manager_frame_decides_the_docked_state(self) -> None:
+        area = self.window.screen().availableGeometry()
+        margins = QMargins(0, 32, 0, 0)
+        self.window.window_hints = SimpleNamespace(frame_margins=lambda: margins, close=lambda: None)
+        self.window.setGeometry(area.marginsRemoved(margins))
+        self.settle()
+        self.window.refresh_window_shape()
+        self.assertTrue(self.window.window_docked())
+        self.assertTrue(all(self.fills()))
+        margins = QMargins()
+        self.window.refresh_window_shape()
+        self.assertFalse(self.window.window_docked())
+        self.assertFalse(any(self.fills()))
 
     def test_a_docked_window_keeps_its_size(self) -> None:
         self.dock()
