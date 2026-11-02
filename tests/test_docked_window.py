@@ -190,32 +190,56 @@ class DockedWindowTest(unittest.TestCase):
                                                    close=lambda: None)
         self.assertFalse(self.window.window_docked())
 
-    def test_a_dock_without_a_filled_layout_shrinks_to_its_videos_and_stays_docked(self) -> None:
-        area = self.window.screen().availableGeometry()
+    def place_frame(self, tile: QRect) -> None:
+        offset = self.window.geometry().topLeft() - self.window.frameGeometry().topLeft()
         frame = self.window.frameGeometry().size() - self.window.size()
-        self.window.setGeometry(area.left(), area.top(), area.width() - frame.width(), area.height() - frame.height())
+        self.window.setGeometry(tile.left() + offset.x(), tile.top() + offset.y(),
+                                tile.width() - frame.width(), tile.height() - frame.height())
+
+    def fit_in_tile(self, tile: QRect) -> QRect:
+        self.place_frame(tile)
         self.settle()
-        docked = self.order()
-        with patch.object(self.window, "current_mosaic", return_value=None):
+        self.assertTrue(self.window.window_docked())
+        self.window.fit_docked_window()
+        self.settle()
+        return self.window.frameGeometry()
+
+    def test_a_dock_without_a_filled_layout_shrinks_to_its_videos_and_stays_docked(self) -> None:
+        work = QRect(0, 0, 2400, 1400)
+        with patch.object(self.window, "available_area", return_value=work), \
+                patch.object(self.window, "current_mosaic", return_value=None):
+            docked = self.order()
+            self.place_frame(QRect(0, 0, 1200, 1400))
+            self.settle()
             tiled = self.window.size()
             with patch("app.QApplication.queryKeyboardModifiers", return_value=Qt.KeyboardModifier.MetaModifier):
                 self.window.fit_docked_window()
                 self.settle()
             self.assertEqual(self.window.size(), tiled)
             self.assertTrue(self.window.dock_fit_timer.isActive())
-            self.window.fit_docked_window()
-            self.settle()
+            fitted = self.fit_in_tile(QRect(0, 0, 1200, 1400))
             columns, rows = self.window.camera_grid_dimensions()
             video = self.window.centralWidget().size()
             self.assertAlmostEqual(video.width() * rows / (video.height() * columns), 16 / 9, delta=0.02)
-            self.assertEqual(self.window.frameGeometry().topLeft(), area.topLeft())
-            self.assertLess(self.window.frameGeometry().height(), area.height())
+            self.assertEqual(fitted.topLeft(), work.topLeft())
+            self.assertEqual(fitted.width(), 1200)
+            self.assertLess(fitted.height(), work.height())
             self.assertTrue(self.window.window_docked())
             self.assertEqual(self.order(), docked)
-            size = self.window.size()
             self.window.fit_docked_window()
             self.settle()
-            self.assertEqual(self.window.size(), size)
+            self.assertEqual(self.window.frameGeometry(), fitted)
+
+    def test_top_and_bottom_docks_fit_like_a_side_dock(self) -> None:
+        work = QRect(0, 0, 2400, 1400)
+        with patch.object(self.window, "available_area", return_value=work), \
+                patch.object(self.window, "current_mosaic", return_value=None):
+            side = self.fit_in_tile(QRect(0, 0, 1200, 1400))
+            top = self.fit_in_tile(QRect(0, 0, 2400, 700))
+            self.assertEqual(top, side)
+            bottom = self.fit_in_tile(QRect(0, 700, 2400, 700))
+            self.assertEqual(bottom.size(), side.size())
+            self.assertEqual(bottom.bottomLeft(), work.bottomLeft())
 
     def test_a_docked_window_keeps_its_size(self) -> None:
         self.dock()

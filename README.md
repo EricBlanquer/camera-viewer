@@ -85,7 +85,8 @@ Full-screen view displays empty cells on a black background; leaving full screen
 In full screen, the grid view arranges the cameras as a mosaic of different 16:9 sizes that fills a landscape screen with almost no black border; the first cameras in the order take the larger tiles, and camera counts without a clean fill keep the uniform grid.
 A window docked to the screen edges (half or quarter tile) or maximized uses the same mosaic, computed for its own video area; when that shape has no clean fill, the nearest standard shape within 15 % is used.
 In a docked window, each video whose pane is within 15 % of 16:9 fills it by trimming its edges instead of showing black bars, in live view and playback.
-When a docked shape is farther from its videos, as with four cameras in a left or right half, Camera Viewer leaves the tile one second after the window settles and shrinks it to its videos against the same screen edges; the window keeps the docked camera order until it is moved or resized.
+When a docked shape is farther from its videos, as with four cameras in a half of the screen, Camera Viewer leaves the tile one second after the window settles and resizes it to its videos against the same screen edges; the window keeps the docked camera order until it is moved or resized.
+The resized window is at most half the work area wide, so a top or bottom half gives the same window as a left or right half, even when it then extends past the middle of the screen.
 A maximized window keeps its size.
 When the window is docked wide or tall, the camera layout adapts to its available shape and returns to the saved choice when undocked.
 Use **Camera profiles > Save current view...** to name the checked cameras, their order, and the camera layout.

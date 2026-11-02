@@ -7238,15 +7238,18 @@ class MainWindow(QMainWindow):
         if area.isEmpty() or self.current_mosaic() is not None or aspect_close(
                 area.width() * rows / (area.height() * columns), VIDEO_ASPECT_WIDTH / VIDEO_ASPECT_HEIGHT):
             return
-        scale = min(area.width() / (columns * VIDEO_ASPECT_WIDTH), area.height() / (rows * VIDEO_ASPECT_HEIGHT))
         client = self.geometry()
+        frame = self.window_frame()
+        available = self.available_area()
+        chrome = frame.size() - area
+        width = min(area.width(), available.width() // 2 - chrome.width())
+        height = available.height() - chrome.height()
+        scale = min(width / (columns * VIDEO_ASPECT_WIDTH), height / (rows * VIDEO_ASPECT_HEIGHT))
         size = QSize(client.width() - area.width() + round(columns * VIDEO_ASPECT_WIDTH * scale),
                      client.height() - area.height() + round(rows * VIDEO_ASPECT_HEIGHT * scale))
-        frame = self.window_frame()
         margins = QMargins(client.left() - frame.left(), client.top() - frame.top(),
                            frame.right() - client.right(), frame.bottom() - client.bottom())
         fitted = QRect(frame.topLeft(), size.grownBy(margins))
-        available = self.available_area()
         if abs(frame.left() - available.left()) > DOCK_TOLERANCE_PX:
             fitted.moveRight(frame.right())
         if abs(frame.top() - available.top()) > DOCK_TOLERANCE_PX:
