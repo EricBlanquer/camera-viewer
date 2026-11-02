@@ -105,6 +105,7 @@ The address is checked every ten seconds; connections reopen after three consecu
 Playback opened from a camera pane remains available during standby, and an empty address turns standby off.
 Use **Forced night vision > camera...** to keep an Imou camera with local video access in black-and-white night vision every day between two times, for example from 18:00 until 08:00, so that lamps or a television cannot make it switch repeatedly between color and infrared.
 Outside these hours, the camera returns to its automatic day and night switching.
+Camera Viewer switches it to color just before automatic switching, because the camera keeps night vision in daylight when automatic switching starts from forced black and white.
 Camera Viewer applies the schedule while it is running, through the camera's Dahua configuration service on TCP port 37777 with the local video access username and device password, and checks it again every 15 minutes.
 The camera keeps the last applied mode while Camera Viewer is closed; unchecking the schedule returns it to automatic switching.
 This configuration service is not encrypted, even on cameras with TLS video: the password itself is not sent, but a challenge response derived from it crosses the network, so use the schedule only on the home network or through the home VPN.

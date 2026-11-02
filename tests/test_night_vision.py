@@ -7,7 +7,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
@@ -139,12 +139,12 @@ class ForcedNightVisionTest(unittest.TestCase):
             {"Delay": 6, "Mode": "BlackWhite", "Sensitivity": 2}, {"Delay": 6, "Mode": "BlackWhite", "Sensitivity": 2},
         ]])
 
-    def test_release_returns_only_black_and_white_profiles_to_automatic(self) -> None:
+    def test_release_returns_only_black_and_white_profiles_to_automatic_through_color(self) -> None:
         client = self.client("BlackWhite", "Color")
         self.assertTrue(set_forced_night_vision(client, 0, False))
-        client.set_config.assert_called_once_with(DAHUA_DAY_NIGHT_CONFIG, [[
-            {"Delay": 6, "Mode": "Brightness", "Sensitivity": 2}, {"Delay": 6, "Mode": "Color", "Sensitivity": 2},
-        ]])
+        self.assertEqual(client.set_config.call_args_list, [call(DAHUA_DAY_NIGHT_CONFIG, [[
+            {"Delay": 6, "Mode": mode, "Sensitivity": 2}, {"Delay": 6, "Mode": "Color", "Sensitivity": 2},
+        ]]) for mode in ("Color", "Brightness")])
 
     def test_matching_mode_is_not_written_again(self) -> None:
         for modes, forced in ((("Brightness",), False), (("BlackWhite",), True)):

@@ -31,7 +31,10 @@ DAHUA_REALM_PREFIX = "Realm:"
 DAHUA_RANDOM_PREFIX = "Random:"
 DAHUA_DAY_NIGHT_CONFIG = "VideoInDayNight"
 DAHUA_DAY_NIGHT_FORCED = "BlackWhite"
+DAHUA_DAY_NIGHT_COLOR = "Color"
 DAHUA_DAY_NIGHT_AUTOMATIC = "Brightness"
+DAHUA_FORCE_MODES = (DAHUA_DAY_NIGHT_FORCED,)
+DAHUA_RELEASE_MODES = (DAHUA_DAY_NIGHT_COLOR, DAHUA_DAY_NIGHT_AUTOMATIC)
 
 
 class DahuaError(OSError):
@@ -191,13 +194,17 @@ def set_forced_night_vision(client: DahuaClient, channel: int, forced: bool) -> 
         not isinstance(profile, dict) or not isinstance(profile.get("Mode"), str) for profile in table[channel]
     ):
         raise DahuaError("The camera does not provide a day and night mode for this channel.")
-    updated = copy.deepcopy(table)
-    for profile in updated[channel]:
-        if forced:
-            profile["Mode"] = DAHUA_DAY_NIGHT_FORCED
-        elif profile["Mode"] == DAHUA_DAY_NIGHT_FORCED:
-            profile["Mode"] = DAHUA_DAY_NIGHT_AUTOMATIC
-    if updated == table:
+    profiles = [index for index, profile in enumerate(table[channel])
+                if (profile["Mode"] != DAHUA_DAY_NIGHT_FORCED) == forced]
+    if not profiles:
         return False
-    client.set_config(DAHUA_DAY_NIGHT_CONFIG, updated)
+    for mode in DAHUA_FORCE_MODES if forced else DAHUA_RELEASE_MODES:
+        client.set_config(DAHUA_DAY_NIGHT_CONFIG, day_night_table(table, channel, profiles, mode))
     return True
+
+
+def day_night_table(table: list, channel: int, profiles: list[int], mode: str) -> list:
+    updated = copy.deepcopy(table)
+    for index in profiles:
+        updated[channel][index]["Mode"] = mode
+    return updated
