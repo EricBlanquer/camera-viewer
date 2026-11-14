@@ -233,6 +233,7 @@ For access away from the camera's network, the computer needs a route to its loc
 
 With `{"url": "srt://<host>:<port>/<path>/", "user": "<user>", "password": "<password>"}` in `~/.config/camera-viewer/relay.json` (mode 600, an `srt://` address on the local network such as a mediamtx server, and the account allowed to publish there), every other camera is published there while the viewer displays it, under `<path>/` followed by its name in lowercase ASCII (`Entrée` becomes `cams/entree`).
 The V380 relay signs in with the same account; logs name the published path, never the password.
+ffmpeg only takes its output address as an argument, so the password is visible in the relay processes' command line to the other accounts of the computer, unless `/proc` is mounted with `hidepid=2`; such an account could at worst publish a fake camera stream to the server.
 The video is copied without re-encoding into MPEG-TS over SRT, which carries the camera's own H.264 or H.265 parameter sets: RTSP publishing would put them in the SDP, where several cameras repeat them with trailing zero bytes that mediamtx refuses.
 Hiding the window to the tray, or replacing a live view with a replay, stops that camera's relay; a relay that fails is restarted after 5 s, then up to 5 minutes while it keeps failing.
 
