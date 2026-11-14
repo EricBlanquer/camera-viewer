@@ -113,7 +113,7 @@ LOG = logging.getLogger("okam-linux.v380")
 _CONFIG_LOCK = threading.Lock()
 
 
-def _is_local_address(address: str) -> bool:
+def is_local_address(address: str) -> bool:
     try:
         host = ipaddress.ip_address(address)
     except ValueError:
@@ -127,7 +127,7 @@ def valid_relay_url(url: str) -> bool:
         parsed.port
     except ValueError:
         return False
-    return (parsed.scheme == "rtsp" and parsed.hostname is not None and _is_local_address(parsed.hostname)
+    return (parsed.scheme == "rtsp" and parsed.hostname is not None and is_local_address(parsed.hostname)
             and parsed.username is None and parsed.password is None and not parsed.query
             and not parsed.fragment and RELAY_PATH_PATTERN.fullmatch(parsed.path) is not None)
 
@@ -228,7 +228,7 @@ class V380Config:
         if (not isinstance(did, int) or not 0 < did <= 0xFFFFFFFF
                 or not isinstance(port, int) or not 1 <= port <= 65535
                 or not isinstance(username, str) or not 1 <= len(username.encode()) <= 32
-                or not isinstance(address, str) or (address and not _is_local_address(address))
+                or not isinstance(address, str) or (address and not is_local_address(address))
                 or not isinstance(relay_url, str) or (relay_url and not valid_relay_url(relay_url))):
             raise OSError("Invalid V380 connection configuration.")
         return cls(did, port, username, address, relay_url)
@@ -321,7 +321,7 @@ def discover(timeout: float = 1.5) -> list[DiscoveredCamera]:
             fields = data.decode("ascii", errors="replace").split("^")
             if len(fields) < 13 or fields[0] != DISCOVERY_RESULT:
                 continue
-            if fields[3] != source[0] or not _is_local_address(fields[3]):
+            if fields[3] != source[0] or not is_local_address(fields[3]):
                 continue
             mac = fields[2]
             try:

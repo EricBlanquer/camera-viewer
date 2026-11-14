@@ -1908,6 +1908,156 @@ class ContinuousRecorder:
             LOG.info("Could not save continuous recording %s: %s", recorder.path.name, ex)
 
 
+RELAY_SETTINGS_PATH = Path.home() / ".config/camera-viewer/relay.json"
+RELAY_SLUG_MAX_LENGTH = 40
+CAMERA_RELAY_RETRY_SECONDS = 5
+CAMERA_RELAY_MAX_RETRY_SECONDS = 300
+CAMERA_RELAY_STABLE_SECONDS = 20
+CAMERA_RELAY_STOP_SECONDS = 3
+SRT_PACKET_SIZE = 1316
+
+
+def camera_relay_url(name: str, settings_path: Path = RELAY_SETTINGS_PATH) -> str:
+    try:
+        base = json.loads(settings_path.read_text()).get("url", "")
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError, AttributeError) as ex:
+        LOG.warning("Ignoring the camera relay settings: %s", ex)
+        return ""
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().casefold()
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_name).strip("-")[:RELAY_SLUG_MAX_LENGTH].strip("-")
+    parsed = urllib.parse.urlsplit(base if isinstance(base, str) else "")
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if not (slug and parsed.scheme == "srt" and parsed.hostname is not None and v380.is_local_address(parsed.hostname)
+            and port is not None and parsed.username is None and parsed.password is None and not parsed.query
+            and not parsed.fragment and v380.RELAY_PATH_PATTERN.fullmatch(parsed.path + slug) is not None):
+        if base:
+            LOG.warning("No relay for %s: the relay address must be an srt:// address of the local network", name)
+        return ""
+    stream_id = parsed.path.lstrip("/") + slug
+    return f"srt://{parsed.hostname}:{port}?streamid=publish:{stream_id}&pkt_size={SRT_PACKET_SIZE}"
+
+
+def camera_relay_output(url: str) -> list[str]:
+    return ["-map", "0:v:0", "-c", "copy", "-f", "mpegts", url]
+
+
+class CameraRelay:
+    def __init__(self, url: str, name: str) -> None:
+        self.url = url
+        self.name = name
+        self.process: subprocess.Popen[bytes] | None = None
+        self.started_at = 0.0
+        self.retry_at = 0.0
+        self.quick_failures = 0
+
+    def _launch(self, command: list[str], stdin: int, now: float) -> bool:
+        try:
+            self.process = subprocess.Popen(command, stdin=stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0)
+        except OSError as ex:
+            LOG.warning("Camera relay for %s could not start: %s", self.name, ex)
+            self._schedule_retry(now, False)
+            return False
+        self.started_at = now
+        LOG.info("Camera relay started for %s to %s", self.name, self.url)
+        return True
+
+    def _schedule_retry(self, now: float, stable: bool) -> None:
+        self.quick_failures = 0 if stable else self.quick_failures + 1
+        self.retry_at = now + min(CAMERA_RELAY_RETRY_SECONDS * 2 ** self.quick_failures, CAMERA_RELAY_MAX_RETRY_SECONDS)
+
+    def _reap(self, now: float) -> None:
+        if self.process is None or self.process.poll() is None:
+            return
+        exit_code = self.process.returncode
+        self._release()
+        self._schedule_retry(now, now - self.started_at >= CAMERA_RELAY_STABLE_SECONDS)
+        LOG.info("Camera relay for %s stopped with exit code %s; retrying in %.0f s", self.name, exit_code, self.retry_at - now)
+
+    def _release(self) -> None:
+        self.process = None
+
+    def _terminate(self) -> None:
+        process = self.process
+        self._release()
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=CAMERA_RELAY_STOP_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=CAMERA_RELAY_STOP_SECONDS)
+
+    def _abort(self, now: float, reason: str) -> None:
+        self._terminate()
+        self._schedule_retry(now, now - self.started_at >= CAMERA_RELAY_STABLE_SECONDS)
+        LOG.info("Camera relay for %s stopped: %s; retrying in %.0f s", self.name, reason, self.retry_at - now)
+
+    def stop(self) -> None:
+        if self.process is None:
+            return
+        self._terminate()
+        self.retry_at = 0.0
+        LOG.info("Camera relay stopped for %s", self.name)
+
+
+class SourceRelay(CameraRelay):
+    def update(self, enabled: bool, input_arguments: Callable[[], list[str] | None], now: float) -> None:
+        self._reap(now)
+        if not enabled:
+            self.stop()
+            return
+        if self.process is not None or now < self.retry_at:
+            return
+        arguments = input_arguments()
+        if arguments is not None:
+            self._launch(["ffmpeg", "-nostdin", "-nostats", "-loglevel", "error", *arguments, *camera_relay_output(self.url)],
+                         subprocess.DEVNULL, now)
+
+
+class FrameRelay(CameraRelay):
+    def __init__(self, url: str, name: str) -> None:
+        super().__init__(url, name)
+        self.feed_writer: PlayerFeed | None = None
+        self.needs_keyframe = True
+
+    def feed(self, frame: bytes, keyframe: bool, rate: float, now: float) -> None:
+        self._reap(now)
+        if self.process is None:
+            if not keyframe or now < self.retry_at:
+                return
+            command = ["ffmpeg", "-nostats", "-loglevel", "error", "-r", str(rate), "-f", "h264", "-i", "pipe:0",
+                       *camera_relay_output(self.url)]
+            if not self._launch(command, subprocess.PIPE, now):
+                return
+            assert self.process is not None and self.process.stdin is not None
+            self.feed_writer = PlayerFeed(self.process.stdin)
+            self.needs_keyframe = True
+        if self.needs_keyframe and not keyframe:
+            return
+        assert self.feed_writer is not None
+        try:
+            self.needs_keyframe = not self.feed_writer.write(frame)
+        except BrokenPipeError:
+            self._abort(now, "its input pipe broke")
+
+    def _release(self) -> None:
+        process = self.process
+        if self.feed_writer is not None:
+            self.feed_writer.close()
+            self.feed_writer = None
+        if process is not None and process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        super()._release()
+
+
 class ControlsOverlay(QWidget):
     owner_window: QWidget | None = None
 
@@ -2701,6 +2851,8 @@ class StreamWorker(QThread):
         self.position_correction: PositionCorrection | None = None
         self.position_corrected_at: float | None = None
         self.last_preset: str | None = None
+        relay_url = camera_relay_url(device.name)
+        self.relay = FrameRelay(relay_url, device.name) if relay_url else None
 
     def set_main_stream(self, enabled: bool) -> None:
         self.main_stream = enabled
@@ -2846,6 +2998,11 @@ class StreamWorker(QThread):
                 if not received_video:
                     received_video = True
                     self.status_changed.emit("Live video")
+                if self.relay is not None:
+                    if self.display_enabled.is_set() and self.local_input_rate is not None:
+                        self.relay.feed(frame, keyframe, self.local_input_rate, last_video)
+                    else:
+                        self.relay.stop()
                 if not self.display_enabled.is_set():
                     self.display_needs_keyframe = True
                     continue
@@ -2864,6 +3021,8 @@ class StreamWorker(QThread):
             self._close_audio_player()
             self.recording_request = None
             self._finish_recording()
+            if self.relay is not None:
+                self.relay.stop()
             if self.continuous is not None:
                 self.continuous.close()
             if self.local_detector is not None:
@@ -4581,6 +4740,22 @@ class RtspStreamWorker(QThread):
         self.quality = quality if quality in ("HD", "SD") else "HD"
         self.requested_quality = self.quality
         self.settings_requests: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.display_enabled = threading.Event()
+        self.display_enabled.set()
+        relay_url = camera_relay_url(camera.name) if camera.provider not in (V380_PROVIDER, IMOU_PROVIDER) else ""
+        self.relay = SourceRelay(relay_url, camera.name) if relay_url else None
+
+    def set_display(self, enabled: bool) -> None:
+        if enabled:
+            self.display_enabled.set()
+        else:
+            self.display_enabled.clear()
+
+    def _relay_input(self) -> list[str] | None:
+        url = self._live_url()
+        if url is None:
+            return None
+        return ["-rtsp_transport", self.camera.transport, "-i", url] if url.startswith("rtsp") else ["-i", url]
 
     def queue_setting(self, name: str, value: object) -> bool:
         if self.camera.provider != IMOU_ACCOUNT_PROVIDER or name != SETTING_QUALITY or value not in ("HD", "SD"):
@@ -5064,6 +5239,8 @@ class RtspStreamWorker(QThread):
                 speed = catch_up.speed(buffered if buffer_ready else None, time.monotonic())
                 if speed != playback_speed and mpv_request(self.socket_path, ["set_property", "speed", speed])[0]:
                     playback_speed = speed
+                if self.relay is not None:
+                    self.relay.update(self.display_enabled.is_set(), self._relay_input, time.monotonic())
                 if self.camera.provider != V380_PROVIDER or self.camera.lens == v380.continuous_host_lens(self.camera.device_uid):
                     self._update_continuous(time.monotonic())
                     update_local_detector(self, self.camera, self._local_detection_source)
@@ -5105,6 +5282,8 @@ class RtspStreamWorker(QThread):
             self.imou_client = None
             self._stop_recording()
             self._stop_continuous()
+            if self.relay is not None:
+                self.relay.stop()
             if self.imou_tunnel is not None:
                 self.imou_tunnel.close()
                 self.imou_tunnel = None
@@ -5364,6 +5543,7 @@ class CameraPreview(QWidget):
                 os.close(playlist_fd)
         if rtsp_camera:
             self.worker = RtspStreamWorker(rtsp_camera, self.player, socket_path, "HD" if self.main_stream else "SD")
+            self.worker.set_display(self.isVisible())
         else:
             assert self.player.stdin is not None
             try:
@@ -5706,7 +5886,7 @@ class CameraPreview(QWidget):
             self.overlay_timer.stop()
             self.hide_overlay()
             self.status_overlay.hide()
-        if isinstance(self.worker, StreamWorker):
+        if isinstance(self.worker, (StreamWorker, RtspStreamWorker)):
             self.worker.set_display(enabled)
 
     def set_local_detection(self, enabled: bool) -> None:
@@ -7602,8 +7782,7 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         if self.stream_worker is not None:
-            if isinstance(self.stream_worker, StreamWorker):
-                self.stream_worker.set_display(True)
+            self.stream_worker.set_display(True)
         for preview in self.previews.values():
             preview.set_display(True)
         self.resume_live_if_idle()
@@ -7615,8 +7794,7 @@ class MainWindow(QMainWindow):
     def hide_to_tray(self) -> None:
         self.close_replays()
         if self.stream_worker is not None:
-            if isinstance(self.stream_worker, StreamWorker):
-                self.stream_worker.set_display(False)
+            self.stream_worker.set_display(False)
         for preview in self.previews.values():
             preview.set_display(False)
         self.overlay_timer.stop()
@@ -7907,7 +8085,7 @@ class MainWindow(QMainWindow):
         stack.addWidget(replay)
         stack.setCurrentWidget(replay)
         self.apply_video_fill()
-        if isinstance(worker, StreamWorker):
+        if isinstance(worker, (StreamWorker, RtspStreamWorker)):
             worker.set_display(False)
         replay.show()
 
@@ -7926,7 +8104,7 @@ class MainWindow(QMainWindow):
         if stack is not None:
             stack.setCurrentIndex(0)
             stack.removeWidget(replay)
-        if isinstance(replay.worker, StreamWorker):
+        if isinstance(replay.worker, (StreamWorker, RtspStreamWorker)):
             replay.worker.set_display(True)
 
     def close_local_replays(self) -> None:
@@ -9196,8 +9374,7 @@ class MainWindow(QMainWindow):
         self.stream_worker.local_motion_area = local_motion_area(self.settings, self.selected_device.uid)
         self.stream_worker.local_event_callback = self.local_detection_ready.emit
         self.stream_worker.local_error_callback = self.local_detection_failed.emit
-        if isinstance(self.stream_worker, StreamWorker):
-            self.stream_worker.set_display(self.isVisible() and not self.isMinimized())
+        self.stream_worker.set_display(self.isVisible() and not self.isMinimized())
         self.stream_worker.status_changed.connect(self.on_stream_status)
         self.stream_worker.failed.connect(self.on_stream_error)
         if isinstance(self.stream_worker, StreamWorker):
@@ -9971,15 +10148,15 @@ def print_camera_passwords() -> int:
 
 
 def accept_instance_request(server: QLocalServer, window: MainWindow) -> None:
+    show_requested = False
     connection = server.nextPendingConnection()
-    if connection is None:
-        return
-    connection.readyRead.connect(lambda: read_instance_request(connection, window))
-    connection.disconnected.connect(connection.deleteLater)
-
-
-def read_instance_request(connection: QLocalSocket, window: MainWindow) -> None:
-    if bytes(connection.readAll()) == SHOW_WINDOW_REQUEST:
+    while connection is not None:
+        if connection.bytesAvailable() or connection.waitForReadyRead(INSTANCE_CONNECT_TIMEOUT_MS):
+            show_requested = show_requested or bytes(connection.readAll()) == SHOW_WINDOW_REQUEST
+        connection.abort()
+        connection.deleteLater()
+        connection = server.nextPendingConnection()
+    if show_requested:
         window.show_window()
 
 
