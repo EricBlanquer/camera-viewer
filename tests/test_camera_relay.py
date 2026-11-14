@@ -12,8 +12,8 @@ import app
 from app import CameraPreview, FrameRelay, RtspStreamWorker, SourceRelay, StreamWorker, camera_relay_url
 
 RELAY_BASE = "srt://192.168.1.251:8890/cams/"
-ENTREE = "srt://192.168.1.251:8890?streamid=publish:cams/entree&pkt_size=1316"
-JARDIN = "srt://192.168.1.251:8890?streamid=publish:cams/jardin&pkt_size=1316"
+ENTREE = "srt://192.168.1.251:8890?streamid=publish:cams/entree:relay:s3cr3t-Token_x&pkt_size=1316"
+JARDIN = "srt://192.168.1.251:8890?streamid=publish:cams/jardin:relay:s3cr3t-Token_x&pkt_size=1316"
 KEYFRAME = b"\x00\x00\x00\x01\x67\x42\x00\x1f" + b"\x00\x00\x00\x01\x65\x88"
 FRAME = b"\x00\x00\x00\x01\x41\x9a"
 
@@ -60,27 +60,33 @@ class CameraRelayUrlTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.directory.cleanup()
 
-    def write(self, url: object) -> None:
-        self.settings.write_text(json.dumps({"url": url}))
+    def write(self, url: object, **credentials: str) -> None:
+        self.settings.write_text(json.dumps({"url": url, **({"user": "relay", "password": "s3cr3t-Token_x"} if not credentials else credentials)}))
+        self.settings.chmod(0o600)
 
     def test_camera_path_comes_from_its_name_in_ascii(self) -> None:
         self.write(RELAY_BASE)
-        self.assertEqual(camera_relay_url("Entrée", self.settings), ENTREE)
+        self.assertEqual(camera_relay_url("Entrée", self.settings), (ENTREE, "cams/entree"))
         self.assertEqual(camera_relay_url("Jardin côté rue", self.settings),
-                         "srt://192.168.1.251:8890?streamid=publish:cams/jardin-cote-rue&pkt_size=1316")
+                         ("srt://192.168.1.251:8890?streamid=publish:cams/jardin-cote-rue:relay:s3cr3t-Token_x&pkt_size=1316",
+                          "cams/jardin-cote-rue"))
 
     def test_no_settings_means_no_relay(self) -> None:
-        self.assertEqual(camera_relay_url("Entrée", self.settings), "")
+        self.assertIsNone(camera_relay_url("Entrée", self.settings))
+
+    def test_no_relay_without_credentials(self) -> None:
+        self.write(RELAY_BASE, user="relay")
+        self.assertIsNone(camera_relay_url("Entrée", self.settings))
 
     def test_relay_outside_the_local_network_or_with_credentials_is_refused(self) -> None:
         for url in ("srt://8.8.8.8:8890/cams/", "srt://user:secret@192.168.1.251:8890/cams/", "srt://192.168.1.251/cams/",
                     "rtsp://192.168.1.251:8554/cams/", "srt://192.168.1.251:8890/cams/?latency=1", 42):
             self.write(url)
-            self.assertEqual(camera_relay_url("Entrée", self.settings), "", url)
+            self.assertIsNone(camera_relay_url("Entrée", self.settings), url)
 
     def test_a_name_without_letters_or_digits_has_no_relay(self) -> None:
         self.write(RELAY_BASE)
-        self.assertEqual(camera_relay_url("***", self.settings), "")
+        self.assertIsNone(camera_relay_url("***", self.settings))
 
 
 class SourceRelayTest(unittest.TestCase):
@@ -89,7 +95,7 @@ class SourceRelayTest(unittest.TestCase):
         patcher = mock.patch.object(app.subprocess, "Popen", side_effect=self.spawn)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.relay = SourceRelay(ENTREE, "Entrée")
+        self.relay = SourceRelay(ENTREE, "cams/entree", "Entrée")
 
     def spawn(self, command: list[str], **kwargs: object) -> FakeProcess:
         process = FakeProcess(command, **kwargs)
@@ -104,6 +110,13 @@ class SourceRelayTest(unittest.TestCase):
         self.assertEqual(command[-7:], ["-map", "0:v:0", "-c", "copy", "-f", "mpegts", ENTREE])
         self.relay.update(True, lambda: ["-i", "http://127.0.0.1:4000/live"], 1.0)
         self.assertEqual(len(self.processes), 1)
+
+    def test_never_logs_the_password(self) -> None:
+        with self.assertLogs("okam-linux", level="INFO") as logs:
+            self.relay.update(True, lambda: ["-i", "http://127.0.0.1:4000/live"], 0.0)
+            self.relay.update(False, lambda: None, 1.0)
+        self.assertTrue(any("cams/entree" in line for line in logs.output))
+        self.assertFalse(any("s3cr3t" in line for line in logs.output))
 
     def test_stops_when_the_camera_is_no_longer_displayed(self) -> None:
         self.relay.update(True, lambda: ["-i", "http://127.0.0.1:4000/live"], 0.0)
@@ -131,7 +144,7 @@ class FrameRelayTest(unittest.TestCase):
         patcher = mock.patch.object(app.subprocess, "Popen", side_effect=self.spawn)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.relay = FrameRelay(JARDIN, "Jardin")
+        self.relay = FrameRelay(JARDIN, "cams/jardin", "Jardin")
         self.addCleanup(self.relay.stop)
 
     def spawn(self, command: list[str], **kwargs: object) -> FakeProcess:

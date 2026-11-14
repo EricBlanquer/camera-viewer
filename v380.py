@@ -24,6 +24,8 @@ from icam365 import broadcast_media, start_media_server, write_media
 
 
 CONFIG_PATH = Path.home() / ".config/camera-viewer/v380.json"
+RELAY_SETTINGS_PATH = Path.home() / ".config/camera-viewer/relay.json"
+RELAY_CREDENTIAL_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 DEFAULT_PORT = 8800
 DEFAULT_USERNAME = "admin"
 DISCOVERY_PORT = 10009
@@ -132,8 +134,43 @@ def valid_relay_url(url: str) -> bool:
             and not parsed.fragment and RELAY_PATH_PATTERN.fullmatch(parsed.path) is not None)
 
 
+def read_relay_settings(path: Path = RELAY_SETTINGS_PATH) -> dict:
+    try:
+        if path.stat().st_mode & 0o077:
+            LOG.warning("Ignoring %s: the relay settings file must be private (mode 600)", path)
+            return {}
+        settings = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as ex:
+        LOG.warning("Ignoring the relay settings: %s", ex)
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def relay_credentials_from(settings: dict) -> tuple[str, str] | None:
+    user = settings.get("user")
+    password = settings.get("password")
+    if not (isinstance(user, str) and isinstance(password, str)
+            and RELAY_CREDENTIAL_PATTERN.fullmatch(user) and RELAY_CREDENTIAL_PATTERN.fullmatch(password)):
+        return None
+    return user, password
+
+
+def relay_credentials(path: Path = RELAY_SETTINGS_PATH) -> tuple[str, str] | None:
+    return relay_credentials_from(read_relay_settings(path))
+
+
+def relay_target(relay_url: str, lens: int, credentials: tuple[str, str] | None) -> str:
+    url = f"{relay_url}{lens + 1}"
+    if credentials is None:
+        return url
+    parsed = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit(parsed._replace(netloc=f"{credentials[0]}:{credentials[1]}@{parsed.netloc}"))
+
+
 def relay_command(source: str, relay_url: str, lenses: int = LENS_COUNT,
-                  device: str | None = None) -> list[str]:
+                  device: str | None = None, credentials: tuple[str, str] | None = None) -> list[str]:
     outputs = "".join(f"[s{lens}]" for lens in range(lenses))
     upload = ",format=nv12,hwupload" if device else ""
     crops = ";".join(
@@ -162,7 +199,7 @@ def relay_command(source: str, relay_url: str, lenses: int = LENS_COUNT,
         command += [
             "-map", f"[l{lens}]", *encoder,
             "-g", RELAY_GOP, "-b:v", RELAY_BITRATE, "-maxrate", RELAY_MAXRATE,
-            "-bufsize", RELAY_BUFFER, "-f", "rtsp", "-rtsp_transport", "tcp", f"{relay_url}{lens + 1}",
+            "-bufsize", RELAY_BUFFER, "-f", "rtsp", "-rtsp_transport", "tcp", relay_target(relay_url, lens, credentials),
         ]
     return command
 
@@ -494,7 +531,7 @@ class NativeBridge:
             device = hardware_encode_device()
             try:
                 process = subprocess.Popen(
-                    relay_command(self.url, self.config.relay_url, device=device),
+                    relay_command(self.url, self.config.relay_url, device=device, credentials=relay_credentials()),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )

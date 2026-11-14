@@ -231,7 +231,8 @@ With a `relay_url` (an `rtsp://` address on the local network, such as a mediamt
 The three relayed lenses are encoded on the computer's Intel graphics through VAAPI when a render node in `/dev/dri` passes a short encoding test at startup, which keeps the processor free; the viewer returns to software encoding by itself when the hardware relay cannot stay up, and `CAMERA_VIEWER_VAAPI_DEVICE` selects another render node or, set to `off`, keeps everything in software.
 For access away from the camera's network, the computer needs a route to its local IP address, such as a VPN.
 
-With `{"url": "srt://<host>:<port>/<path>/"}` in `~/.config/camera-viewer/relay.json` (an `srt://` address on the local network, such as a mediamtx server), every other camera is published there while the viewer displays it, under `<path>/` followed by its name in lowercase ASCII (`Entrée` becomes `cams/entree`).
+With `{"url": "srt://<host>:<port>/<path>/", "user": "<user>", "password": "<password>"}` in `~/.config/camera-viewer/relay.json` (mode 600, an `srt://` address on the local network such as a mediamtx server, and the account allowed to publish there), every other camera is published there while the viewer displays it, under `<path>/` followed by its name in lowercase ASCII (`Entrée` becomes `cams/entree`).
+The V380 relay signs in with the same account; logs name the published path, never the password.
 The video is copied without re-encoding into MPEG-TS over SRT, which carries the camera's own H.264 or H.265 parameter sets: RTSP publishing would put them in the SDP, where several cameras repeat them with trailing zero bytes that mediamtx refuses.
 Hiding the window to the tray, or replacing a live view with a replay, stops that camera's relay; a relay that fails is restarted after 5 s, then up to 5 minutes while it keeps failing.
 

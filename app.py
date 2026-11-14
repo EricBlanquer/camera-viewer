@@ -1908,7 +1908,6 @@ class ContinuousRecorder:
             LOG.info("Could not save continuous recording %s: %s", recorder.path.name, ex)
 
 
-RELAY_SETTINGS_PATH = Path.home() / ".config/camera-viewer/relay.json"
 RELAY_SLUG_MAX_LENGTH = 40
 CAMERA_RELAY_RETRY_SECONDS = 5
 CAMERA_RELAY_MAX_RETRY_SECONDS = 300
@@ -1917,14 +1916,11 @@ CAMERA_RELAY_STOP_SECONDS = 3
 SRT_PACKET_SIZE = 1316
 
 
-def camera_relay_url(name: str, settings_path: Path = RELAY_SETTINGS_PATH) -> str:
-    try:
-        base = json.loads(settings_path.read_text()).get("url", "")
-    except FileNotFoundError:
-        return ""
-    except (OSError, ValueError, AttributeError) as ex:
-        LOG.warning("Ignoring the camera relay settings: %s", ex)
-        return ""
+def camera_relay_url(name: str, settings_path: Path = v380.RELAY_SETTINGS_PATH) -> tuple[str, str] | None:
+    settings = v380.read_relay_settings(settings_path)
+    base = settings.get("url", "")
+    if not base:
+        return None
     ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().casefold()
     slug = re.sub(r"[^a-z0-9]+", "-", ascii_name).strip("-")[:RELAY_SLUG_MAX_LENGTH].strip("-")
     parsed = urllib.parse.urlsplit(base if isinstance(base, str) else "")
@@ -1932,14 +1928,16 @@ def camera_relay_url(name: str, settings_path: Path = RELAY_SETTINGS_PATH) -> st
         port = parsed.port
     except ValueError:
         port = None
-    if not (slug and parsed.scheme == "srt" and parsed.hostname is not None and v380.is_local_address(parsed.hostname)
-            and port is not None and parsed.username is None and parsed.password is None and not parsed.query
-            and not parsed.fragment and v380.RELAY_PATH_PATTERN.fullmatch(parsed.path + slug) is not None):
-        if base:
-            LOG.warning("No relay for %s: the relay address must be an srt:// address of the local network", name)
-        return ""
-    stream_id = parsed.path.lstrip("/") + slug
-    return f"srt://{parsed.hostname}:{port}?streamid=publish:{stream_id}&pkt_size={SRT_PACKET_SIZE}"
+    credentials = v380.relay_credentials_from(settings)
+    if not (slug and credentials is not None and parsed.scheme == "srt" and parsed.hostname is not None
+            and v380.is_local_address(parsed.hostname) and port is not None and parsed.username is None
+            and parsed.password is None and not parsed.query and not parsed.fragment
+            and v380.RELAY_PATH_PATTERN.fullmatch(parsed.path + slug) is not None):
+        LOG.warning("No relay for %s: the relay needs an srt:// address of the local network, a user and a password", name)
+        return None
+    path = parsed.path.lstrip("/") + slug
+    user, password = credentials
+    return f"srt://{parsed.hostname}:{port}?streamid=publish:{path}:{user}:{password}&pkt_size={SRT_PACKET_SIZE}", path
 
 
 def camera_relay_output(url: str) -> list[str]:
@@ -1947,8 +1945,9 @@ def camera_relay_output(url: str) -> list[str]:
 
 
 class CameraRelay:
-    def __init__(self, url: str, name: str) -> None:
+    def __init__(self, url: str, path: str, name: str) -> None:
         self.url = url
+        self.path = path
         self.name = name
         self.process: subprocess.Popen[bytes] | None = None
         self.started_at = 0.0
@@ -1963,7 +1962,7 @@ class CameraRelay:
             self._schedule_retry(now, False)
             return False
         self.started_at = now
-        LOG.info("Camera relay started for %s to %s", self.name, self.url)
+        LOG.info("Camera relay started for %s to %s", self.name, self.path)
         return True
 
     def _schedule_retry(self, now: float, stable: bool) -> None:
@@ -2020,8 +2019,8 @@ class SourceRelay(CameraRelay):
 
 
 class FrameRelay(CameraRelay):
-    def __init__(self, url: str, name: str) -> None:
-        super().__init__(url, name)
+    def __init__(self, url: str, path: str, name: str) -> None:
+        super().__init__(url, path, name)
         self.feed_writer: PlayerFeed | None = None
         self.needs_keyframe = True
 
@@ -2851,8 +2850,8 @@ class StreamWorker(QThread):
         self.position_correction: PositionCorrection | None = None
         self.position_corrected_at: float | None = None
         self.last_preset: str | None = None
-        relay_url = camera_relay_url(device.name)
-        self.relay = FrameRelay(relay_url, device.name) if relay_url else None
+        relay_target = camera_relay_url(device.name)
+        self.relay = FrameRelay(*relay_target, device.name) if relay_target else None
 
     def set_main_stream(self, enabled: bool) -> None:
         self.main_stream = enabled
@@ -4742,8 +4741,8 @@ class RtspStreamWorker(QThread):
         self.settings_requests: queue.Queue[tuple[str, object]] = queue.Queue()
         self.display_enabled = threading.Event()
         self.display_enabled.set()
-        relay_url = camera_relay_url(camera.name) if camera.provider not in (V380_PROVIDER, IMOU_PROVIDER) else ""
-        self.relay = SourceRelay(relay_url, camera.name) if relay_url else None
+        relay_target = camera_relay_url(camera.name) if camera.provider not in (V380_PROVIDER, IMOU_PROVIDER) else None
+        self.relay = SourceRelay(*relay_target, camera.name) if relay_target else None
 
     def set_display(self, enabled: bool) -> None:
         if enabled:

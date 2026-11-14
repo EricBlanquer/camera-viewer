@@ -1,3 +1,6 @@
+from pathlib import Path
+import tempfile
+import json
 import struct
 import threading
 import unittest
@@ -91,6 +94,26 @@ class V380RelayTest(unittest.TestCase):
         self.assertIn("[s2]crop=iw:ih/3:0:2*ih/3,scale=640:360,format=nv12,hwupload[l2]", graph)
         self.assertEqual([part for part in command if part.startswith("rtsp://")],
                          [f"rtsp://192.168.1.251:8554/maison{lens}" for lens in (1, 2, 3)])
+
+    def test_relay_signs_in_to_the_server_when_credentials_are_given(self) -> None:
+        command = v380.relay_command("http://127.0.0.1:1/source", "rtsp://192.168.1.251:8554/maison",
+                                     credentials=("relay", "s3cr3t-Token_x"))
+        self.assertEqual([part for part in command if part.startswith("rtsp://")],
+                         [f"rtsp://relay:s3cr3t-Token_x@192.168.1.251:8554/maison{lens}" for lens in (1, 2, 3)])
+
+    def test_relay_credentials_come_from_the_private_relay_settings(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="intraswitch_okam_") as directory:
+            path = Path(directory) / "relay.json"
+            path.write_text(json.dumps({"user": "relay", "password": "s3cr3t-Token_x"}))
+            path.chmod(0o600)
+            self.assertEqual(v380.relay_credentials(path), ("relay", "s3cr3t-Token_x"))
+            path.chmod(0o644)
+            self.assertIsNone(v380.relay_credentials(path))
+            path.chmod(0o600)
+            for record in ({"user": "relay"}, {"user": "re:lay", "password": "x"}, {"user": "relay", "password": "a@b"}):
+                path.write_text(json.dumps(record))
+                self.assertIsNone(v380.relay_credentials(path), record)
+            self.assertIsNone(v380.relay_credentials(Path(directory) / "missing.json"))
 
     def test_relay_runs_until_the_bridge_stops(self) -> None:
         bridge = object.__new__(v380.NativeBridge)
